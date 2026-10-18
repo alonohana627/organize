@@ -1,0 +1,17 @@
+build/
+out/
+.cache/
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.onnx
+*.bin
+*.bundle
+*.zip
+benchmark-data/
+models/
+samples/
+*.user
+.vs/
