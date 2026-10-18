@@ -19,11 +19,11 @@ Three independent versions exist: `catalog_revision` (monotonic committed transa
 | `tags`, `sample_tags`, `tag_aliases` | Hierarchy, membership and reversible merge redirects |
 | `categories` | Separate user-editable primary category tree |
 | `collections`, `collection_items` | Smart query AST or ordered manual membership |
-| `analysis_profiles`, `analysis_runs`, `jobs` | Immutable profiles/run snapshots, durable queue and cancellation |
+| `analysis_profiles`, `analysis_runs`, `jobs`, `analysis_claims` | Immutable profiles/run snapshots, durable queue and cancellation |
 | `artifacts`, `artifact_segments` | Content-addressed derived data references and segment storage |
 | `vector_spaces`, `vector_entries`, `index_generations` | Model/preprocessing compatibility, embedding positions and ANN publication |
 | `duplicate_edges` | Evidence for exact/equivalent/near matches without destructive merge |
-| `history_actions`, `history_chunks`, `history_state` | Durable grouped undo/redo and expected-value patches |
+| `history_actions`, `history_chunks`, `history_state`, `command_receipts` | Durable grouped undo/redo and expected-value patches |
 | `file_operations`, `review_items`, `scan_sessions`, `scan_frontier` | Recoverable external work and reconciliation |
 | `catalog_outbox`, `consumer_cursors` | Replayable committed changes, mirror/derived-index progress |
 | `sample_search`, `sample_fts` | Rebuildable lexical projection; one document per sample |

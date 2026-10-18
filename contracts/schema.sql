@@ -130,6 +130,19 @@ CREATE TABLE jobs (
 ) STRICT;
 CREATE INDEX jobs_admission ON jobs(state,priority,id);
 CREATE INDEX jobs_run ON jobs(run_id,state,id);
+-- Durable cross-run task identity; one owner can serve multiple requested jobs.
+CREATE TABLE analysis_claims (
+ sample_id INTEGER NOT NULL REFERENCES samples(id), content_revision INTEGER NOT NULL,
+ stage_digest TEXT NOT NULL, owner_job_id INTEGER NOT NULL REFERENCES jobs(id),
+ lease_token TEXT NOT NULL, lease_expires_at INTEGER NOT NULL,
+ PRIMARY KEY(sample_id,content_revision,stage_digest)
+) STRICT;
+CREATE TABLE command_receipts (
+ operation_uuid TEXT PRIMARY KEY, command_digest TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('running','completed','partial','failed')),
+ action_id INTEGER REFERENCES history_actions(id),
+ receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)), updated_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE artifact_segments (
  id INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, relative_path TEXT NOT NULL UNIQUE, byte_size INTEGER NOT NULL CHECK(byte_size>=0),
  checksum TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('staging','published','retired'))
