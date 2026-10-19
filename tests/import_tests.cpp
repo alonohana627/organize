@@ -81,6 +81,13 @@ public:
 #else
         applied_ = ::chmod(directory_.c_str(), 0) == 0 && ::geteuid() != 0;  // root ignores permissions
 #endif
+        // Some accounts bypass the restriction anyway (root, or an elevated Windows CI runner with
+        // backup privileges), so check that listing really fails, the same way the importer lists.
+        if (applied_) {
+            std::error_code error;
+            const fs::directory_iterator listing(directory_, error);
+            applied_ = static_cast<bool>(error);
+        }
     }
     ListingDenied(const ListingDenied&) = delete;
     ListingDenied& operator=(const ListingDenied&) = delete;
@@ -315,7 +322,7 @@ TEST_SUITE("import") {
         fixture.import();
         ListingDenied denied(fixture.source / "Loops");
         if (!denied.applied()) {
-            MESSAGE("cannot restrict directory access here (running as root?)");
+            MESSAGE("cannot restrict directory access here (root, or an account that bypasses the ACL)");
             return;
         }
         const auto summary = fixture.import();
