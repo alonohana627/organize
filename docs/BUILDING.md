@@ -54,6 +54,24 @@ libc++, FFmpeg and their dependencies resolved from the toolchain), and `<prefix
 the Qt plugins that `qt.conf` points to. Network-related Qt plugins are not deployed (the application
 is offline). CI starts the installed app with only `C:\Windows\System32` on `PATH` to prove this.
 
+### Windows installer (.msi)
+
+To install on another PC, build an installer from the same install rules (`cmake/Packaging.cmake`).
+It needs the [WiX Toolset 3.x](https://github.com/wixtoolset/wix3/releases): unpack
+`wix314-binaries.zip` anywhere and point `WIX` at that folder, or put it on `PATH`.
+
+```sh
+export WIX="C:\Users\<you>\AppData\Local\wix314\bin"     # folder with candle.exe and light.exe
+cmake --preset release && cmake --build --preset release
+cpack --config build/release/CPackConfig.cmake -B build/release/package
+```
+
+This produces `build/release/package/MusicSampleOrganizer-<version>-windows-x64.msi` (about 140 MB:
+the app, `mso`, `mso-worker`, Qt, FFmpeg and libc++). It installs per machine into
+`Program Files\Music Sample Organizer`, adds Start menu and desktop shortcuts, shows the GPL as its
+license page, and replaces an older version when a newer one is installed. To check its contents
+without installing, run `msiexec /a <file>.msi /qn TARGETDIR=<folder>`.
+
 Switches: `--workspace <dir>` (a separate workspace instead of `%LOCALAPPDATA%\MusicSampleOrganizer`),
 `--exit-when-ready` (start-up smoke test) and `--screenshot <file.png>` (save the main window after
 start-up, then quit). With `QT_QPA_PLATFORM=offscreen` and `MSO_AUDIO_BACKEND=null` the app runs

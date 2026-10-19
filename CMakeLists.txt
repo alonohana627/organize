@@ -129,3 +129,4 @@ endif()
 mso_finalize_module_graph()
 
 include(cmake/Install.cmake)
+include(cmake/Packaging.cmake)
