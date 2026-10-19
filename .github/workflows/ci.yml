@@ -112,7 +112,8 @@ jobs:
             libfontconfig1-dev libfreetype-dev libxkbcommon-dev
       - name: Build Qt
         if: steps.qt-cache.outputs.cache-hit != 'true'
-        run: bash .github/scripts/build-qt-libcxx.sh "$HOME/qt-libcxx"
+        # Qt is built once and cached, so ccache would only add a dependency: drop the global launcher.
+        run: env -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER bash .github/scripts/build-qt-libcxx.sh "$HOME/qt-libcxx"
 
   linux:
     needs: qt-linux
