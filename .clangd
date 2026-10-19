@@ -1,0 +1,6 @@
+# clangd configuration (Zed, VS Code, Neovim, CLion...). The compile database is written by
+# `cmake --preset debug`; headers inherit flags from the sources that include them.
+CompileFlags:
+  CompilationDatabase: build/debug
+Diagnostics:
+  UnusedIncludes: Strict

@@ -6,7 +6,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # compile_commands.json for clangd (Zed, VS Code, CLion)
+# No C++20 modules are used. Without this, CMake adds per-file @*.modmap response files to every
+# compile command, which clangd cannot read.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR "Music Sample Organizer is built with clang + libc++; got ${CMAKE_CXX_COMPILER_ID}")

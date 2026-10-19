@@ -1,0 +1,17 @@
+// Zed project settings. Uses the clangd that ships with the MSYS2 CLANG64 toolchain so it
+// understands clang + libc++ exactly like the build, and lets it query that compiler for the
+// system include paths. Linux users: replace the paths with their clangd/clang++ (e.g. clang-20).
+{
+  "lsp": {
+    "clangd": {
+      "binary": {
+        "path": "C:/msys64/clang64/bin/clangd.exe",
+        "arguments": [
+          "--query-driver=C:/msys64/clang64/bin/clang*.exe",
+          "--background-index",
+          "--header-insertion=never"
+        ]
+      }
+    }
+  }
+}
