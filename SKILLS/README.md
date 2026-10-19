@@ -37,6 +37,7 @@ and how to verify. Read `AGENTS.md` and the project rules below first.
   `TEST_SUITE("<area>")` (CTest registers each suite automatically). Generate fixtures at runtime with
   the shared helpers in `tests/test_support.hpp`; never commit audio; poll with deadlines
   (`test::wait_until`), never sleep a fixed time.
-- **Docs move with code:** update `README.md`, `docs/BUILDING.md`, `deps/README.md`,
-  `IMPLEMENTATION_STATUS.md` and the relevant skill in the same change.
+- **Docs move with code:** update `docs/DEVELOPING.md`, `docs/BUILDING.md`, `deps/README.md`,
+  `IMPLEMENTATION_STATUS.md` and the relevant skill in the same change. `README.md` is the user
+  guide (written for producers, not developers): update it only for user-visible changes.
 - **Git:** never commit or push without the owner's explicit OK.

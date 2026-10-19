@@ -78,7 +78,9 @@ the Linux build is not yet verified on a Linux machine.
   `miniaudio/miniaudio.c` and `signalsmith_linear/platform/linear-xsimd-dispatch.cpp` are no longer
   vendored. SQLite additionally uses `OMIT_DEPRECATED`, `OMIT_SHARED_CACHE` and
   `LIKE_DOESNT_MATCH_BLOBS`; its options are PRIVATE to the amalgamation.
-- CI: see `README.md`. Windows builds everything from prebuilt MSYS2 packages; Linux builds the core,
+- CI: see `docs/DEVELOPING.md`. The Linux job is parked (owner's decision, 2026-10-19); its last run
+  (release and ASan/UBSan) built cleanly and passed every suite except an include-graph false
+  positive in GUI-less builds, since fixed. Windows builds everything from prebuilt MSYS2 packages; Linux builds the core,
   CLI and worker without the desktop app (`MSO_BUILD_GUI=OFF`), because no prebuilt Qt uses libc++
   and building Qt in CI is too slow. `.github/scripts/build-qt-libcxx.sh` stays for building the desktop app
   locally on Linux (`docs/BUILDING.md` explains the libstdc++ link problem).
@@ -119,7 +121,7 @@ the Linux build is not yet verified on a Linux machine.
 
 **Application and CLI**
 - The desktop app keeps an in-memory `SampleIndex` per open library (`include/mso/app/sample_index.hpp`;
-  see "How the UI stays responsive" in `README.md`). Benchmark, release build,
+  see "How the UI stays responsive" in `docs/DEVELOPING.md`). Benchmark, release build,
   `mso bench --rows 100000 --repetitions 30`, uncached (the app owner's run):
 
   | Operation | SQLite | Index |

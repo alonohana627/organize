@@ -1,6 +1,6 @@
 # Engineering agent rules
 
-Read `README.md`, `IMPLEMENTATION_STATUS.md` and the relevant guide in `SKILLS/` before coding. The
+Read `docs/DEVELOPING.md`, `IMPLEMENTATION_STATUS.md` and the relevant guide in `SKILLS/` before coding. The
 specification in `docs/01`–`09` and `contracts/schema.sql` remains the requirements baseline; where
 the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviation and it wins.
 
@@ -20,8 +20,10 @@ the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviat
    `CMakeLists.txt` (`mso_module(... MODULES ...)`); the `include-graph` CTest entry enforces it.
    Exception: test-only helpers live next to the tests (`tests/test_support.{hpp,cpp}`).
 5. **Every component has doctest tests** (`tests/<area>_tests.cpp`, `TEST_SUITE("<area>")`).
-6. **Docs move with code:** update `README.md`, `docs/BUILDING.md`, `deps/README.md`,
-   `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change.
+6. **Docs move with code:** update `docs/DEVELOPING.md`, `docs/BUILDING.md`, `deps/README.md`,
+   `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change. `README.md` is
+   for the people who use the app (producers, sound designers): change it when something they see
+   changes, in plain words with no implementation detail.
 7. **Windows and Linux:** Windows (MSYS2 CLANG64, clang + libc++) is verified; Linux must stay
    buildable. Platform code goes behind `#ifdef _WIN32` with a POSIX branch.
 8. **Git:** never commit or push without the owner's explicit OK for that commit.

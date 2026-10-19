@@ -54,4 +54,4 @@ second partition automatically; the final tie-breaker is always the sample id.
 Performance: `mso_tests --test-suite=search --no-skip --test-case=*benchmark*` runs the skipped-by-default
 100K-row benchmark (release build: `for_each_row` about 141 ms, first page about 2.9 ms on the dev PC).
 
-Also document the field in the query language section of `README.md`.
+Also document the field in the "Searching" table of `README.md` (written for users: plain words, no SQL).
