@@ -78,8 +78,10 @@ the Linux build is not yet verified on a Linux machine.
   `miniaudio/miniaudio.c` and `signalsmith_linear/platform/linear-xsimd-dispatch.cpp` are no longer
   vendored. SQLite additionally uses `OMIT_DEPRECATED`, `OMIT_SHARED_CACHE` and
   `LIKE_DOESNT_MATCH_BLOBS`; its options are PRIVATE to the amalgamation.
-- CI (not yet run, no remote): see `README.md`. Linux Qt is built from source with libc++
-  (`.github/scripts/build-qt-libcxx.sh`; `docs/BUILDING.md` explains the libstdc++ link problem).
+- CI: see `README.md`. Windows builds everything from prebuilt MSYS2 packages; Linux builds the core,
+  CLI and worker without the desktop app (`MSO_BUILD_GUI=OFF`), because no prebuilt Qt uses libc++
+  and building Qt in CI is too slow. `.github/scripts/build-qt-libcxx.sh` stays for building the desktop app
+  locally on Linux (`docs/BUILDING.md` explains the libstdc++ link problem).
 - Tests: CTest entries are generated per `TEST_SUITE` plus a catch-all per executable, with timeouts
   and labels; shared helpers (scratch directories, WAV writers, deadline polling, worker path) are in
   `tests/test_support.{hpp,cpp}`.

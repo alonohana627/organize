@@ -63,8 +63,9 @@ headless. On first start the desktop app creates the library "My Samples" under
 ## Linux — prepared, not yet verified
 
 The code keeps platform specifics behind small interfaces (`#ifdef _WIN32` with POSIX branches:
-file identity, worker process spawning and limits, audio backends). Setup on Ubuntu 24.04, the same
-steps CI runs:
+file identity, worker process spawning and limits, audio backends). Setup on Ubuntu 24.04 (CI runs
+the same steps except the Qt build: its Linux jobs configure with `-DMSO_BUILD_GUI=OFF -DMSO_REQUIRE_GUI=OFF`
+and test the core, the CLI and the worker; the desktop app is tested on Windows):
 
 ```sh
 # clang, libc++ and libc++abi from the apt.llvm.org repository (key fingerprint checked; no piped script)

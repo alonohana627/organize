@@ -6,14 +6,17 @@ durable undo, and run explicit local analysis (BPM, key, waveforms, duplicates).
 no telemetry. C++23 (clang + libc++), Qt 6, SQLite. Licensed under the GNU GPL v3.
 
 - **Build:** [`docs/BUILDING.md`](docs/BUILDING.md) (Windows via MSYS2 CLANG64 is verified; Linux is prepared)
-- **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is configured but **has not run yet** (the
-  repository has no remote). It is set up to build with warnings as errors and run every CTest entry on
-  **Windows** (MSYS2 CLANG64: clang + libc++, Qt 6, FFmpeg; plus an install-and-launch check without
-  MSYS2 on `PATH`) and **Linux** (Ubuntu 24.04, LLVM 23 clang + libc++, FFmpeg, and Qt 6.11 built from
-  source with libc++, because distribution Qt is built with libstdc++ and cannot link with this
-  project's libc++ code), a Linux Debug + AddressSanitizer/UndefinedBehaviorSanitizer run, and a lint
-  job (vendored-dependency digests, `clang-format`). A missing Qt or FFmpeg fails the CI build instead
-  of being skipped.
+- **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) builds with warnings as errors and runs
+  every CTest entry, using only prebuilt packages for the toolchain, Qt and FFmpeg:
+  - **Windows** (MSYS2 CLANG64: clang + libc++, Qt 6, FFmpeg) covers the whole project, including the
+    desktop app and its UI tests, plus an install-and-launch check without MSYS2 on `PATH`.
+  - **Linux** (Ubuntu 24.04, LLVM 23 clang + libc++, FFmpeg) covers the core, the CLI and the worker,
+    with a release run and a Debug + AddressSanitizer/UndefinedBehaviorSanitizer run. The desktop app
+    is not built there: no prebuilt Qt uses libc++, and building Qt in CI is too slow (see
+    `docs/BUILDING.md`).
+  - **Lint** checks the vendored-dependency digests and `clang-format`.
+
+  A missing FFmpeg (or, on Windows, Qt) fails the build instead of being skipped.
 - **What is implemented and verified:** [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)
 - **Guides for coding agents:** [`SKILLS/`](SKILLS/README.md) · repository rules in [`AGENTS.md`](AGENTS.md)
 - **Dependencies:** [`deps/README.md`](deps/README.md)
