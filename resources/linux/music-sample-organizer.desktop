@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Music Sample Organizer
+Comment=Offline sample library browser
+Exec=MusicSampleOrganizer
+Icon=music-sample-organizer
+Terminal=false
+Categories=AudioVideo;Audio;

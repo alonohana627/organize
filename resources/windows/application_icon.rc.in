@@ -1,0 +1,3 @@
+// Windows resource script: the executable icon shown by Explorer, the taskbar and shortcuts.
+// Configured by CMake (cmake/ApplicationIcon.cmake) so the icon path is absolute.
+IDI_APPLICATION_ICON ICON "@MSO_APPLICATION_ICON_FILE@"

@@ -131,6 +131,7 @@ include/mso/<module>/   all headers          src/<module>/   implementation (.cp
 include/mso/<module>/detail/   internal headers; the module include graph is checked (CTest include-graph)
 tests/      doctest suites per area, shared helpers in test_support.{hpp,cpp}
 deps/       vendored libraries (+ patches/)
+resources/  application icon (SVG source + generated PNG/ICO), Windows .rc, Linux .desktop entry
 SKILLS/     task guides for coding agents    docs/   specification and build docs
 ```
 

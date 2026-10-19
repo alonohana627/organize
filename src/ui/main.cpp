@@ -11,7 +11,9 @@
 /// (documentation and visual review; also works offscreen).
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QIcon>
 #include <QPixmap>
+#include <QSize>
 #include <QTimer>
 
 #include "mso/app/application.hpp"
@@ -27,6 +29,12 @@ int main(int argc, char* argv[]) {
     QApplication application(argc, argv);
     QApplication::setApplicationName(QStringLiteral("Music Sample Organizer"));
     QApplication::setApplicationVersion(QStringLiteral(MSO_VERSION_STRING));
+    // Every rendered size from the Qt resources (cmake/ApplicationIcon.cmake), so title bars, the
+    // taskbar and Alt+Tab each get a crisp image instead of a scaled one.
+    QIcon application_icon;
+    for (const int size : {16, 24, 32, 48, 64, 128, 256})
+        application_icon.addFile(QStringLiteral(":/icons/music_sample_organizer_%1.png").arg(size), QSize(size, size));
+    QApplication::setWindowIcon(application_icon);
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QApplication::translate("main", "Offline sample library browser"));

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Music Sample Organizer application icon: the source of every generated size (resources/README.md). -->
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5b5bf0"/>
+      <stop offset="1" stop-color="#1fb5c9"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#background)"/>
+  <rect x="8" y="8" width="240" height="120" rx="52" fill="url(#shine)"/>
+  <!-- Waveform: rounded bars centred on the middle line. -->
+  <g fill="#ffffff">
+    <rect x="44"  y="104" width="20" height="48"  rx="10"/>
+    <rect x="76"  y="76"  width="20" height="104" rx="10"/>
+    <rect x="108" y="48"  width="20" height="160" rx="10"/>
+    <rect x="140" y="84"  width="20" height="88"  rx="10"/>
+    <rect x="172" y="64"  width="20" height="128" rx="10"/>
+    <rect x="204" y="108" width="12" height="40"  rx="6" fill-opacity="0.75"/>
+  </g>
+</svg>

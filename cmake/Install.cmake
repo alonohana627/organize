@@ -14,6 +14,9 @@ if(TARGET MusicSampleOrganizer)
 endif()
 install(TARGETS ${_mso_installed_targets} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES LICENSE README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+if(TARGET MusicSampleOrganizer)
+  mso_install_desktop_entry()
+endif()
 
 if(TARGET MusicSampleOrganizer)
   # Qt's own deployment (windeployqt on Windows): Qt DLLs, platform/style/image plugins, qt.conf.
