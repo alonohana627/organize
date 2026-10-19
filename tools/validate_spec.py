@@ -15,8 +15,8 @@ class DocumentContracts(unittest.TestCase):
         self.assertEqual([p.name[:2] for p in DOCS], [f'{i:02}' for i in range(1, 10)])
 
     def test_requirement_traceability(self):
-        reqs = (ROOT/'docs/01_REQUIREMENTS.md').read_text()
-        roadmap = (ROOT/'docs/07_ROADMAP.md').read_text().split('## 10. Requirement traceability')[1]
+        reqs = (ROOT/'docs/01_REQUIREMENTS.md').read_text(encoding='utf-8')
+        roadmap = (ROOT/'docs/07_ROADMAP.md').read_text(encoding='utf-8').split('## 10. Requirement traceability')[1]
         ids = set(re.findall(r'\bR\d{2}\b', reqs))
         self.assertEqual(ids, {f'R{i:02}' for i in range(1,29)})
         self.assertTrue(ids <= set(re.findall(r'\bR\d{2}\b', roadmap)))
@@ -24,31 +24,31 @@ class DocumentContracts(unittest.TestCase):
     def test_json_examples(self):
         examples = 0
         for p in DOCS:
-            for block in re.findall(r'```json\n(.*?)\n```', p.read_text(), re.S):
+            for block in re.findall(r'```json\n(.*?)\n```', p.read_text(encoding='utf-8'), re.S):
                 self.assertIsInstance(json.loads(block), dict, p.name)
                 examples += 1
         self.assertGreaterEqual(examples, 2)
 
     def test_source_ids_defined(self):
-        all_text = '\n'.join(p.read_text() for p in DOCS)
+        all_text = '\n'.join(p.read_text(encoding='utf-8') for p in DOCS)
         refs = set(re.findall(r'\bS\d{2}\b', all_text))
-        sources = set(re.findall(r'^\| (S\d{2}) \|', (ROOT/'docs/09_DECISIONS_AND_SOURCES.md').read_text(), re.M))
+        sources = set(re.findall(r'^\| (S\d{2}) \|', (ROOT/'docs/09_DECISIONS_AND_SOURCES.md').read_text(encoding='utf-8'), re.M))
         self.assertEqual(refs, sources)
 
     def test_fences_and_no_placeholders(self):
         for p in DOCS:
-            text = p.read_text()
+            text = p.read_text(encoding='utf-8')
             self.assertEqual(len(re.findall(r'^```', text, re.M)) % 2, 0, p.name)
             self.assertNotRegex(text, r'\b(?:TODO|FIXME|TBD)\b')
 
     def test_referenced_repo_files(self):
-        for name in re.findall(r'`((?:docs|contracts|tools)/[^`]+\.(?:md|sql|py))`', (ROOT/'README.md').read_text()):
+        for name in re.findall(r'`((?:docs|contracts|tools)/[^`]+\.(?:md|sql|py))`', (ROOT/'README.md').read_text(encoding='utf-8')):
             self.assertTrue((ROOT/name).is_file(), name)
 
 class SchemaContracts(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(':memory:')
-        self.db.executescript((ROOT/'contracts/schema.sql').read_text())
+        self.db.executescript((ROOT/'contracts/schema.sql').read_text(encoding='utf-8'))
         self.db.execute("INSERT INTO roots(id,uuid,name,mode) VALUES(1,'root-1','Test','referenced')")
         self.add_sample(1, 'kick')
         self.db.commit()
@@ -74,7 +74,7 @@ class SchemaContracts(unittest.TestCase):
 
     def test_all_domain_tables_created(self):
         actual={r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        expected=set(re.findall(r'CREATE TABLE (\w+)', (ROOT/'contracts/schema.sql').read_text()))
+        expected=set(re.findall(r'CREATE TABLE (\w+)', (ROOT/'contracts/schema.sql').read_text(encoding='utf-8')))
         self.assertTrue(expected <= actual)
         self.assertGreaterEqual(len(expected), 30)
 

@@ -1,0 +1,54 @@
+# Builds and tests on Windows (MSYS2 CLANG64: clang + libc++) and Linux (LLVM clang + libc++).
+# Dependencies under deps/ are vendored; Qt 6 and FFmpeg come from the system package manager.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-qt6-base
+            mingw-w64-clang-x86_64-ffmpeg
+      - name: Verify vendored dependencies
+        run: python3 deps/update_deps.py --check || python deps/update_deps.py --check
+      - name: Configure
+        run: cmake --preset release
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain and system libraries
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y libc++-20-dev libc++abi-20-dev cmake ninja-build pkg-config \
+            qt6-base-dev libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+            libpulse-dev libasound2-dev ffmpeg
+      - name: Verify vendored dependencies
+        run: python3 deps/update_deps.py --check
+      - name: Configure
+        run: cmake --preset release -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: QT_QPA_PLATFORM=offscreen ctest --preset release

@@ -3,3 +3,6 @@
 *.sql text eol=lf
 *.py text eol=lf
 *.json text eol=lf
+# Vendored sources and patches are kept byte-exact (no line-ending conversion).
+deps/** -text
+patches/** -text

@@ -1,0 +1,293 @@
+#include "mso/audio/source_stream.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <new>
+#include <string>
+
+#include "mso/audio/sample_safety.hpp"
+#include "mso/audio/tempo_pitch_stretcher.hpp"
+
+namespace mso::audio {
+namespace {
+
+/// Source frames decoded per read: small enough to keep the decoder thread responsive.
+constexpr std::size_t kSourceChunkFrames = 1024;
+/// Length of the click-avoiding fades at segment starts and loop ends.
+constexpr std::int64_t kDeclickRampMilliseconds = 5;
+/// Highest source rate accepted (miniaudio's MA_MAX_SAMPLE_RATE); keeps the rate ratio in 32 bits.
+constexpr int kMaximumSourceRate = 384000;
+
+}  // namespace
+
+SourceStream::SourceStream(std::unique_ptr<media::Decoder> decoder) : decoder_(std::move(decoder)) {}
+
+SourceStream::~SourceStream() = default;
+
+Result<std::unique_ptr<SourceStream>> SourceStream::create(std::unique_ptr<media::Decoder> decoder) {
+    if (!decoder) {
+        return fail(ErrorCode::InvalidArgument, "no decoder");
+    }
+    const int channels = decoder->channels();
+    const int rate = decoder->sample_rate();
+    if (channels <= 0 || channels > MA_MAX_CHANNELS) {
+        return fail(ErrorCode::UnsupportedCodec, "unsupported channel count " + std::to_string(channels));
+    }
+    if (rate <= 0 || rate > kMaximumSourceRate) {
+        return fail(ErrorCode::UnsupportedCodec, "unsupported sample rate " + std::to_string(rate));
+    }
+    std::unique_ptr<SourceStream> stream(new SourceStream(std::move(decoder)));
+    stream->channels_ = static_cast<std::size_t>(channels);
+    stream->source_rate_ = rate;
+    stream->ramp_frames_ = std::max<std::int64_t>(1, rate * kDeclickRampMilliseconds / 1000);
+    stream->staged_.assign(kSourceChunkFrames * stream->channels_, 0.0f);
+    return stream;
+}
+
+std::optional<std::int64_t> SourceStream::exact_total_frames() const {
+    if (!decoder_->frames_exact()) {
+        return std::nullopt;
+    }
+    return decoder_->total_frames();
+}
+
+Result<void> SourceStream::restart(std::int64_t source_frame, const PlaybackShape& shape, std::uint32_t output_rate) {
+    const std::optional<std::int64_t> total = exact_total_frames();
+    std::int64_t target = std::max<std::int64_t>(source_frame, 0);
+    if (total) {
+        target = std::min(target, *total);
+    }
+    if (auto sought = decoder_->seek(target); !sought) {
+        return std::unexpected(sought.error());
+    }
+    const std::int64_t anchor = decoder_->position();
+
+    loop_ = LoopFold{};
+    if (shape.loop) {
+        LoopFold candidate{std::max<std::int64_t>(shape.loop->start_frame, 0), shape.loop->end_frame};
+        if (total) {
+            candidate.end_frame = std::min(candidate.end_frame, *total);
+        }
+        // A loop applies when playback starts before its end; starting past it plays on to the end.
+        if (candidate.is_active() && anchor < candidate.end_frame) {
+            loop_ = candidate;
+        }
+    }
+
+    clock_ = SourceClock(anchor, source_rate_, shape.speed_permille, output_rate);
+    mode_ = shape.mode;
+    // Varispeed resamples by rate × speed; the stretch mode resamples at 1× and lets the
+    // stretcher change the tempo, so pitch is free to move independently.
+    const SourceClock conversion =
+        mode_ == PlaybackMode::Varispeed ? clock_ : SourceClock(anchor, source_rate_, kUnitySpeedPermille, output_rate);
+    auto converter = StereoConverter::create(channels_, conversion.source_units(), conversion.output_units());
+    if (!converter) {
+        return std::unexpected(converter.error());
+    }
+    converter_ = std::move(*converter);
+
+    read_position_ = anchor;
+    segment_frames_read_ = 0;
+    output_frames_since_anchor_ = 0;
+    staged_frames_ = 0;
+    staged_offset_ = 0;
+    input_exhausted_ = false;
+    stretch_tail_frames_ = 0;
+    if (mode_ == PlaybackMode::IndependentTempoPitch) {
+        return prime_stretcher(shape, output_rate);
+    }
+    return {};
+}
+
+Result<void> SourceStream::prime_stretcher(const PlaybackShape& shape, std::uint32_t output_rate) {
+    try {
+        if (!stretcher_ || stretcher_->sample_rate() != output_rate) {
+            stretcher_ = std::make_unique<TempoPitchStretcher>(output_rate);
+        }
+        tempo_ = SourceClock(0, 1, shape.speed_permille, 1);  // stretcher input frames per output frame
+        const double tempo = static_cast<double>(shape.speed_permille) / static_cast<double>(kUnitySpeedPermille);
+        priming_frames_ = stretcher_->priming_frames(tempo);
+        const std::size_t largest_block_input =
+            static_cast<std::size_t>(tempo_.source_frame_after(kPcmBlockFrames)) + 1;
+        stretch_input_.resize(std::max(priming_frames_, largest_block_input) * kOutputChannels);
+    } catch (const std::bad_alloc&) {
+        return fail(ErrorCode::ResourceLimit, "out of memory for the tempo/pitch stretcher");
+    }
+    const auto priming = std::span<float>(stretch_input_).first(priming_frames_ * kOutputChannels);
+    auto converted = convert_into(priming);
+    if (!converted) {
+        return std::unexpected(converted.error());
+    }
+    std::fill(priming.begin() + static_cast<std::ptrdiff_t>(*converted * kOutputChannels), priming.end(), 0.0f);
+    stretcher_->prime(priming, shape.pitch_semitones);
+    if (*converted < priming_frames_) {
+        start_stretch_tail();
+    }
+    return {};
+}
+
+Result<void> SourceStream::render_block(PcmBlockHeader& header, std::span<float> stereo_samples) {
+    const std::size_t capacity = std::min<std::size_t>(stereo_samples.size() / kOutputChannels, kPcmBlockFrames);
+    auto written = mode_ == PlaybackMode::Varispeed ? convert_into(stereo_samples.first(capacity * kOutputChannels))
+                                                    : stretch_into(stereo_samples.first(capacity * kOutputChannels));
+    if (!written) {
+        return std::unexpected(written.error());
+    }
+
+    header.frame_count = static_cast<std::uint32_t>(*written);
+    header.clock = clock_;
+    header.first_output_frame = output_frames_since_anchor_;
+    output_frames_since_anchor_ += static_cast<std::int64_t>(*written);
+    header.loop = loop_;
+    // The resampler's few frames of filter delay are not flushed: inaudible for a preview.
+    header.end_of_stream = mode_ == PlaybackMode::Varispeed ? input_exhausted_ && staged_frames_remaining() == 0
+                                                            : stretch_tail_frames_ == 0 && input_exhausted_;
+    return {};
+}
+
+Result<std::size_t> SourceStream::convert_into(std::span<float> stereo_output) {
+    const std::size_t capacity = stereo_output.size() / kOutputChannels;
+    std::size_t written = 0;
+    while (written < capacity) {
+        if (staged_frames_remaining() == 0) {
+            if (input_exhausted_) {
+                break;
+            }
+            if (auto refilled = refill_staging(); !refilled) {
+                return std::unexpected(refilled.error());
+            }
+            if (staged_frames_remaining() == 0) {
+                break;  // the source just ran out
+            }
+        }
+        const auto staged =
+            std::span<const float>(staged_).subspan(staged_offset_ * channels_, staged_frames_remaining() * channels_);
+        const ConversionProgress progress =
+            converter_->process(staged, stereo_output.subspan(written * kOutputChannels));
+        if (progress.input_frames == 0 && progress.output_frames == 0) {
+            break;  // converter made no progress; the next call continues from here
+        }
+        staged_offset_ += progress.input_frames;
+        written += progress.output_frames;
+    }
+    return written;
+}
+
+Result<std::size_t> SourceStream::stretch_into(std::span<float> stereo_output) {
+    const std::size_t output_frames = stereo_output.size() / kOutputChannels;
+    if (input_exhausted_ && stretch_tail_frames_ == 0) {
+        return std::size_t{0};
+    }
+    // Input for this block follows the exact tempo ratio, so tempo never drifts from the clock.
+    const auto first = static_cast<std::size_t>(tempo_.source_frame_after(output_frames_since_anchor_));
+    const auto last = static_cast<std::size_t>(
+        tempo_.source_frame_after(output_frames_since_anchor_ + static_cast<std::int64_t>(output_frames)));
+    const auto input = std::span<float>(stretch_input_).first((last - first) * kOutputChannels);
+
+    std::size_t converted = 0;
+    if (!input_exhausted_) {
+        auto result = convert_into(input);
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        converted = *result;
+        if (converted < input.size() / kOutputChannels) {
+            start_stretch_tail();
+        }
+    }
+    // Past the end of the source the stretcher drains its look-ahead on silence.
+    std::fill(input.begin() + static_cast<std::ptrdiff_t>(converted * kOutputChannels), input.end(), 0.0f);
+    stretcher_->process(input, stereo_output);
+
+    if (converted == 0 && input_exhausted_) {
+        const std::size_t emitted = std::min(output_frames, stretch_tail_frames_);
+        stretch_tail_frames_ -= emitted;
+        return emitted;
+    }
+    return output_frames;
+}
+
+void SourceStream::start_stretch_tail() noexcept {
+    // Output still owed for the look-ahead the stretcher was primed with.
+    const auto per_output = static_cast<double>(tempo_.source_units()) / static_cast<double>(tempo_.output_units());
+    stretch_tail_frames_ = static_cast<std::size_t>(std::ceil(static_cast<double>(priming_frames_) / per_output));
+}
+
+Result<void> SourceStream::refill_staging() {
+    staged_frames_ = 0;
+    staged_offset_ = 0;
+    // Two attempts: the second covers a loop whose end lies beyond the real end of the file.
+    for (int attempt = 0; attempt < 2 && staged_frames_ == 0; ++attempt) {
+        if (loop_.is_active() && read_position_ >= loop_.end_frame) {
+            if (auto wrapped = wrap_to_loop_start(); !wrapped) {
+                return wrapped;
+            }
+        }
+        std::size_t wanted = kSourceChunkFrames;
+        if (loop_.is_active()) {
+            wanted = std::min<std::size_t>(wanted, static_cast<std::size_t>(loop_.end_frame - read_position_));
+        }
+        auto read = decoder_->read(staged_.data(), wanted);
+        if (!read) {
+            return std::unexpected(read.error());
+        }
+        staged_frames_ = std::min(*read, wanted);
+        if (staged_frames_ == 0) {
+            if (!loop_.is_active() || read_position_ <= loop_.start_frame) {
+                break;
+            }
+            if (auto wrapped = wrap_to_loop_start(); !wrapped) {
+                return wrapped;
+            }
+        }
+    }
+    if (staged_frames_ == 0) {
+        input_exhausted_ = true;
+        return {};
+    }
+    replace_non_finite_with_silence(std::span<float>(staged_).first(staged_frames_ * channels_));
+    apply_declick_ramps();
+    read_position_ += static_cast<std::int64_t>(staged_frames_);
+    segment_frames_read_ += static_cast<std::int64_t>(staged_frames_);
+    return {};
+}
+
+Result<void> SourceStream::wrap_to_loop_start() {
+    if (auto sought = decoder_->seek(loop_.start_frame); !sought) {
+        return std::unexpected(sought.error());
+    }
+    read_position_ = loop_.start_frame;
+    segment_frames_read_ = 0;
+    return {};
+}
+
+void SourceStream::apply_declick_ramps() noexcept {
+    const auto chunk_frames = static_cast<std::int64_t>(staged_frames_);
+    const bool touches_fade_in = segment_frames_read_ < ramp_frames_;
+    const bool touches_fade_out = loop_.is_active() && loop_.end_frame - (read_position_ + chunk_frames) < ramp_frames_;
+    if (!touches_fade_in && !touches_fade_out) {
+        return;
+    }
+    const float ramp_length = static_cast<float>(ramp_frames_);
+    for (std::int64_t frame = 0; frame < chunk_frames; ++frame) {
+        float gain = 1.0f;
+        const std::int64_t frames_into_segment = segment_frames_read_ + frame;
+        if (frames_into_segment < ramp_frames_) {
+            gain = static_cast<float>(frames_into_segment) / ramp_length;
+        }
+        if (loop_.is_active()) {
+            const std::int64_t frames_to_loop_end = loop_.end_frame - (read_position_ + frame);
+            if (frames_to_loop_end < ramp_frames_) {
+                gain = std::min(gain, static_cast<float>(frames_to_loop_end) / ramp_length);
+            }
+        }
+        if (gain < 1.0f) {
+            float* samples = staged_.data() + static_cast<std::size_t>(frame) * channels_;
+            for (std::size_t channel = 0; channel < channels_; ++channel) {
+                samples[channel] *= gain;
+            }
+        }
+    }
+}
+
+}  // namespace mso::audio

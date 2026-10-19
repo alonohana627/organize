@@ -1,0 +1,231 @@
+{
+  "comment": "Pinned third-party sources vendored into deps/. Edit 'ref' and run: python deps/update_deps.py <name>",
+  "dependencies": [
+    {
+      "name": "sqlite",
+      "purpose": "Catalog database engine (amalgamation with FTS5)",
+      "version": "3.53.4",
+      "license": "Public domain",
+      "kind": "archive",
+      "url": "https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip",
+      "sha256": "1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d",
+      "files": {
+        "*/sqlite3.c": "sqlite/sqlite3.c",
+        "*/sqlite3.h": "sqlite/sqlite3.h",
+        "*/sqlite3ext.h": "sqlite/sqlite3ext.h"
+      }
+    },
+    {
+      "name": "nlohmann_json",
+      "purpose": "JSON for history patches, outbox envelopes, settings, export and worker IPC",
+      "version": "3.12.0",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/nlohmann/json",
+      "ref": "v3.12.0",
+      "files": {
+        "single_include/nlohmann/json.hpp": "nlohmann_json/include/nlohmann/json.hpp",
+        "LICENSE.MIT": "nlohmann_json/LICENSE.MIT"
+      }
+    },
+    {
+      "name": "utf8proc",
+      "purpose": "Unicode normalization and case folding for name, sort and sibling keys",
+      "version": "2.12.0",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/JuliaStrings/utf8proc",
+      "ref": "v2.12.0",
+      "files": {
+        "utf8proc.c": "utf8proc/utf8proc.c",
+        "utf8proc.h": "utf8proc/utf8proc.h",
+        "utf8proc_data.c": "utf8proc/utf8proc_data.c",
+        "LICENSE.md": "utf8proc/LICENSE.md"
+      }
+    },
+    {
+      "name": "stduuid",
+      "purpose": "RFC 4122 UUIDs for libraries, samples, operations",
+      "version": "1.2.3",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/mariusbancila/stduuid",
+      "ref": "v1.2.3",
+      "files": {
+        "include/uuid.h": "stduuid/include/uuid.h",
+        "LICENSE": "stduuid/LICENSE"
+      }
+    },
+    {
+      "name": "picosha2",
+      "purpose": "SHA-256 for migration checksums, integrity verification and byte-exact duplicates",
+      "version": "1.0.1",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/okdshin/PicoSHA2",
+      "ref": "v1.0.1",
+      "files": {
+        "picosha2.h": "picosha2/picosha2.h",
+        "LICENSE": "picosha2/LICENSE"
+      }
+    },
+    {
+      "name": "miniaudio",
+      "purpose": "WASAPI preview output, resampling, WAV/FLAC/MP3 decoding",
+      "version": "0.11.25",
+      "license": "Public domain or MIT-0",
+      "kind": "git",
+      "url": "https://github.com/mackron/miniaudio",
+      "ref": "0.11.25",
+      "files": {
+        "miniaudio.h": "miniaudio/miniaudio.h",
+        "miniaudio.c": "miniaudio/miniaudio.c",
+        "extras/stb_vorbis.c": "miniaudio/extras/stb_vorbis.c",
+        "LICENSE": "miniaudio/LICENSE"
+      }
+    },
+    {
+      "name": "pocketfft",
+      "purpose": "FFT for spectral onset, tempo and chroma (key) analysis",
+      "version": "cpp@c90e55b",
+      "license": "BSD-3-Clause",
+      "kind": "git",
+      "url": "https://github.com/mreineck/pocketfft",
+      "ref": "cpp",
+      "commit": "c90e55b3d529f8efa40ed01a20de22405f45fc65",
+      "files": {
+        "pocketfft_hdronly.h": "pocketfft/pocketfft_hdronly.h",
+        "LICENSE.md": "pocketfft/LICENSE.md"
+      }
+    },
+    {
+      "name": "signalsmith_linear",
+      "purpose": "FFT/STFT support library required by signalsmith-stretch",
+      "version": "0.6.5",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/Signalsmith-Audio/linear",
+      "ref": "0.6.5",
+      "files": {
+        "approx.h": "signalsmith_linear/approx.h",
+        "fft.h": "signalsmith_linear/fft.h",
+        "include/signalsmith-linear/approx.h": "signalsmith_linear/include/signalsmith-linear/approx.h",
+        "include/signalsmith-linear/fft.h": "signalsmith_linear/include/signalsmith-linear/fft.h",
+        "include/signalsmith-linear/linear.h": "signalsmith_linear/include/signalsmith-linear/linear.h",
+        "include/signalsmith-linear/stft.h": "signalsmith_linear/include/signalsmith-linear/stft.h",
+        "LICENSE.txt": "signalsmith_linear/LICENSE.txt",
+        "linear.h": "signalsmith_linear/linear.h",
+        "platform/approx-cmsisdsp.h": "signalsmith_linear/platform/approx-cmsisdsp.h",
+        "platform/basic-fill-warnings.h": "signalsmith_linear/platform/basic-fill-warnings.h",
+        "platform/fft-accelerate.h": "signalsmith_linear/platform/fft-accelerate.h",
+        "platform/fft-cmsisdsp.h": "signalsmith_linear/platform/fft-cmsisdsp.h",
+        "platform/fft-ipp.h": "signalsmith_linear/platform/fft-ipp.h",
+        "platform/fft-linear.h": "signalsmith_linear/platform/fft-linear.h",
+        "platform/fft-pffft-double.h": "signalsmith_linear/platform/fft-pffft-double.h",
+        "platform/fft-pffft.h": "signalsmith_linear/platform/fft-pffft.h",
+        "platform/linear-accelerate.h": "signalsmith_linear/platform/linear-accelerate.h",
+        "platform/linear-cmsisdsp.h": "signalsmith_linear/platform/linear-cmsisdsp.h",
+        "platform/linear-xsimd-dispatch.cpp": "signalsmith_linear/platform/linear-xsimd-dispatch.cpp",
+        "platform/linear-xsimd.h": "signalsmith_linear/platform/linear-xsimd.h",
+        "stft.h": "signalsmith_linear/stft.h"
+      }
+    },
+    {
+      "name": "signalsmith_stretch",
+      "purpose": "Time-stretch / pitch-shift for independent tempo and pitch preview (V2)",
+      "version": "1.4.0",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/Signalsmith-Audio/signalsmith-stretch",
+      "ref": "1.4.0",
+      "files": {
+        "include/signalsmith-stretch/signalsmith-stretch.h": "signalsmith_stretch/include/signalsmith-stretch/signalsmith-stretch.h",
+        "LICENSE.txt": "signalsmith_stretch/LICENSE.txt",
+        "signalsmith-stretch.h": "signalsmith_stretch/signalsmith-stretch.h"
+      }
+    },
+    {
+      "name": "thread_pool",
+      "purpose": "Bounded worker pool for parallel import probes",
+      "version": "5.1.0",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/bshoshany/thread-pool",
+      "ref": "v5.1.0",
+      "files": {
+        "include/BS_thread_pool.hpp": "thread_pool/include/BS_thread_pool.hpp",
+        "LICENSE.txt": "thread_pool/LICENSE.txt"
+      }
+    },
+    {
+      "name": "readerwriterqueue",
+      "purpose": "Bounded blocking SPSC queue between import enumeration and commit",
+      "version": "1.0.7",
+      "license": "BSD-2-Clause",
+      "kind": "git",
+      "url": "https://github.com/cameron314/readerwriterqueue",
+      "ref": "v1.0.7",
+      "files": {
+        "readerwritercircularbuffer.h": "readerwriterqueue/include/readerwriterqueue/readerwritercircularbuffer.h",
+        "atomicops.h": "readerwriterqueue/include/readerwriterqueue/atomicops.h",
+        "readerwriterqueue.h": "readerwriterqueue/include/readerwriterqueue/readerwriterqueue.h",
+        "LICENSE.md": "readerwriterqueue/LICENSE.md"
+      }
+    },
+    {
+      "name": "csv_parser",
+      "purpose": "RFC 4180 CSV writing for metadata export",
+      "version": "5.5.0",
+      "license": "MIT",
+      "kind": "download",
+      "downloads": [
+        {
+          "url": "https://github.com/vincentlaucsb/csv-parser/releases/download/v5.5.0/csv.hpp",
+          "sha256": "6a64b52dc6bc045ab70473927fee1a9ea6513c60a5d5f50ef3c5d76fd12c0bad",
+          "destination": "csv_parser/include/csv.hpp"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vincentlaucsb/csv-parser/v5.5.0/LICENSE",
+          "sha256": "59029b5fe7d35208519a89e48e2ba47291b9ad5e9be58f6c3fb549a2f6d41c74",
+          "destination": "csv_parser/LICENSE"
+        }
+      ],
+      "files": {},
+      "patches": [
+        "patches/csv_parser/0001-crlf-record-terminator.patch"
+      ]
+    },
+    {
+      "name": "cli11",
+      "purpose": "Command-line parsing for the mso tool",
+      "version": "2.7.2",
+      "license": "BSD-3-Clause",
+      "kind": "download",
+      "downloads": [
+        {
+          "url": "https://github.com/CLIUtils/CLI11/releases/download/v2.7.2/CLI11.hpp",
+          "sha256": "ffa9a30da295c5858fb5f91f9f45771bab09471d7010a34c7c68c857a330dd76",
+          "destination": "cli11/include/CLI/CLI11.hpp"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/CLIUtils/CLI11/v2.7.2/LICENSE",
+          "destination": "cli11/LICENSE"
+        }
+      ],
+      "files": {}
+    },
+    {
+      "name": "doctest",
+      "purpose": "Test framework for tests/",
+      "version": "2.5.3",
+      "license": "MIT",
+      "kind": "git",
+      "url": "https://github.com/doctest/doctest",
+      "ref": "v2.5.3",
+      "files": {
+        "doctest/doctest.h": "doctest/doctest.h",
+        "LICENSE.txt": "doctest/LICENSE.txt"
+      }
+    }
+  ]
+}

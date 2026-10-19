@@ -1,0 +1,12 @@
+--- a/deps/csv_parser/include/csv.hpp
++++ b/deps/csv_parser/include/csv.hpp
+@@ -12974,7 +12974,8 @@
+ 
+         /** Finalize a single CSV row inside the shared batch buffer. */
+         void end_record() {
+-            batch_buffer_.push_back('\n');
++            // Music Sample Organizer patch: RFC 4180 record terminator (CRLF).
++            batch_buffer_.append("\r\n");
+         }
+ 
+         void finish_write_call() {

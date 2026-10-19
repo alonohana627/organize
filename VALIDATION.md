@@ -1,5 +1,10 @@
 # Specification validation record
 
+> This file records checks of the *specification documents and reference schema*. Verification of
+> the implemented application (builds, test suites, benchmarks) is recorded in
+> [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md). The tools now read files as UTF-8, so
+> `python tools/validate_spec.py` also passes on Windows code pages (re-run 2026-10-19: OK).
+
 Validated 2026-10-19 in the preparation environment with Python's SQLite 3.53.1. This validates documentation and the reference schema, not the Windows application.
 
 - `python3 tools/validate_spec.py`: **26 checks passed**.

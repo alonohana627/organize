@@ -1,16 +1,41 @@
 # Engineering agent rules
 
-1. Read README, the specification, and the current roadmap phase before coding. Treat confirmed requirements as binding. Chosen defaults are implementation decisions, not claims that the user explicitly chose them.
-2. Implement one usable vertical slice at a time. Start with phase P0, then P1. Later milestones remain requirements; do not implement every subsystem upfront.
-3. Keep the shipping application completely offline. No account, telemetry, updater, remote model download, cloud inference, network decoder protocol, or hidden online fallback. Developer dependency acquisition is separate from runtime behavior.
-4. Import performs bounded filesystem/container metadata work only. Full hashing, full waveform extraction, BPM, key, embeddings, classification, and duplicate analysis require an explicit action. Interactive preview may decode the selected file and show its waveform under the separate preview policy.
-5. Preserve source files. Never auto-delete, auto-move, rewrite embedded metadata, or silently merge records. Availability is not deletion.
-6. Keep audio callback work bounded: no allocation, locks, filesystem, SQLite, logging, Qt calls, decoding, or inference on that callback.
-7. Keep datasets disk-backed and UI models paged. Every queue, cache, result set, and worker pool must have an explicit bound. A memory-mapped file still consumes physical memory when paged in.
-8. Use one writer per library. Persist metadata, history, revision, and outbox atomically. Never claim an atomic transaction across libraries or across SQLite and the filesystem.
-9. Use the reference contracts and schema. Add numbered forward migrations only when their feature ships. Do not edit a migration already released. Derived data remains rebuildable and versioned.
-10. Add meaningful tests for correctness and failure behavior. Never relax tests, budgets, recall thresholds, or acceptance criteria merely to make a phase pass. Document an evidence-backed specification amendment before changing a contract.
-11. Work with Git: inspect status first; preserve unrelated changes; use a feature branch; commit each coherent, passing increment. Never commit credentials, recordings, personal libraries, build outputs, downloaded model weights, or benchmark corpora. Never run destructive reset/clean or force push without explicit authorization.
-12. Update `IMPLEMENTATION_STATUS.md` with completed work, checks, unresolved failures, and the exact next action. Record actual command output summaries, not invented tests or performance.
-13. Use pragmatic defaults for routine choices. Do not stop to ask questions already answered here. If blocked by an external artifact, keep the interface, mark the capability unavailable, and finish independent authorized work. Never pretend an unvalidated model or stub is production-ready.
-14. No sub-agent delegation is required by this document. No application implementation is claimed by this specification repository.
+Read `README.md`, `IMPLEMENTATION_STATUS.md` and the relevant guide in `SKILLS/` before coding. The
+specification in `docs/01`–`09` and `contracts/schema.sql` remains the requirements baseline; where
+the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviation and it wins.
+
+## Owner's rules (binding)
+
+1. **Use libraries, never hand-roll utilities.** UUIDs are `uuids::uuid` (stduuid; `mso::new_uuid()`),
+   JSON is `nlohmann::json` (no aliases), SHA-256 is `picosha2`, Unicode is utf8proc, FFT is pocketfft,
+   CSV is csv-parser, CLI parsing is CLI11, queues are moodycamel, time-stretch is signalsmith-stretch,
+   tests are doctest. A missing capability means a new vendored dependency (`SKILLS/add-dependency`).
+   The project is GPL-3.0; any GPL-compatible library is acceptable.
+2. **Vendored code is never edited by hand.** Changes are patches in `patches/<name>/`, listed in
+   `deps/manifest.json` and re-applied by `deps/update_deps.py`.
+3. **Clear names, no abbreviations**, and a `///` doc comment on every meaningful class and
+   non-trivial function. Aim for code a reviewer rates 10/10.
+4. **Layout:** all headers in `include/mso/<module>/`, all sources in `src/<module>/` (`.cpp` only).
+5. **Every component has doctest tests** (`tests/<area>_tests.cpp`, `TEST_SUITE("<area>")`).
+6. **Docs move with code:** update `README.md`, `docs/BUILDING.md`, `deps/README.md`,
+   `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change.
+7. **Windows and Linux:** Windows (MSYS2 CLANG64, clang + libc++) is verified; Linux must stay
+   buildable. Platform code goes behind `#ifdef _WIN32` with a POSIX branch.
+8. **Git:** never commit or push without the owner's explicit OK for that commit.
+
+## Product invariants (from the specification, as amended)
+
+9. The application is completely offline: no accounts, telemetry, updater, downloads, cloud
+   inference or network decoder protocols. Developer dependency fetching is separate.
+10. Import is bounded metadata work. Analysis (hashing, waveforms, BPM, key) runs only as durable
+    analysis runs in `mso-worker`. The desktop app queues them automatically after imports (owner's
+    decision); the CLI only on request. Interactive preview may decode the selected file.
+11. Preserve source files: never delete, move, rewrite embedded metadata or silently merge records.
+    Availability is not deletion.
+12. The audio callback does no allocation, locking, I/O, SQLite, logging, Qt calls or decoding.
+13. Datasets stay disk-backed and UI models paged; every queue, cache and pool is bounded.
+14. One serialized writer per library; metadata, history, revision and outbox commit atomically.
+    Never claim atomicity across libraries or across SQLite and the filesystem.
+15. Schema changes are new numbered migrations; released migrations are immutable (checksummed).
+16. Never relax tests or acceptance criteria to make something pass. Report real command output in
+    `IMPLEMENTATION_STATUS.md`, never invented results.
