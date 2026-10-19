@@ -3,6 +3,7 @@
 /// Thin RAII wrapper over SQLite. A Connection is thread-confined: it is used by one thread at a
 /// time and never shared concurrently. No raw sqlite3 handle escapes the catalog module's public API.
 #include <chrono>
+#include <concepts>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -70,8 +71,14 @@ public:
 
     /// Binds a 64-bit integer.
     PreparedStatement& bind(int parameter, std::int64_t value);
-    /// Binds an int as a 64-bit integer.
-    PreparedStatement& bind(int parameter, int value) { return bind(parameter, static_cast<std::int64_t>(value)); }
+    /// Binds any other integer type (int, bool, `long` vs `long long`, chrono counts) as a 64-bit
+    /// integer. A template so that no integer type is ambiguous between the overloads: std::int64_t
+    /// is `long` on Linux but `long long` on Windows, while chrono durations use `long long` on both.
+    template <std::integral Integer>
+        requires(!std::same_as<Integer, std::int64_t>)
+    PreparedStatement& bind(int parameter, Integer value) {
+        return bind(parameter, static_cast<std::int64_t>(value));
+    }
     /// Binds a double.
     PreparedStatement& bind(int parameter, double value);
     /// Binds UTF-8 text (copied by SQLite).
