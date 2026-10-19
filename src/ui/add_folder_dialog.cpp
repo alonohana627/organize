@@ -16,6 +16,7 @@ AddFolderDialog::AddFolderDialog(const QString& folder, const std::vector<std::p
     setWindowTitle(tr("Add folder"));
 
     auto* folder_label = new QLabel(folder, this);
+    folder_label->setTextFormat(Qt::PlainText);  // a folder name is never markup
     folder_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
     folder_label->setWordWrap(true);
 

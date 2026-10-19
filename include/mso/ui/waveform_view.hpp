@@ -32,6 +32,7 @@ public:
     /// What the view currently displays.
     enum class State { NoSample, NotGenerated, Generating, Failed, Ready };
 
+    /// An empty view showing "no sample".
     explicit WaveformView(QWidget* parent = nullptr);
 
     /// Nothing selected.
@@ -93,13 +94,13 @@ private:
     State state_ = State::NoSample;
     /// Overview bins (Ready state).
     WaveformBins bins_;
-    double progress_ = 0;  ///< generating progress 0..1
-    QString failure_;      ///< reason shown in the Failed state
-    std::optional<double> playhead_;
+    double progress_ = 0;             ///< generating progress 0..1
+    QString failure_;                 ///< reason shown in the Failed state
+    std::optional<double> playhead_;  ///< playhead as a fraction of the length, if shown
     /// Whether clicks and keys seek.
     bool seekable_ = false;
-    mutable QPixmap bins_pixmap_;  ///< cached rendering of bins_ (painted lazily)
-    mutable bool bins_pixmap_valid_ = false;
+    mutable QPixmap bins_pixmap_;             ///< cached rendering of bins_ (painted lazily)
+    mutable bool bins_pixmap_valid_ = false;  ///< the cached pixmap matches the bins and size
 };
 
 }  // namespace mso::ui

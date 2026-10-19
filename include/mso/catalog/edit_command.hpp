@@ -70,9 +70,9 @@ struct TaxonomyCommand {
 };
 
 /// Checks value bounds and incompatible operations before any write.
-Result<void> validate(const EditCommand& command);
+[[nodiscard]] Result<void> validate(const EditCommand& command);
 
 /// A short history label such as "Set rating 4 on 12 samples".
-std::string describe(const EditCommand& command);
+[[nodiscard]] std::string describe(const EditCommand& command);
 
 }  // namespace mso::catalog

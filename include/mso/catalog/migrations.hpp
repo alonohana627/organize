@@ -18,8 +18,8 @@ struct Migration {
 };
 
 /// Every migration this build ships, in version order.
-const std::vector<Migration>& migrations();
+[[nodiscard]] const std::vector<Migration>& migrations();
 /// Version of the newest migration.
-int latest_schema_version();
+[[nodiscard]] int latest_schema_version();
 
 }  // namespace mso::catalog

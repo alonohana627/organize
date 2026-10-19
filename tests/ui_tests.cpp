@@ -18,8 +18,12 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLocale>
 #include <QMainWindow>
+#include <QMenu>
 #include <QMouseEvent>
+#include <QPersistentModelIndex>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QStyleOptionViewItem>
@@ -33,7 +37,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -53,6 +59,7 @@
 #include "mso/ui/history_panel.hpp"
 #include "mso/ui/inspector_panel.hpp"
 #include "mso/ui/jobs_panel.hpp"
+#include "mso/ui/layout_controller.hpp"
 #include "mso/ui/layout_preset_store.hpp"
 #include "mso/ui/layout_store.hpp"
 #include "mso/ui/main_window.hpp"
@@ -61,6 +68,7 @@
 #include "mso/ui/optimistic_edit.hpp"
 #include "mso/ui/preferences_dialog.hpp"
 #include "mso/ui/preview_panel.hpp"
+#include "mso/ui/sample_context_menu.hpp"
 #include "mso/ui/sample_row_delegate.hpp"
 #include "mso/ui/sample_table_model.hpp"
 #include "mso/ui/sample_table_view.hpp"
@@ -78,17 +86,19 @@ using mso::search::SampleRow;
 using mso::ui::SampleKey;
 using mso::ui::SampleTableModel;
 
-/// One QApplication for the whole test run, on the offscreen platform with silent audio.
+/// One QApplication for the whole test run, on the offscreen platform with silent audio (shared
+/// with the other ui_*.cpp files: whichever asks first creates it).
 QApplication& application() {
     static int argc = 1;
     static char name[] = "mso_ui_tests";
     static char* argv[] = {name, nullptr};
-    static std::unique_ptr<QApplication> instance = [] {
+    static std::unique_ptr<QApplication> instance = []() -> std::unique_ptr<QApplication> {
+        if (QCoreApplication::instance()) return nullptr;
         qputenv("QT_QPA_PLATFORM", "offscreen");
         qputenv("MSO_AUDIO_BACKEND", "null");
         return std::make_unique<QApplication>(argc, argv);
     }();
-    return *instance;
+    return *qobject_cast<QApplication*>(QCoreApplication::instance());
 }
 
 /// Runs the Qt event loop until `done` holds or the deadline passes; returns the final value.
@@ -122,30 +132,55 @@ private:
     std::vector<std::function<void()>> held_;
 };
 
-/// In-memory search backend: each query text maps to a sorted row list; cursors are offsets.
+/// In-memory search backend: each query text maps to a sorted row list; cursors are offsets
+/// tagged with the structure generation they were issued in. Bumping `structure_generation`
+/// makes every older cursor STALE_CURSOR, like the Application's index after rows are added.
 class FakePageSource final : public mso::ui::SamplePageSource {
 public:
     std::map<std::string, std::vector<SampleRow>> results;
     std::vector<mso::search::SearchRequest> page_requests;
     int count_requests = 0;
     int rows_requests = 0;
+    int stale_failures = 0;                ///< pages refused because their cursor went stale
+    int skipped_obsolete = 0;              ///< requests whose stop token was set before they ran
+    int structure_generation = 0;          ///< cursors of older generations are stale
+    std::optional<mso::Error> rows_error;  ///< when set, request_rows() fails with it
     DeliveryQueue deliveries;
 
-    void request_page(const mso::search::SearchRequest& request, std::optional<uuids::uuid>, QObject* context,
-                      PageDelivery deliver) override {
+    void request_page(const mso::search::SearchRequest& request, std::optional<uuids::uuid>, std::stop_token obsolete,
+                      QObject* context, PageDelivery deliver) override {
         page_requests.push_back(request);
+        // The page is computed when the "work" runs (the delivery), like on the session's pool: a
+        // structure change between the request and then makes its cursor stale.
+        deliveries.schedule(context, [this, request, deliver, obsolete] {
+            if (obsolete.stop_requested()) ++skipped_obsolete;
+            deliver(page_for(request));
+        });
+    }
+
+    mso::Result<mso::search::SearchPage> page_for(const mso::search::SearchRequest& request) {
+        std::size_t offset = 0;
+        if (request.cursor) {
+            const std::string& token = request.cursor->token;
+            const auto separator = token.find(':');
+            offset = std::stoul(token.substr(0, separator));
+            if (std::stoi(token.substr(separator + 1)) != structure_generation) {
+                ++stale_failures;
+                return mso::fail(mso::ErrorCode::StaleCursor, "the result changed");
+            }
+        }
         const auto& rows = results[request.text];
-        const std::size_t offset = request.cursor ? std::stoul(request.cursor->token) : 0;
         mso::search::SearchPage page;
         for (std::size_t index = offset; index < rows.size() && page.rows.size() < request.page_size; ++index)
             page.rows.push_back(rows[index]);
         if (offset + page.rows.size() < rows.size())
-            page.next = mso::search::Cursor{std::to_string(offset + page.rows.size())};
-        deliveries.schedule(context, [deliver, page] { deliver(page); });
+            page.next = mso::search::Cursor{std::to_string(offset + page.rows.size()) + ":" +
+                                            std::to_string(structure_generation)};
+        return page;
     }
 
-    void request_count(const mso::search::SearchRequest& request, std::optional<uuids::uuid>, QObject* context,
-                       CountDelivery deliver) override {
+    void request_count(const mso::search::SearchRequest& request, std::optional<uuids::uuid>, std::stop_token,
+                       QObject* context, CountDelivery deliver) override {
         ++count_requests;
         mso::search::CountResult count;
         count.total = static_cast<std::int64_t>(results[request.text].size());
@@ -154,6 +189,10 @@ public:
 
     void request_rows(const std::vector<SampleKey>& keys, QObject* context, RowsDelivery deliver) override {
         ++rows_requests;
+        if (rows_error) {
+            deliveries.schedule(context, [deliver, error = *rows_error] { deliver(std::unexpected(error)); });
+            return;
+        }
         std::vector<SampleRow> found;
         for (const SampleKey& key : keys) {
             for (const auto& [text, rows] : results) {
@@ -283,7 +322,7 @@ TEST_SUITE("ui") {
         CHECK(name_at(model, 449) == QStringLiteral("kick 449"));
         CHECK(source.count_requests == 1);
         CHECK(source.page_requests.size() == 3);
-        CHECK(source.page_requests.back().cursor->token == "400");
+        CHECK(source.page_requests.back().cursor->token == "400:0");
     }
 
     TEST_CASE("results of an obsolete query generation are discarded") {
@@ -462,7 +501,7 @@ TEST_SUITE("ui") {
         CHECK(row.display_name == "Big kick");
         CHECK(row.tag_paths == std::vector<std::string>{"Drums/Kick", "Punchy"});
         CHECK(row.tag_ids == std::vector<std::int64_t>{7, 0});
-        CHECK(row.tags == "Drums/Kick, Punchy");
+        CHECK(mso::ui::DisplayFormat::tag_list(row.tag_paths) == QStringLiteral("Drums/Kick, Punchy"));
         CHECK(row.category == "Drums/Kicks");
         CHECK_FALSE(row.category_id.has_value());  // the catalog assigns it on reconciliation
         CHECK(row.bpm_milli == 128'000);
@@ -843,6 +882,31 @@ TEST_SUITE("ui") {
         window.takeCentralWidget();
     }
 
+    TEST_CASE("layout controller saves, applies, resets and deletes presets") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        QMainWindow window;
+        window.setObjectName(QStringLiteral("LayoutControllerWindow"));
+        auto* table = new QTableView;
+        window.setCentralWidget(table);
+        mso::ui::LayoutController controller(idle_session, window, *table->horizontalHeader());
+        controller.capture_default();
+        QMenu view;
+        controller.add_menu_entries(view);
+        int restored = 0;
+        QObject::connect(&controller, &mso::ui::LayoutController::headerRestored, [&] { ++restored; });
+        controller.save_preset_as(QStringLiteral("Mixing"));
+        CHECK(controller.preset_names() == QStringList{QStringLiteral("Mixing")});
+        controller.apply_preset(QStringLiteral("Mixing"));
+        CHECK(restored == 1);
+        controller.reset();
+        CHECK(restored == 2);
+        controller.save_current();
+        CHECK(idle_session.preference(mso::ui::LayoutStore::kCurrentLayoutKey).is_object());
+        controller.delete_preset(QStringLiteral("Mixing"));
+        CHECK(controller.preset_names().isEmpty());
+    }
+
     TEST_CASE("preferences are cached synchronously and layout presets are kept by name") {
         application();
         mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
@@ -992,6 +1056,433 @@ TEST_SUITE("ui") {
         pool.waitForDone();
     }
 
+    // ---------------------------------------------------------------- stale cursors and refreshes
+
+    TEST_CASE("a stale cursor runs an anchored refresh that keeps every loaded row and the anchor") {
+        application();
+        FakePageSource source;
+        auto& rows = source.results[""];
+        rows = make_rows(3000, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 6; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        const QPersistentModelIndex watched = model.index(1100, 0);  // the view's current row, say
+        const SampleKey watched_key = key_of(*model.loaded_row(1100));
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+
+        // An import adds two rows before the anchor: the result's structure changes, every cursor
+        // goes stale, and the next page cannot be appended with the old one.
+        auto added = make_rows(2, "added ", rows.front().library);
+        added[0].sample_id = 10'001;
+        added[1].sample_id = 10'002;
+        rows.insert(rows.begin(), added.begin(), added.end());
+        ++source.structure_generation;
+        model.fetchMore({});
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(source.stale_failures == 1);
+        CHECK(model.rowCount() >= 1200);  // never cut back to the first pages (the review's row 400)
+        REQUIRE(watched.isValid());
+        CHECK(watched.row() == 1102);  // the persistent index followed its sample
+        CHECK(key_of(*model.loaded_row(watched.row())) == watched_key);
+        static_cast<void>(name_at(model, 0));  // outside the refreshed window: the view asks for it
+        REQUIRE(process_events_until([&] { return model.loaded_row(0) != nullptr; }));
+        CHECK(name_at(model, 0) == QStringLiteral("added 0"));
+        // Paging continues with the fresh cursors.
+        const int before = model.rowCount();
+        REQUIRE(model.canFetchMore({}));
+        model.fetchMore({});
+        REQUIRE(process_events_until([&] { return model.rowCount() > before; }));
+        CHECK(name_at(model, model.rowCount() - 1) == QStringLiteral("row %1").arg(model.rowCount() - 3));
+    }
+
+    TEST_CASE("a page re-read with a stale cursor refreshes around that page instead of failing") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(SampleTableModel::kPageSize * 12, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 12; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        REQUIRE(model.loaded_row(SampleTableModel::kPageSize) == nullptr);  // page 1 was evicted
+        int refreshed = 0;
+        int failures = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+        QObject::connect(&model, &SampleTableModel::queryFailed, [&] { ++failures; });
+        ++source.structure_generation;                                   // page 1's start cursor is stale now
+        static_cast<void>(name_at(model, SampleTableModel::kPageSize));  // the view asks for its rows
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(failures == 0);
+        CHECK(model.rowCount() == SampleTableModel::kPageSize * 12);
+        REQUIRE(process_events_until([&] { return model.loaded_row(SampleTableModel::kPageSize) != nullptr; }));
+        CHECK(name_at(model, SampleTableModel::kPageSize) == QStringLiteral("row 200"));
+    }
+
+    TEST_CASE("an anchored refresh that meets another structure change walks again and still commits") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(700, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 4; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == std::min(700, 200 * (page + 1)); }));
+        }
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+        source.deliveries.hold = true;
+        model.refresh(650);
+        source.deliveries.release();    // the first page (no cursor) arrives; the second is requested
+        ++source.structure_generation;  // … and its cursor is stale by the time it runs
+        source.deliveries.hold = false;
+        source.deliveries.release();
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(source.stale_failures >= 1);
+        CHECK(model.rowCount() == 700);
+        CHECK_FALSE(model.is_refreshing());
+    }
+
+    TEST_CASE("a row repeated on a later page (its sort value changed across the cursor) is shown once") {
+        application();
+        FakePageSource source;
+        auto& rows = source.results[""];
+        rows = make_rows(250, "row ");
+        rows[210] = rows[5];  // the same sample again, as a keyset cursor can return it
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        model.fetchMore({});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 249; }));
+        std::set<SampleKey> keys;
+        for (int row = 0; row < model.rowCount(); ++row)
+            keys.insert(key_of(*model.loaded_row(row)));
+        CHECK(keys.size() == 249);
+        // A full refresh skips the repeat as well.
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+        model.refresh(0);
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(model.rowCount() == 249);
+    }
+
+    TEST_CASE("rows with an edit in flight keep the prediction through refreshed and re-read pages") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(3, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 3; }));
+        const SampleKey key = key_of(source.results[""][1]);
+        model.patch_rows({key}, [](SampleRow& row) { row.rating = 5; });
+        model.begin_pending_edit({key});
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+        model.refresh(0);  // the catalog still has the old rating
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(model.loaded_row(1)->rating == 5);  // no flicker back to the old value
+        model.end_pending_edit({key});
+        model.refresh(0);
+        REQUIRE(process_events_until([&] { return refreshed == 2; }));
+        CHECK(model.loaded_row(1)->rating == 0);
+    }
+
+    TEST_CASE("a failed row read is reported and never treated as deleted") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(3, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 3; }));
+        std::optional<QString> failure;
+        QObject::connect(&model, &SampleTableModel::queryFailed, [&](const QString& message) { failure = message; });
+        source.rows_error = mso::fail(mso::ErrorCode::DbBusy, "the library is busy").error();
+        CHECK(model.refresh_rows({key_of(source.results[""][0]), key_of(source.results[""][2])}) == 2);
+        REQUIRE(process_events_until([&] { return failure.has_value(); }));
+        CHECK(model.rowCount() == 3);
+        CHECK(failure->contains(QStringLiteral("busy")));
+        // A key that is not loaded is reported as such, so the caller can re-read the window.
+        CHECK(model.refresh_rows({SampleKey{mso::new_uuid(), 99}}) == 0);
+    }
+
+    TEST_CASE("requests of an obsolete generation are told to skip their work") {
+        application();
+        FakePageSource source;
+        source.results["first"] = make_rows(3, "first ");
+        source.results["second"] = make_rows(2, "second ");
+        SampleTableModel model(source);
+        source.deliveries.hold = true;
+        model.set_query("first", {});
+        model.set_query("second", {});
+        source.deliveries.hold = false;
+        source.deliveries.release();
+        REQUIRE(process_events_until([&] { return model.rowCount() == 2; }));
+        CHECK(source.skipped_obsolete == 1);
+        CHECK(name_at(model, 0) == QStringLiteral("second 0"));
+    }
+
+    TEST_CASE("edits of one library are written one at a time, in order; other libraries in parallel") {
+        application();
+        FakePageSource source;
+        const auto library = mso::new_uuid();
+        auto rows = make_rows(2, "row ", library);
+        const auto other_rows = make_rows(1, "other ");
+        rows.push_back(other_rows.front());
+        source.results[""] = rows;
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 3; }));
+        FakeEditGateway gateway;
+        gateway.deliveries.hold = true;
+        mso::ui::EditController controller(gateway, model);
+        int settled = 0;
+        QObject::connect(&controller, &mso::ui::EditController::succeeded, [&] { ++settled; });
+        mso::catalog::EditCommand first;
+        first.rating = 1;
+        mso::catalog::EditCommand second;
+        second.rating = 2;
+        controller.apply({key_of(rows[0])}, first, QStringLiteral("first"));
+        controller.apply({key_of(rows[0])}, second, QStringLiteral("second"));
+        controller.apply({key_of(rows[2])}, second, QStringLiteral("other library"));
+        CHECK(gateway.edits.size() == 2);  // the second edit of `library` waits for the first
+        CHECK(controller.queued_writes(library) == 1);
+        CHECK(gateway.edits[0].rating == 1);
+        gateway.deliveries.hold = false;
+        gateway.deliveries.release();
+        REQUIRE(process_events_until([&] { return settled == 3; }));
+        REQUIRE(gateway.edits.size() == 3);
+        CHECK(gateway.edits[2].rating == 2);
+        CHECK(controller.queued_writes(library) == 0);
+        int undo_requests_before = gateway.undo_requests;
+        gateway.deliveries.hold = true;
+        controller.undo(library);
+        controller.undo(library);
+        CHECK(gateway.undo_requests == undo_requests_before + 1);  // undo is ordered like edits
+        gateway.deliveries.hold = false;
+        gateway.deliveries.release();
+        REQUIRE(process_events_until([&] { return gateway.undo_requests == undo_requests_before + 2; }));
+    }
+
+    // ---------------------------------------------------------------- inspector drafts and partial selections
+
+    TEST_CASE("inspector refuses edits when part of the selection is not loaded") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        mso::ui::InspectorPanel inspector(idle_session);
+        int requests = 0;
+        QObject::connect(&inspector, &mso::ui::InspectorPanel::editRequested, [&] { ++requests; });
+        const auto rows = make_rows(2, "row ");
+        inspector.show_selection(rows, 5);
+        auto* stars = inspector.findChild<mso::ui::StarRatingWidget*>();
+        REQUIRE(stars != nullptr);
+        CHECK_FALSE(stars->isEnabled());
+        bool explained = false;
+        for (auto* label : inspector.findChildren<QLabel*>())
+            explained =
+                explained || (label->isVisibleTo(&inspector) && label->text().contains(QStringLiteral("2 of the 5")));
+        CHECK(explained);
+        child_named<QPushButton>(inspector, QStringLiteral("Unmark favorite"))->click();
+        CHECK(requests == 0);
+        inspector.show_selection(rows, 2);
+        CHECK(stars->isEnabled());
+    }
+
+    TEST_CASE("inspector drafts survive refreshes and are discarded with the selection") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        mso::ui::InspectorPanel inspector(idle_session);
+        auto rows = make_rows(3, "row ");
+        rows[0].bpm_source = "user";
+        rows[0].bpm_milli = 90'000;
+        rows[1].bpm_source = "analysis";
+        rows[1].bpm_milli = 120'000;
+        auto* bpm_mode = child_named<QComboBox>(inspector, QStringLiteral("BPM override mode"));
+        auto* bpm_apply = child_named<QPushButton>(inspector, QStringLiteral("Apply BPM"));
+        auto* name = child_named<QLineEdit>(inspector, QStringLiteral("Display name"));
+
+        inspector.show_selection({rows[0]}, 1);
+        CHECK(bpm_mode->currentIndex() == 2);  // a manual value
+        bpm_mode->setCurrentIndex(1);          // the user picks "Unknown" and does not apply yet
+        rows[0].rating = 3;
+        inspector.show_selection({rows[0]}, 1);  // the same sample refreshed (not focused)
+        CHECK(bpm_mode->currentIndex() == 1);
+
+        name->setText(QStringLiteral("draft name"));
+        name->setModified(true);
+        inspector.show_selection({rows[1]}, 1);  // another sample: every draft goes
+        CHECK(bpm_mode->currentIndex() == 0);
+        CHECK(name->text() == QStringLiteral("row 1"));
+
+        // Differing overrides: no mode is preselected, so Apply cannot write one sample's to all.
+        inspector.show_selection({rows[0], rows[1]}, 2);
+        CHECK(bpm_mode->currentIndex() == -1);
+        CHECK_FALSE(bpm_apply->isEnabled());
+        bpm_mode->setCurrentIndex(0);
+        CHECK(bpm_apply->isEnabled());
+
+        // Notes: Clear notes leaves no draft behind.
+        inspector.show_selection({rows[2]}, 1);
+        auto* notes = child_named<QPlainTextEdit>(inspector, QStringLiteral("Notes"));
+        notes->setPlainText(QStringLiteral("typed"));
+        QPushButton* save = nullptr;
+        QPushButton* clear = nullptr;
+        for (auto* button : inspector.findChildren<QPushButton*>()) {
+            if (button->text() == QStringLiteral("Save notes")) save = button;
+            if (button->text() == QStringLiteral("Clear notes")) clear = button;
+        }
+        REQUIRE((save && clear));
+        CHECK(save->isEnabled());
+        clear->click();
+        CHECK(notes->toPlainText().isEmpty());
+        CHECK_FALSE(save->isEnabled());
+
+        // Nothing selected: no stars left over from the last sample.
+        rows[2].rating = 4;
+        inspector.show_selection({rows[2]}, 1);
+        inspector.show_selection({}, 0);
+        CHECK(inspector.findChild<mso::ui::StarRatingWidget*>()->rating() == 0);
+    }
+
+    TEST_CASE("inspector tag counts never substitute placeholders inside tag names") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        mso::ui::InspectorPanel inspector(idle_session);
+        auto rows = make_rows(2, "row ");
+        rows[0].tag_paths = {"100%2 legit"};
+        inspector.show_selection(rows, 2);
+        auto* tags = child_named<QListWidget>(inspector, QStringLiteral("Tags"));
+        REQUIRE(tags->count() == 1);
+        CHECK(tags->item(0)->text() == QStringLiteral("100%2 legit (1 of 2)"));
+    }
+
+    // ---------------------------------------------------------------- panels, menus and small helpers
+
+    TEST_CASE("jobs panel closes the runs of a closed library and lists paused jobs") {
+        application();
+        mso::ui::JobsPanel jobs;
+        mso::app::AnalysisProgressEvent event;
+        event.library = mso::new_uuid();
+        mso::catalog::Library::AnalysisRunStatus run;
+        run.id = 7;
+        run.profile_name = "Full";
+        run.state = "running";
+        run.queued = 3;
+        run.paused = 2;
+        event.runs = {run};
+        jobs.update_analysis(event, QStringLiteral("Library"));
+        auto* tree = jobs.findChild<QTreeWidget*>();
+        REQUIRE(tree != nullptr);
+        CHECK(tree->topLevelItem(0)->text(2).contains(QStringLiteral("2 paused")));
+        tree->setCurrentItem(tree->topLevelItem(0));
+        auto* cancel = child_named<QPushButton>(jobs, QStringLiteral("Cancel selected job"));
+        CHECK(cancel->isEnabled());
+        jobs.retain_libraries({});
+        CHECK(tree->topLevelItem(0)->text(2) == QStringLiteral("Library closed"));
+        CHECK_FALSE(cancel->isEnabled());
+    }
+
+    TEST_CASE("the welcome message shows its whole text at every window size") {
+        application();
+        mso::ui::EmptyStateWidget empty;
+        empty.show_welcome();
+        const QLabel* message = empty.message_label();
+        REQUIRE(message != nullptr);
+        CHECK(message->text().endsWith(QStringLiteral("everything works offline.")));
+        empty.show();
+        for (const QSize size : {QSize(1400, 860), QSize(640, 480), QSize(420, 360), QSize(300, 200)}) {
+            empty.resize(size);
+            REQUIRE(process_events_until([&] { return message->width() > 0; }));
+            QCoreApplication::processEvents();
+            INFO("window " << size.width() << "x" << size.height());
+            CHECK(message->height() >= message->heightForWidth(message->width()));
+        }
+    }
+
+    TEST_CASE("sample context menu disables copying when part of the selection is not loaded") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        QWidget parent;
+        mso::ui::SampleMenuCommands commands;
+        std::vector<std::unique_ptr<QAction>> actions;
+        const auto make_action = [&actions] {
+            actions.push_back(std::make_unique<QAction>(QStringLiteral("command")));
+            return actions.back().get();
+        };
+        commands.play = make_action();
+        for (auto& rating : commands.ratings)
+            rating = make_action();
+        commands.toggle_favorite = make_action();
+        commands.remove_from_library = make_action();
+        commands.analyze_waveforms = make_action();
+        commands.analyze_musical = make_action();
+        commands.analyze_duplicates = make_action();
+        mso::ui::SampleContextMenu menu(idle_session, commands, &parent);
+        const auto rows = make_rows(2, "row ");
+        const auto copy_enabled = [](const QMenu& built) {
+            int enabled = 0;
+            for (const QAction* action : built.actions())
+                if (action->text().startsWith(QStringLiteral("Copy")) && action->isEnabled()) ++enabled;
+            return enabled;
+        };
+        CHECK(copy_enabled(*menu.build_menu(rows, 2, rows[0])) == 2);
+        const auto partial = menu.build_menu(rows, 9, rows[0]);
+        CHECK(copy_enabled(*partial) == 0);
+        auto unavailable = rows;
+        unavailable[1].availability = mso::search::RowAvailability::Missing;
+        CHECK(copy_enabled(*menu.build_menu(unavailable, 2, unavailable[0])) == 0);
+    }
+
+    TEST_CASE("a command rebound to a single key moves to the sample table") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        mso::ui::MainWindow window(idle_session);
+        QAction* undo = window.command(QStringLiteral("undo"));
+        REQUIRE(undo != nullptr);
+        CHECK(undo->shortcutContext() == Qt::WindowShortcut);
+        CHECK(window.actions().contains(undo));
+        auto bindings = mso::ui::ShortcutCatalog::defaults();
+        bindings[QStringLiteral("undo")] = QKeySequence(Qt::Key_U);
+        window.apply_shortcuts(bindings);
+        CHECK(undo->shortcutContext() == Qt::WidgetWithChildrenShortcut);
+        CHECK(window.sample_table()->actions().contains(undo));
+        CHECK_FALSE(window.actions().contains(undo));
+        CHECK(mso::ui::ShortcutCatalog::is_single_key(QKeySequence(Qt::SHIFT | Qt::Key_U)));
+        CHECK_FALSE(mso::ui::ShortcutCatalog::is_single_key(QKeySequence(Qt::CTRL | Qt::Key_U)));
+    }
+
+    TEST_CASE("search errors mark a whole code point and sizes follow the locale") {
+        application();
+        mso::ui::SearchBar bar;
+        bar.set_text(QStringLiteral("bpm:\U0001F941"));  // a drum emoji: one code point, two UTF-16 units
+        const QString html = child_named<QLabel>(bar, QStringLiteral("Search error"))->text();
+        const auto high_surrogate = html.indexOf(QChar(0xD83E));
+        if (high_surrogate >= 0) CHECK(html.mid(high_surrogate, 2) == QStringLiteral("\U0001F941"));
+
+        const QLocale previous;
+        QLocale::setDefault(QLocale(QLocale::German, QLocale::Germany));
+        CHECK(mso::ui::DisplayFormat::sample_rate(44'100) == QStringLiteral("44,1 kHz"));
+        QLocale::setDefault(previous);
+        CHECK(mso::ui::DisplayFormat::sample_rate(48'000) == QStringLiteral("48 kHz"));
+    }
+
+#ifdef _WIN32
+    TEST_CASE("file manager commands quote paths for Explorer and never wait for it") {
+        const std::filesystem::path file = std::filesystem::path(u"C:\\Samples, old\\kick 01.wav");
+        const auto reveal = mso::ui::FileManager::reveal_command(file);
+        CHECK(reveal.program == QStringLiteral("explorer.exe"));
+        CHECK(reveal.native_arguments == QStringLiteral("/select,\"C:\\Samples, old\\kick 01.wav\""));
+        const auto open = mso::ui::FileManager::open_folder_command(file.parent_path());
+        CHECK(open.native_arguments == QStringLiteral("\"C:\\Samples, old\""));
+    }
+#endif
+
     // ---------------------------------------------------------------- the real application
 
     TEST_CASE("end to end: search, navigator, preview, drag check, optimistic rating and main window") {
@@ -1091,12 +1582,13 @@ TEST_SUITE("ui") {
             controller.apply({key_of(first)}, command, QStringLiteral("Rated 5"));
             CHECK(model.loaded_row(0)->rating == 5);
             REQUIRE(process_events_until([&] { return successes == 1; }, 10000));
-            std::optional<std::vector<SampleRow>> stored;
+            std::optional<mso::Result<std::vector<SampleRow>>> stored;
             session.request_rows({key_of(first)}, &session,
-                                 [&](std::vector<SampleRow> rows) { stored = std::move(rows); });
+                                 [&](mso::Result<std::vector<SampleRow>> rows) { stored = std::move(rows); });
             REQUIRE(process_events_until([&] { return stored.has_value(); }, 10000));
-            REQUIRE(stored->size() == 1);
-            CHECK(stored->front().rating == 5);
+            REQUIRE(stored->has_value());
+            REQUIRE((*stored)->size() == 1);
+            CHECK((*stored)->front().rating == 5);
         }
 
         // The main window starts on this session, shows the results and scopes single-key shortcuts.

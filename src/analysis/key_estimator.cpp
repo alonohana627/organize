@@ -22,8 +22,8 @@ constexpr double kMinimumChromaVariation = 0.3;   ///< std/mean of the 12 bins; 
 /// activates only its root and fifth (its major-third overtone stays far below), so requiring
 /// three active classes keeps one note from posing as a major or minor key.
 constexpr double kActivePitchClassFraction = 0.2;
-constexpr int kMinimumActivePitchClasses = 3;
-constexpr double kMinimumCorrelation = 0.5;
+constexpr int kMinimumActivePitchClasses = 3;  ///< see kActivePitchClassFraction
+constexpr double kMinimumCorrelation = 0.5;    ///< best profile correlation below this means no key
 /// Best correlation minus the best one of an unrelated key (neither the relative nor the parallel
 /// key of the winner). Relative keys share every pitch class and parallel keys their tonic, so on
 /// real music they routinely score within a few hundredths of the winner; rejecting those near

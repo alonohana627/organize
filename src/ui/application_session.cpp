@@ -19,6 +19,9 @@ namespace {
 /// memory-fast, so a handful of threads keeps the UI responsive without oversubscribing SQLite.
 constexpr int kWorkerThreads = 4;
 
+/// UI preference values cached from the workspace, read before they reach the UI thread.
+using PreferenceValues = std::vector<std::pair<std::string, nlohmann::json>>;
+
 /// Merges a catalog change into a pending one of the same library.
 void merge_catalog_change(app::CatalogChangedEvent& pending, const app::CatalogChangedEvent& incoming) {
     pending.structure_changed = pending.structure_changed || incoming.structure_changed;
@@ -74,6 +77,8 @@ ApplicationSession::ApplicationSession(app::ApplicationOptions options, QObject*
     : QObject(parent), options_(std::move(options)) {
     pool_.setMaxThreadCount(kWorkerThreads);
     pool_.setObjectName(QStringLiteral("ApplicationSessionPool"));
+    long_task_pool_.setMaxThreadCount(kLongTaskThreads);
+    long_task_pool_.setObjectName(QStringLiteral("ApplicationSessionLongTasks"));
     preference_writer_.setMaxThreadCount(1);
     preference_writer_.setObjectName(QStringLiteral("PreferenceWriter"));
     preference_write_timer_.setSingleShot(true);
@@ -86,7 +91,9 @@ ApplicationSession::~ApplicationSession() {
     flush_preferences();
     if (application_) application_->set_event_handler({});
     pool_.clear();
+    long_task_pool_.clear();  // queued exports never start; running ones observe shutdown_token()
     pool_.waitForDone();
+    long_task_pool_.waitForDone();
     preference_writer_.waitForDone();
     application_.reset();  // joins the Application's own background threads
 }
@@ -105,22 +112,35 @@ void ApplicationSession::preload_preferences() {
 }
 
 void ApplicationSession::start() {
-    using StartResult = Result<std::unique_ptr<app::Application>>;
+    /// The started Application plus its UI preferences, both read on the pool.
+    struct Started {
+        std::unique_ptr<app::Application> application;
+        PreferenceValues preferences;
+    };
+    using StartResult = Result<Started>;
     run_in_background(
-        pool_, this, [options = options_]() -> StartResult { return app::Application::start(options); },
+        pool_, this,
+        [options = options_]() -> StartResult {
+            auto application = app::Application::start(options);
+            if (!application) return std::unexpected(application.error());
+            // The workspace's lock is taken here, off the UI thread, never in the delivery.
+            Started started{std::move(*application), {}};
+            for (std::string_view key : UiPreferenceKeys::kAll) {
+                nlohmann::json value = started.application->workspace().preference(key);
+                if (!value.is_null()) started.preferences.emplace_back(std::string(key), std::move(value));
+            }
+            return started;
+        },
         [this](StartResult started) {
             if (!started) {
                 emit startFailed(DisplayFormat::error(started.error()));
                 return;
             }
-            application_ = std::move(*started);
+            application_ = std::move(started->application);
             application_->set_event_handler([this](const app::ApplicationEvent& event) { enqueue_event(event); });
             // Values preloaded before start-up stay authoritative; fill in anything not yet cached.
-            for (std::string_view key : UiPreferenceKeys::kAll) {
-                if (preferences_.contains(key)) continue;
-                nlohmann::json value = application_->workspace().preference(key);
-                if (!value.is_null()) preferences_.insert_or_assign(std::string(key), std::move(value));
-            }
+            for (auto& [key, value] : started->preferences)
+                if (!preferences_.contains(key)) preferences_.insert_or_assign(key, std::move(value));
             if (!dirty_preferences_.empty()) preference_write_timer_.start();
             run(
                 this, [](app::Application& application) { return application.libraries(); },
@@ -186,7 +206,7 @@ void ApplicationSession::flush_preferences() {
 }
 
 void ApplicationSession::request_page(const search::SearchRequest& request, std::optional<uuids::uuid> library,
-                                      QObject* context, PageDelivery deliver) {
+                                      std::stop_token obsolete, QObject* context, PageDelivery deliver) {
     if (!application_) {
         QTimer::singleShot(0, context, [deliver = std::move(deliver)] {
             deliver(fail(ErrorCode::Internal, "the workspace is still opening", true));
@@ -194,12 +214,17 @@ void ApplicationSession::request_page(const search::SearchRequest& request, std:
         return;
     }
     run(
-        context, [request, library](app::Application& application) { return application.search(request, library); },
+        context,
+        [request, library,
+         obsolete = std::move(obsolete)](app::Application& application) -> Result<search::SearchPage> {
+            if (obsolete.stop_requested()) return fail(ErrorCode::Cancelled, "a newer query replaced this one");
+            return application.search(request, library);
+        },
         std::move(deliver));
 }
 
 void ApplicationSession::request_count(const search::SearchRequest& request, std::optional<uuids::uuid> library,
-                                       QObject* context, CountDelivery deliver) {
+                                       std::stop_token obsolete, QObject* context, CountDelivery deliver) {
     if (!application_) {
         QTimer::singleShot(0, context, [deliver = std::move(deliver)] {
             deliver(fail(ErrorCode::Internal, "the workspace is still opening", true));
@@ -207,7 +232,12 @@ void ApplicationSession::request_count(const search::SearchRequest& request, std
         return;
     }
     run(
-        context, [request, library](app::Application& application) { return application.count(request, library); },
+        context,
+        [request, library,
+         obsolete = std::move(obsolete)](app::Application& application) -> Result<search::CountResult> {
+            if (obsolete.stop_requested()) return fail(ErrorCode::Cancelled, "a newer query replaced this one");
+            return application.count(request, library);
+        },
         std::move(deliver));
 }
 
@@ -227,8 +257,11 @@ void ApplicationSession::request_edit(const uuids::uuid& library, const catalog:
 
 void ApplicationSession::request_taxonomy(const uuids::uuid& library, const catalog::TaxonomyCommand& command,
                                           QObject* context, ReceiptDelivery deliver) {
-    run_with_library(
-        context, library, [command](catalog::Library& opened) { return opened.apply_taxonomy(command); },
+    // Through the Application, which patches the in-memory index before returning (a renamed tag
+    // shows in rows() at once), like apply_edit().
+    run(
+        context,
+        [library, command](app::Application& application) { return application.apply_taxonomy(library, command); },
         std::move(deliver));
 }
 
@@ -277,6 +310,11 @@ void ApplicationSession::dispatch_event(const app::ApplicationEvent& event) {
                 emit analysisProgressed(specific);
             } else if constexpr (std::is_same_v<Event, app::OperationFinishedEvent>) {
                 emit operationFinished(specific);
+            } else if constexpr (std::is_same_v<Event, app::BackgroundErrorEvent>) {
+                emit backgroundError(specific);
+            } else if constexpr (std::is_same_v<Event, app::LibraryAccessChangedEvent>) {
+                emit libraryAccessChanged(specific);
+                refresh_libraries();  // read_only in libraries() changes: panels re-enable editing
             }
         },
         event);

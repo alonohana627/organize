@@ -1,38 +1,37 @@
 #pragma once
 /// @file
-/// Lightweight wake-up for the decoder thread, usable from any non-real-time thread.
-#include <atomic>
+/// Wake-up of one waiting engine thread (the decoder thread, the output thread), usable from any
+/// non-real-time thread.
 #include <chrono>
-#include <semaphore>
+#include <memory>
 
 namespace mso::audio::detail {
 
-/// Wakes a worker sleeping in wait_for(). Notifications that arrive before the worker wakes collapse
-/// into one, which also keeps the binary semaphore's count within its maximum. A notification racing
-/// with a wake already in progress may be absorbed by it; the worker re-checks its inputs after every
-/// wake and never sleeps longer than its timeout, so such a race only costs one bounded poll.
+/// Wakes the one thread sleeping in wait_for(). Built on the vendored moodycamel
+/// LightweightSemaphore (the semaphore of moodycamel::BlockingReaderWriterQueue): notify() signals
+/// it, and a woken waiter takes every further pending signal at once, so notifications that arrive
+/// before the waiter wakes collapse into one wake-up. The waiter re-checks all of its inputs after
+/// every wake and never sleeps longer than its timeout, so a notification absorbed by a wake already
+/// in progress only costs one bounded poll.
 class WakeupSignal {
 public:
-    /// Requests a wake-up. Not for the real-time callback (it may enter the kernel).
-    void notify() noexcept {
-        if (!pending_.exchange(true, std::memory_order_acq_rel)) {
-            semaphore_.release();
-        }
-    }
+    /// Creates an unsignalled wake-up. Throws std::bad_alloc only.
+    WakeupSignal();
+    ~WakeupSignal();
+    WakeupSignal(const WakeupSignal&) = delete;
+    WakeupSignal& operator=(const WakeupSignal&) = delete;
+
+    /// Requests a wake-up. Any number of threads may notify; not for the real-time callback (it may
+    /// enter the kernel).
+    void notify() noexcept;
 
     /// Sleeps until notified or until `timeout` elapses. Returns true when woken by notify().
-    template <class Rep, class Period>
-    bool wait_for(std::chrono::duration<Rep, Period> timeout) {
-        const bool notified = semaphore_.try_acquire_for(timeout);
-        if (notified) {
-            pending_.store(false, std::memory_order_release);
-        }
-        return notified;
-    }
+    /// Only one thread may wait on a given signal.
+    bool wait_for(std::chrono::microseconds timeout) noexcept;
 
 private:
-    std::binary_semaphore semaphore_{0};  ///< released once per collapsed batch of notifications
-    std::atomic<bool> pending_{false};    ///< a release is outstanding; further notify() calls are no-ops
+    struct Semaphore;
+    std::unique_ptr<Semaphore> semaphore_;  ///< the moodycamel semaphore (kept out of this header)
 };
 
 }  // namespace mso::audio::detail

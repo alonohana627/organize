@@ -20,7 +20,7 @@ inline constexpr std::size_t kId3v1TagSize = 128;
 
 /// Total size of the ID3v2 tag whose header starts at header[0] (header, body and optional
 /// footer); nullopt when the bytes are not a valid ID3v2 header.
-std::optional<std::uint64_t> id3v2_tag_size(Bytes header) noexcept;
+[[nodiscard]] std::optional<std::uint64_t> id3v2_tag_size(Bytes header) noexcept;
 
 /// Reads title, artist, album, genre, comment, BPM and key frames from an ID3v2 tag held in
 /// memory (header included). A tag cut short is parsed as far as it goes.
@@ -31,7 +31,8 @@ void parse_id3v2(Bytes tag, EmbeddedTags& tags);
 /// (pictures, GEOB, PRIV and other binary frames are skipped unread). A tag unsynchronised as a
 /// whole (before v2.4) is loaded in one piece, up to kMaxTagBytes. Nothing is stored when the
 /// bytes at `offset` are not an ID3v2 header. Errors: only the reader's (ProbeLimit).
-Result<void> read_id3v2(BoundedFileReader& reader, std::uint64_t offset, std::uint64_t length, EmbeddedTags& tags);
+[[nodiscard]] Result<void> read_id3v2(BoundedFileReader& reader, std::uint64_t offset, std::uint64_t length,
+                                      EmbeddedTags& tags);
 
 /// Reads a 128-byte ID3v1 or ID3v1.1 tag; false when `tail` is not one.
 bool parse_id3v1(Bytes tail, EmbeddedTags& tags);

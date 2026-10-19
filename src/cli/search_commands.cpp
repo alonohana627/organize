@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 
 #include "mso/cli/command_context.hpp"
+#include "mso/domain/json_fields.hpp"
 
 namespace mso::cli {
 
@@ -16,6 +17,14 @@ std::string optional_text(const std::optional<std::int64_t>& value) {
     return value ? std::to_string(*value) : "-";
 }
 
+/// Tag paths as one cell: "Drums/Kick, Mood/Dark".
+std::string join_tags(const std::vector<std::string>& paths) {
+    std::string joined;
+    for (const auto& path : paths)
+        joined += (joined.empty() ? "" : ", ") + path;
+    return joined;
+}
+
 /// One table line of `search`.
 void print_row(const CommandContext& context, const search::SampleRow& row) {
     const std::string duration =
@@ -25,7 +34,7 @@ void print_row(const CommandContext& context, const search::SampleRow& row) {
     context.print("{:>6}  {:<36.36} {:<5} {:>8} {:>7} {:>4} {:<4} {:<15} {}", row.sample_id, row.display_name,
                   row.format, duration, bpm, key,
                   std::string(static_cast<std::size_t>(row.rating), '*') + (row.favorite ? "♥" : ""),
-                  search::to_string(row.availability), row.tags);
+                  search::to_string(row.availability), join_tags(row.tag_paths));
 }
 
 /// One row of `search --json`.
@@ -68,42 +77,47 @@ bool warn_incomplete(const CommandContext& context, const std::vector<search::Li
 /// Registers `search`.
 void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("search", "Search one or more libraries with the query language");
-    auto directories = std::make_shared<std::vector<std::string>>();
-    auto query = std::make_shared<std::string>();
-    auto sort = std::make_shared<std::string>("name");
-    auto descending = std::make_shared<bool>(false);
-    auto limit = std::make_shared<std::size_t>(50);
-    auto count = std::make_shared<bool>(false);
-    command->add_option("--library,-l", *directories, "Library folder (repeat to search several together)")
+    /// Every option of `search`.
+    struct Options {
+        std::vector<std::string> directories;
+        std::string query;
+        std::string sort = "name";
+        bool descending = false;
+        std::size_t limit = 50;
+        bool count = false;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("--library,-l", options.directories, "Library folder (repeat to search several together)")
         ->required()
         ->allow_extra_args(false);
-    command->add_option("query", *query, "Query, e.g. 'kick bpm:120..130 tag:Drums rating:>=3'");
-    command->add_option("--sort", *sort, "Sort field")->check(CLI::IsMember(kSortNames));
-    command->add_flag("--desc", *descending, "Descending order");
-    command->add_option("--limit", *limit, "Maximum rows to print (pages of up to 500 are fetched)")
+    command->add_option("query", options.query, "Query, e.g. 'kick bpm:120..130 tag:Drums rating:>=3'");
+    command->add_option("--sort", options.sort, "Sort field")->check(CLI::IsMember(kSortNames));
+    command->add_flag("--desc", options.descending, "Descending order");
+    command->add_option("--limit", options.limit, "Maximum rows to print (pages of up to 500 are fetched)")
         ->check(CLI::Range(std::size_t{0}, std::size_t{10'000'000}));
-    command->add_flag("--count", *count, "Also report the exact total");
-    command->callback([&, directories, query, sort, descending, limit, count] {
-        for (const auto& directory : *directories)
+    command->add_flag("--count", options.count, "Also report the exact total");
+    command->callback([&] {
+        const auto& [directories, query, sort, descending, limit, count] = options;
+        for (const auto& directory : directories)
             if (auto library = context.open_library(path_from_utf8(directory)); !library)
                 return void(exit_code = context.report(library.error()));
-        const auto field = search::parse_sort_field(*sort);
+        const auto field = search::parse_sort_field(sort);
         if (!field) return void(exit_code = context.usage("unknown sort field"));
         search::SearchRequest request{
-            .text = *query,
+            .text = query,
             .sort = *field,
-            .descending = *descending,
-            .page_size = std::clamp<std::size_t>(*limit, 1, search::SearchService::kMaxPageSize)};
+            .descending = descending,
+            .page_size = std::clamp<std::size_t>(limit, 1, search::SearchService::kMaxPageSize)};
         auto* application = *context.application();
         bool incomplete = false;
         std::size_t printed = 0;
         nlohmann::json rows = nlohmann::json::array();
-        while (printed < *limit) {
+        while (printed < limit) {
             auto page = application->search(request);
             if (!page) return void(exit_code = context.report(page.error()));
             incomplete = warn_incomplete(context, page->coverage) || incomplete;
             for (const auto& row : page->rows) {
-                if (printed >= *limit) break;
+                if (printed >= limit) break;
                 ++printed;
                 if (context.json_output)
                     rows.push_back(row_json(row));
@@ -114,7 +128,7 @@ void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
             request.cursor = page->next;
         }
         std::optional<std::int64_t> total;
-        if (*count) {
+        if (count) {
             request.cursor.reset();
             auto counted = application->count(request);
             if (!counted) return void(exit_code = context.report(counted.error()));
@@ -124,10 +138,10 @@ void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
         if (context.json_output) {
             // With --count the output stays one JSON document: {"rows": [...], "total": n}.
             if (total)
-                context.print("{}", nlohmann::json{{"rows", rows}, {"total", *total}, {"complete", !incomplete}}.dump(
-                                        2, ' ', false, nlohmann::json::error_handler_t::replace));
+                context.print(
+                    "{}", json_fields::dump_json({{"rows", rows}, {"total", *total}, {"complete", !incomplete}}, 2));
             else
-                context.print("{}", rows.dump(2, ' ', false, nlohmann::json::error_handler_t::replace));
+                context.print("{}", json_fields::dump_json(rows, 2));
         } else if (total) {
             context.print("{} matching sample(s)", *total);
         }
@@ -138,15 +152,20 @@ void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
 /// Registers `show`.
 void register_show(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("show", "Show everything known about one sample");
-    auto directory = std::make_shared<std::string>();
-    auto sample = std::make_shared<std::int64_t>(0);
-    command->add_option("library", *directory, "Library folder")->required();
-    command->add_option("sample", *sample, "Sample id (from search)")->required();
-    command->callback([&, directory, sample] {
-        auto library = context.open_library(path_from_utf8(*directory));
+    /// Every option of `show`.
+    struct Options {
+        std::string directory;
+        std::int64_t sample = 0;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "Library folder")->required();
+    command->add_option("sample", options.sample, "Sample id (from search)")->required();
+    command->callback([&] {
+        const auto& [directory, sample] = options;
+        auto library = context.open_library(path_from_utf8(directory));
         if (!library) return void(exit_code = context.report(library.error()));
         auto detail = (*context.application())->with_library(library->uuid, [&](catalog::Library& opened) {
-            return opened.sample_detail(*sample);
+            return opened.sample_detail(sample);
         });
         if (!detail) return void(exit_code = context.report(detail.error()));
         context.print("{} ({})", detail->display_name, uuids::to_string(detail->uuid));
@@ -178,10 +197,10 @@ void register_show(CLI::App& root, CommandContext& context, int& exit_code) {
 void register_taxonomy_listings(CLI::App& root, CommandContext& context, int& exit_code) {
     {
         auto* command = root.add_subcommand("tags", "List the tag and category trees with counts");
-        auto directory = std::make_shared<std::string>();
-        command->add_option("library", *directory, "Library folder")->required();
-        command->callback([&, directory] {
-            auto library = context.open_library(path_from_utf8(*directory));
+        auto& directory = context.command_options<std::string>();
+        command->add_option("library", directory, "Library folder")->required();
+        command->callback([&] {
+            auto library = context.open_library(path_from_utf8(directory));
             if (!library) return void(exit_code = context.report(library.error()));
             auto listed =
                 (*context.application())->with_library(library->uuid, [&](catalog::Library& opened) -> Result<void> {
@@ -202,10 +221,10 @@ void register_taxonomy_listings(CLI::App& root, CommandContext& context, int& ex
     }
     {
         auto* command = root.add_subcommand("collections", "List collections");
-        auto directory = std::make_shared<std::string>();
-        command->add_option("library", *directory, "Library folder")->required();
-        command->callback([&, directory] {
-            auto library = context.open_library(path_from_utf8(*directory));
+        auto& directory = context.command_options<std::string>();
+        command->add_option("library", directory, "Library folder")->required();
+        command->callback([&] {
+            auto library = context.open_library(path_from_utf8(directory));
             if (!library) return void(exit_code = context.report(library.error()));
             auto collections = (*context.application())->with_library(library->uuid, [](catalog::Library& opened) {
                 return opened.list_collections();

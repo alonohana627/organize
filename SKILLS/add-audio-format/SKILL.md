@@ -19,11 +19,14 @@ was reviewed and not adopted because:
   `METADATA_BLOCK_PICTURE` across Ogg pages, ASF `WM/Picture`, APE binary items) are skipped unread;
 - the probe needs container facts TagLib does not expose: acid tempo, `smpl` loops, AIFF `MARK`/`INST`,
   RF64 `ds64`, exact frame counts, gapless trim;
-- the parsers are overflow-checked (`ByteCursor`, `checked_add`) and fuzz-tested.
+- the parsers are overflow-checked (`ByteCursor`, `checked_add`) and fuzzed: `probe_memory()` runs the
+  same parsers over a byte buffer for the libFuzzer targets in `tests/fuzz/`.
 
 Keep it that way: a new format gets a bounded parser here, not an unbounded library call. All internal
 media headers are in `include/mso/media/detail/` (`probe_formats.hpp`, `bounded_reader.hpp`,
-`byte_cursor.hpp`, `tag_mapping.hpp`, ...). The Ogg page CRC is hand-written too, because no vendored
+`byte_cursor.hpp`, `tag_mapping.hpp`, ...). The platform file helpers other modules also need
+(`native_path` for long Windows paths, `UniqueWin32Handle`, native error mapping) are the public
+`include/mso/media/native_file.hpp`. The Ogg page CRC is hand-written too, because no vendored
 library exports one.
 
 ## Probe
@@ -33,7 +36,9 @@ library exports one.
 2. Add `src/media/probe_<format>.cpp` implementing the declaration in
    `include/mso/media/detail/probe_formats.hpp`. Read through
    `BoundedFileReader` only (it enforces the byte and time budget; on a limit return what you have with
-   `partial = true`). Use checked 64-bit arithmetic (`ByteCursor`, `checked_add`) for every size and
+   `partial = true`). Small header reads are cheap: the reader serves them from a 16 KiB read-ahead
+   window and charges only the bytes it hands out, so walk headers with small reads rather than
+   loading large blocks. Use checked 64-bit arithmetic (`ByteCursor`, `checked_add`) for every size and
    offset: hostile headers must never over-read, over-allocate or loop forever. Skip binary tag items
    (pictures, private frames) by their header length without reading them.
 3. Fill `ProbeResult`: actual `format`/`codec`, rate, channels, `bit_depth` only for PCM/lossless,
@@ -55,13 +60,24 @@ unparseable). Every backend keeps the decoder contract:
 
 - seeking at or past the end is not an error, and the next read returns 0 frames;
 - the channel count and sample rate never change after open (FFmpeg remixes and resamples a mid-stream
-  layout or rate change to the first frame's layout and rate).
+  layout or rate change to the first frame's layout and rate, keeping the samples the old resampler
+  still held);
+- `frames_exact()` is true only when a full read delivers exactly `total_frames()` on that backend
+  (FFmpeg's Vorbis decoder is 128 frames short of the granule count, so it reports an estimate; the MP3
+  probe trims at least the 529-frame decoder delay at the end, as dr_mp3 does).
+
+A decoder library is vendored code: a fix to it is a patch in `patches/<name>/` listed in
+`deps/manifest.json` (for example `patches/miniaudio/0001-stb-vorbis-setup-allocation-overflow.patch`,
+which bounds stb_vorbis's header allocations and frees a failing codebook's temporary tables), never a
+hand edit.
 
 ## Tests (`tests/media_tests.cpp`)
 
 Generate fixtures at runtime (hand-built bytes, `mso::test::write_wav`, or `ffmpeg` from PATH; when
-ffmpeg is absent the test skips with a MESSAGE, unless `mso::test::ffmpeg_required()` is true, which
+ffmpeg is absent the test is skipped through `doctest::skip(...)`, unless `mso::test::ffmpeg_required()` is true, which
 CTest sets in `MSO_REQUIRE_FFMPEG` builds such as CI, where it must FAIL):
 probe fields, exact vs estimated duration, a truncated/corrupt file failing cleanly, a file larger than
-the budget returning `partial`, decode frame counts and seek accuracy. Never commit audio files.
+the budget returning `partial`, decode frame counts and seek accuracy, and `probe_memory()` agreeing
+with `probe_file()`. Crafted hostile inputs are built in the test too (see the stb_vorbis comment-header
+cases). Never commit audio files.
 Then run the CLI check (`SKILLS/cli-end-to-end-check`) with a file of the new format.

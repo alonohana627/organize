@@ -24,8 +24,9 @@ class StereoConverter {
 public:
     /// Converter for `input_channels` channels and the reduced rate ratio
     /// `source_units : output_units` (see SourceClock). Fails with RESOURCE_LIMIT/INVALID_ARGUMENT.
-    static Result<std::unique_ptr<StereoConverter>> create(std::size_t input_channels, std::int64_t source_units,
-                                                           std::int64_t output_units);
+    [[nodiscard]] static Result<std::unique_ptr<StereoConverter>> create(std::size_t input_channels,
+                                                                         std::int64_t source_units,
+                                                                         std::int64_t output_units);
 
     ~StereoConverter();
     StereoConverter(const StereoConverter&) = delete;
@@ -33,7 +34,7 @@ public:
 
     /// Converts as much of `input` (interleaved, input_channels wide) as fits into `stereo_output`.
     /// Returns zero progress when miniaudio reports an error.
-    ConversionProgress process(std::span<const float> input, std::span<float> stereo_output) noexcept;
+    [[nodiscard]] ConversionProgress process(std::span<const float> input, std::span<float> stereo_output) noexcept;
 
 private:
     struct Engine;

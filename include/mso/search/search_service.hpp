@@ -22,9 +22,9 @@ enum class SortField { Name, Added, Duration, Size, SampleRate, Bpm, Key, Rating
 
 /// Wire name of a sort field ("name", "added", "duration", "size", "rate", "bpm", "key", "rating",
 /// "format", "relevance").
-std::string_view to_string(SortField field) noexcept;
+[[nodiscard]] std::string_view to_string(SortField field) noexcept;
 /// Inverse of `to_string(SortField)`; nullopt for an unknown name.
-std::optional<SortField> parse_sort_field(std::string_view text) noexcept;
+[[nodiscard]] std::optional<SortField> parse_sort_field(std::string_view text) noexcept;
 
 /// Opaque continuation token (JSON); STALE_CURSOR for a different query, sort, scope or library set.
 struct Cursor {
@@ -76,14 +76,21 @@ struct CountResult {
 
 /// Ids of the live samples of one library matching `request.text` and `request.scope`, in
 /// ascending id order (no sort, no hydration, no paging). The application combines it with its
-/// in-memory index for queries that need full-text search.
-Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const SearchRequest& request);
+/// in-memory index for queries that need full-text search. The result holds at most one id per
+/// live sample of the library; use the bounded overload to cap it lower.
+[[nodiscard]] Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const SearchRequest& request);
+
+/// As matching_ids, but fails with RESOURCE_LIMIT as soon as more than `maximum_ids` samples
+/// match (SQLite stops at `maximum_ids + 1` rows), so a caller that keeps id sets can bound them.
+[[nodiscard]] Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const SearchRequest& request,
+                                                             std::size_t maximum_ids);
 
 /// Stateless search over the given libraries. Thread-safe: each call leases its own readers.
 ///
 /// Error policy (search, count): a problem with the request itself (PARSE_ERROR, INVALID_ARGUMENT,
-/// STALE_CURSOR) fails the whole call; a failure of one library (busy, offline database, I/O)
-/// marks that library's coverage incomplete and the other libraries still answer.
+/// STALE_CURSOR) fails the whole call; a failure of one library (busy, offline database, I/O, or a
+/// smart collection of that library whose stored query cannot be compiled: DB_CORRUPT,
+/// RESOURCE_LIMIT) marks that library's coverage incomplete and the other libraries still answer.
 class SearchService {
 public:
     /// Largest page.
@@ -94,11 +101,15 @@ public:
     static constexpr double kReciprocalRankConstant = 60.0;
 
     /// One page of the request across `libraries`, globally ordered (ties: library UUID, then id).
-    Result<SearchPage> search(std::span<catalog::Library* const> libraries, const SearchRequest& request) const;
+    [[nodiscard]] Result<SearchPage> search(std::span<catalog::Library* const> libraries,
+                                            const SearchRequest& request) const;
     /// Exact number of matches across `libraries` (cursor, sort and page size are ignored).
-    Result<CountResult> count(std::span<catalog::Library* const> libraries, const SearchRequest& request) const;
-    /// Validates query text without running it (for smart collections and the search box).
-    Result<void> validate(std::string_view text) const;
+    [[nodiscard]] Result<CountResult> count(std::span<catalog::Library* const> libraries,
+                                            const SearchRequest& request) const;
+    /// Validates query text without running it (for smart collections and the search box): a
+    /// PARSE_ERROR with its position, or INVALID_ARGUMENT for a `tag:`/`category:` path the catalog
+    /// would reject (`tag:a//b`).
+    [[nodiscard]] Result<void> validate(std::string_view text) const;
 };
 
 }  // namespace mso::search

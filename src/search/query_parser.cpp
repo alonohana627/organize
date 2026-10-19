@@ -1,6 +1,8 @@
 // Recursive-descent parser for the search query language (see query.hpp).
 #include <algorithm>
 #include <format>
+#include <initializer_list>
+#include <limits>
 #include <utility>
 
 #include "mso/domain/analysis_flags.hpp"
@@ -56,6 +58,15 @@ std::string_view to_string(Field field) noexcept {
 
 namespace {
 
+/// Whether '\' separates folders in a typed folder value, as in path_key: Windows only.
+#ifdef _WIN32
+constexpr bool kBackslashIsSeparator = true;
+#else
+constexpr bool kBackslashIsSeparator = false;
+#endif
+
+/// The field a query names ("tag", "tempo", "favourite"...), ASCII case-insensitive; nullopt for an
+/// unknown name.
 std::optional<Field> field_from_name(std::string_view name) {
     const std::string lowered = to_lower_ascii(name);
     struct Alias {
@@ -126,15 +137,19 @@ constexpr int kMaxDigits = 18;
 /// Largest accepted value in storage units (well inside SQLite's 64-bit integers).
 constexpr std::int64_t kMaxStorageValue = 9'000'000'000'000'000;
 
-/// ⌈numerator / denominator⌉ for a positive denominator.
+/// ⌈numerator / denominator⌉ for a positive denominator, for every int64 numerator (no
+/// intermediate sum that could overflow; C++ division truncates toward zero).
 constexpr std::int64_t ceiling_divide(std::int64_t numerator, std::int64_t denominator) {
-    return numerator >= 0 ? (numerator + denominator - 1) / denominator : -((-numerator) / denominator);
+    return numerator / denominator + (numerator % denominator > 0 ? 1 : 0);
 }
 
-/// ⌊numerator / denominator⌋ for a positive denominator.
+/// ⌊numerator / denominator⌋ for a positive denominator, for every int64 numerator.
 constexpr std::int64_t floor_divide(std::int64_t numerator, std::int64_t denominator) {
-    return numerator >= 0 ? numerator / denominator : -((-numerator + denominator - 1) / denominator);
+    return numerator / denominator - (numerator % denominator < 0 ? 1 : 0);
 }
+static_assert(ceiling_divide(7, 2) == 4 && ceiling_divide(-7, 2) == -3 && ceiling_divide(6, 2) == 3);
+static_assert(floor_divide(7, 2) == 3 && floor_divide(-7, 2) == -4 && floor_divide(-6, 2) == -3);
+static_assert(ceiling_divide(std::numeric_limits<std::int64_t>::max(), 2'000'000'000) == 4'611'686'019);
 
 /// Recursive-descent parser over a token list; one instance parses one query.
 class Parser {
@@ -171,13 +186,27 @@ private:
         return character == ' ' || character == '\t' || character == '\n' || character == '\r';
     }
 
-    /// Reads a quoted string starting at the opening quote; returns the unescaped content.
+    /// True when a token may end before `position`: at the end, at whitespace or a parenthesis.
+    bool at_token_end(std::size_t position) const {
+        return position >= text_.size() || is_space(text_[position]) || text_[position] == '(' ||
+               text_[position] == ')';
+    }
+
+    /// Reads a quoted string starting at the opening quote; returns the unescaped content. The
+    /// closing quote must end the token: `"kick"*` (a quoted prefix) and `tag:"x"y` are errors
+    /// rather than silently becoming two terms.
     Result<std::string> read_quoted(std::size_t& position) {
         const std::size_t start = position++;
         std::string content;
         while (position < text_.size()) {
             const char character = text_[position++];
-            if (character == '"') return content;
+            if (character == '"') {
+                if (at_token_end(position)) return content;
+                if (text_[position] == '*')
+                    return error_at(position,
+                                    "a quoted phrase cannot be a prefix search; remove the quotes or the '*'");
+                return error_at(position, "put a space after the closing quote");
+            }
             if (character == '\\') {
                 if (position >= text_.size()) break;
                 const char escaped = text_[position++];
@@ -243,7 +272,9 @@ private:
         return {};
     }
 
+    /// The next token (the End token once everything is consumed).
     const Token& peek() const { return tokens_[index_]; }
+    /// Consumes and returns the next token.
     const Token& advance() { return tokens_[index_++]; }
     /// True when the next token is the operator `keyword` (operators are upper-case only).
     bool peek_keyword(std::string_view keyword) const {
@@ -256,6 +287,7 @@ private:
     }
 
     // ------------------------------------------------------------ grammar
+    /// A new node of `kind`, or a PARSE_ERROR once the query exceeds kMaxQueryNodes.
     Result<QueryNodePointer> make_node(QueryNode::Kind kind, std::size_t offset) {
         if (++node_count_ > kMaxQueryNodes) return error_at(offset, "query has more than 256 terms");
         auto node = std::make_unique<QueryNode>();
@@ -366,6 +398,8 @@ private:
     }
 
     // ------------------------------------------------------------ field values
+    /// A `field:value` token as a predicate node (or a column-restricted text node for
+    /// name:/path:/notes:).
     Result<QueryNodePointer> predicate_node(const Token& token) {
         auto field = field_from_name(token.field_name);
         if (!field) return error_at(token.offset, std::format("unknown field '{}'", token.field_name));
@@ -381,11 +415,20 @@ private:
         return node;
     }
 
+    /// Parses the value of `predicate.field` into the predicate; `offset` is the value's byte
+    /// offset for error positions.
     Result<void> parse_value(FieldPredicate& predicate, std::string_view value, std::size_t offset) {
         switch (predicate.field) {
+            case Field::Folder:
+                // Folders are addressed from a root down: "/Drums" means "Drums", and so does "\Drums"
+                // on Windows, where path_key treats '\' as a separator (elsewhere it is a name byte).
+                predicate.text = trim(value);
+                while (predicate.text.starts_with('/') || (kBackslashIsSeparator && predicate.text.starts_with('\\')))
+                    predicate.text.erase(0, 1);
+                if (trim(predicate.text).empty()) return error_at(offset, "expected a folder name");
+                return {};
             case Field::Tag:
             case Field::Category:
-            case Field::Folder:
             case Field::Collection:
                 predicate.text = trim(value);
                 if (predicate.text.empty()) return error_at(offset, "expected a name");
@@ -456,6 +499,7 @@ private:
         return false;
     }
 
+    /// true/yes/1 or false/no/0 for favorite: and available:.
     Result<void> parse_flag(FieldPredicate& predicate, std::string_view value, std::size_t offset) {
         const std::string lowered = to_lower_ascii(value);
         if (lowered == "true" || lowered == "yes" || lowered == "1")
@@ -467,6 +511,7 @@ private:
         return {};
     }
 
+    /// A musical key ("F#minor", "Am", "Eb") or "unknown" (no key detected or set).
     Result<void> parse_key_value(FieldPredicate& predicate, std::string_view value, std::size_t offset) {
         if (to_lower_ascii(value) == "unknown") {
             predicate.text = "unknown";
@@ -584,6 +629,7 @@ private:
         std::int64_t storage_units = 1;
     };
 
+    /// A non-negative decimal with an optional unit suffix from `units` (ASCII case-insensitive).
     Result<Quantity> parse_quantity(std::string_view text, std::size_t offset, std::initializer_list<Unit> units,
                                     bool allow_fraction) {
         Decimal number;
@@ -649,12 +695,13 @@ private:
         return scaled(quantity, 1, 0, 1, offset, ceiling_divide);
     }
 
-    std::string_view text_;
-    std::vector<Token> tokens_;
-    std::size_t index_ = 0;
-    std::size_t node_count_ = 0;
+    std::string_view text_;       ///< the whole query
+    std::vector<Token> tokens_;   ///< the tokenized query, ending with an End token
+    std::size_t index_ = 0;       ///< next token to consume
+    std::size_t node_count_ = 0;  ///< nodes created so far (kMaxQueryNodes)
 };
 
+/// Appends the text terms of `node` that are not under an odd number of NOTs.
 void collect_positive_terms(const QueryNode& node, bool negated, std::vector<TextTerm>& terms) {
     switch (node.kind) {
         case QueryNode::Kind::Text:

@@ -333,7 +333,7 @@ Result<void> read_id3v2(BoundedFileReader& reader, std::uint64_t offset, std::ui
     Id3v2FrameHandler handler(major_version, (flags & kTagUnsynchronised) != 0, tags);
     const std::size_t header_size = frame_header_size(major_version);
     // True when `size` bytes of frame data starting at `data_offset` end at a plausible boundary.
-    Result<void> lookahead_error;
+    Result<void> lookahead_outcome;
     const auto boundary_after = [&](std::uint64_t data_offset, std::uint32_t size) {
         const std::uint64_t next = data_offset + size;
         if (next == frames_end) return true;
@@ -341,7 +341,7 @@ Result<void> read_id3v2(BoundedFileReader& reader, std::uint64_t offset, std::ui
         auto bytes =
             reader.read_available(next, static_cast<std::size_t>(std::min<std::uint64_t>(4, frames_end - next)));
         if (!bytes) {
-            lookahead_error = std::unexpected(bytes.error());
+            lookahead_outcome = std::unexpected(bytes.error());
             return false;
         }
         return looks_like_frame_boundary(*bytes, major_version);
@@ -365,7 +365,7 @@ Result<void> read_id3v2(BoundedFileReader& reader, std::uint64_t offset, std::ui
                        ? v24_frame_size(raw_size,
                                         [&](std::uint32_t candidate) { return boundary_after(data_offset, candidate); })
                        : raw_size;
-            if (!lookahead_error) return lookahead_error;
+            if (!lookahead_outcome) return lookahead_outcome;
         }
         if (size > frames_end - data_offset) break;  // frame runs past the tag
         const std::string_view canonical = canonical_frame_id(id);

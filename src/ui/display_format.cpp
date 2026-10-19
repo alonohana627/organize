@@ -67,8 +67,9 @@ QString DisplayFormat::duration(std::optional<std::int64_t> microseconds, bool e
 
 QString DisplayFormat::sample_rate(std::optional<std::int64_t> hertz) {
     if (!hertz) return {};
-    if (*hertz % 1000 == 0) return tr("%1 kHz").arg(*hertz / 1000);
-    return tr("%1 kHz").arg(static_cast<double>(*hertz) / 1000.0, 0, 'f', 1);
+    // %L1: the locale's decimal separator ("44,1 kHz" in German), not always a dot.
+    if (*hertz % 1000 == 0) return tr("%L1 kHz").arg(*hertz / 1000);
+    return tr("%L1 kHz").arg(static_cast<double>(*hertz) / 1000.0, 0, 'f', 1);
 }
 
 QString DisplayFormat::channels(std::optional<std::int64_t> count) {
@@ -191,6 +192,13 @@ QString DisplayFormat::timestamp(std::int64_t unix_milliseconds) {
 
 QString DisplayFormat::error(const Error& failure) {
     return from_utf8(failure.message());
+}
+
+QString DisplayFormat::tag_list(const std::vector<std::string>& tag_paths) {
+    QStringList paths;
+    for (const std::string& path : tag_paths)
+        paths << from_utf8(path);
+    return paths.join(QStringLiteral(", "));
 }
 
 QString DisplayFormat::count(std::int64_t value) {

@@ -90,14 +90,14 @@ public:
 
     /// Free block to fill (the same one until committed), or nullopt when every block holds unread
     /// audio. The header is reset to defaults.
-    std::optional<WritablePcmBlock> begin_write() noexcept;
+    [[nodiscard]] std::optional<WritablePcmBlock> begin_write() noexcept;
     /// Publishes the block returned by begin_write() to the consumer. Requires a successful begin_write().
     void commit_write() noexcept;
 
     // ---- consumer (audio callback)
 
     /// Oldest published block, or nullopt when the ring is empty.
-    std::optional<ReadablePcmBlock> front() const noexcept;
+    [[nodiscard]] std::optional<ReadablePcmBlock> front() const noexcept;
     /// Releases the block returned by front() back to the producer. Requires a non-empty front().
     void pop_front() noexcept;
 

@@ -1,5 +1,5 @@
 {
-  "comment": "Pinned third-party sources vendored into deps/. Change 'ref'/'commit'/'version' (or 'url'/'sha256') and run: python deps/update_deps.py <name>. 'content_sha256' is written by that script (post-patch digest of every vendored file) and verified offline by --check. 'system_dependencies' are found at configure time, not vendored; CMake lists them in the generated About-box notices.",
+  "comment": "Pinned third-party sources vendored into deps/. Change 'ref'/'commit'/'version' (or 'url'/'sha256') and run: python deps/update_deps.py <name>. 'content_sha256' is written by that script (post-patch digest of every vendored file) and verified offline by --check. 'system_dependencies' are found at configure time, not vendored; CMake lists them in the generated About-box notices. 'test_only': true marks a dependency that only the tests link; it is not shipped, so the About box, the installed notices and the installer leave it out.",
   "dependencies": [
     {
       "name": "sqlite",
@@ -37,8 +37,8 @@
       },
       "license_file": "nlohmann_json/LICENSE.MIT",
       "content_sha256": {
-        "nlohmann_json/LICENSE.MIT": "b9715282b2f1db1359a919bb3a542dd4362fd9e38ae72d421367eb11abe62eec",
-        "nlohmann_json/include/nlohmann/json.hpp": "5f09d1eebe9b3557f21df155869af13bcde79b74a0748f82ca946e8cc088aaa0"
+        "nlohmann_json/LICENSE.MIT": "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603",
+        "nlohmann_json/include/nlohmann/json.hpp": "aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63"
       }
     },
     {
@@ -59,10 +59,10 @@
       },
       "license_file": "utf8proc/LICENSE.md",
       "content_sha256": {
-        "utf8proc/LICENSE.md": "767edbcafb23016d7f203aaf2cbdef5690ad58bcede52ee241427dcb816cd644",
-        "utf8proc/utf8proc.c": "d6a44162d63e831139c027bfd5af824d9e35f5802b76a740c88d524ce0323525",
-        "utf8proc/utf8proc.h": "07e9f32cc5a39f3f59ffc1fd848f02b3c86401123ee499deb46d91232a24df43",
-        "utf8proc/utf8proc_data.c": "0168d10ff1a2c0b4ff2164a0284b74e521ebd4a54b4a330ef5d2aeb0c0e65b8d"
+        "utf8proc/LICENSE.md": "3b510150d34f248a221bb88e1d811238d6c6c18b51231822c42974c39bb07256",
+        "utf8proc/utf8proc.c": "f38438eb986ba7eedad0f2e820a70fae1aaf05197364ba0381a5e84775099ef8",
+        "utf8proc/utf8proc.h": "08da85e820efaa3613500946c26b2dc427a07f76001ed7c16bc90f298b814c35",
+        "utf8proc/utf8proc_data.c": "b4911d4162d216afa612317a9b981851e15d672f4d93b25f3a1eb986f8c0aedb"
       }
     },
     {
@@ -82,9 +82,9 @@
       },
       "license_file": "stduuid/LICENSE",
       "content_sha256": {
-        "stduuid/LICENSE": "c6170664187466c22ecb6046c69b7476f6a578db3c1707b5ed0723c290969808",
-        "stduuid/README.md": "37282d1f23cb968bafa64dcf88a58e9c7a6ae7b4b35098099b0e771ba0db30e3",
-        "stduuid/include/uuid.h": "36880bd470c3bd9e5fd1d8ca66028911b17253bb057dbda8709c3c9789b0079f"
+        "stduuid/LICENSE": "afb11426e09da40a1ae4f8fa17ddcc6b6a52d14df04c29bc5bcd06eb8730624d",
+        "stduuid/README.md": "96ff002c71ac4abc93361105fdb5b89fd92954cf067007341de36eb4777826ea",
+        "stduuid/include/uuid.h": "8b329afa7e099e632c2e992e02ddb9fc4627c772dfd5fd42b069752ea0f8ec7f"
       }
     },
     {
@@ -104,9 +104,9 @@
       },
       "license_file": "picosha2/LICENSE",
       "content_sha256": {
-        "picosha2/LICENSE": "3e4ca187c6ffc8b0ed48f84fb06b9a44eb6fd2c15af856806fc51d44911b4496",
-        "picosha2/README.md": "4da16028cb7d5bbb2af88e7cc0915cd11bf8123a7e642880bfeed209b72e50c3",
-        "picosha2/picosha2.h": "ae5613548dbd3ff1028b136af97d8bb409036566febc5c0fd9b48099f9c55b8d"
+        "picosha2/LICENSE": "6c30eb1f37554ec4199cb82a8c86d9e7a852da78a757832bebb03ac9ddc44ff1",
+        "picosha2/README.md": "211c460310f0d2a9b918b785af959694878c54a8ab88d787a14b99b28ff04f43",
+        "picosha2/picosha2.h": "b13c180161ffac8d0adc81e033e493c409457c4d1258ab9781ac80579ba3bdd8"
       }
     },
     {
@@ -125,10 +125,13 @@
         "LICENSE": "miniaudio/LICENSE"
       },
       "license_file": "miniaudio/LICENSE",
+      "patches": [
+        "patches/miniaudio/0001-stb-vorbis-setup-allocation-overflow.patch"
+      ],
       "content_sha256": {
-        "miniaudio/LICENSE": "cf00884e3bae1ec7b49e96bc014079f5b4c803987586b894ac431779927c67b3",
-        "miniaudio/extras/stb_vorbis.c": "c8daf8d9f0dad818a1cb6c9194eeb4503b63b8cbf8c744efc12942f3d679f686",
-        "miniaudio/miniaudio.h": "e9e742f8c4d7cdd0fc81ba7f1c47b719d98d45e0138849aa0ec1e574d554a1ee"
+        "miniaudio/LICENSE": "457f1b500e0adf6bc059edddfa78a2f62012e7c3bb43476c20e0bd23b25ba0eb",
+        "miniaudio/extras/stb_vorbis.c": "1ba414d68bc74350826cadc6d880d2b5fc4d0c1851abd65de4b75ce10f097f53",
+        "miniaudio/miniaudio.h": "ac7af4de748b7e26b777f37e01cee313a308a7296a3eb080e2906b320cc55c89"
       }
     },
     {
@@ -147,8 +150,8 @@
       },
       "license_file": "pocketfft/LICENSE.md",
       "content_sha256": {
-        "pocketfft/LICENSE.md": "8db000e158c162e7249787852d8c69764706502ccee725c06641b31c1e95c8af",
-        "pocketfft/pocketfft_hdronly.h": "22c16c8ed7dc4fce3ee3732422a8b05bf12db0f944363aa0d07d02dd09d20975"
+        "pocketfft/LICENSE.md": "a85ca13fdf90160b64a0698215868c13b74d835ad0a4e2ba44713b8c5058a056",
+        "pocketfft/pocketfft_hdronly.h": "3e9a05318d8e3b1446bda1c4617e6a103cdd23599ae0a776a92a6e8800e92fdc"
       }
     },
     {
@@ -185,26 +188,26 @@
       },
       "license_file": "signalsmith_linear/LICENSE.txt",
       "content_sha256": {
-        "signalsmith_linear/LICENSE.txt": "a91f5703b0f5fa22e8c14a8bd854559a7c512bbe58656ea8bdcd4964e923ab2f",
-        "signalsmith_linear/approx.h": "bc3e6dfb911ac50fb5841784b5633751fc14ae9b0f881a88b427c60c7a628cf1",
-        "signalsmith_linear/fft.h": "af0df3ff84c6f69ec00f09e0e53634b7ccacd3198a4acb2b482cb7d93854d207",
-        "signalsmith_linear/include/signalsmith-linear/approx.h": "eac208cc0e94556dde10e1d9bb0d53d8df9453aa8d2157421073f0497649ec3b",
-        "signalsmith_linear/include/signalsmith-linear/fft.h": "30e4054a9df4f1f31318ffefb43b52d69378788a344fb09c8995a36d5bc28148",
-        "signalsmith_linear/include/signalsmith-linear/linear.h": "38560f893be3ecbd18e6ce45b17dc7c3f3d3e4e6ed2890572b4aba385e36c03d",
-        "signalsmith_linear/include/signalsmith-linear/stft.h": "db40c535f6554daf2f0a12540730dc22bce71c5007210e515f463a0cbd1a16b7",
-        "signalsmith_linear/linear.h": "7e43d30cfd9c7d9989d58f875c9cb7e07c559aa93f86733c571c0bbc9ae0ea63",
-        "signalsmith_linear/platform/approx-cmsisdsp.h": "190d7487b4afc4353e8b5205bb78be0eab48fb180c11647d56beb57ddeab4994",
-        "signalsmith_linear/platform/basic-fill-warnings.h": "5f21ba12381d360dc166d034723dfbd43f5676dc4b2131f99a633fc9ab9935b2",
-        "signalsmith_linear/platform/fft-accelerate.h": "bbd6b46002acf8eedaf35aad07e2a15c18dd23cd8ff91d7afb0a72bb65c6dae6",
-        "signalsmith_linear/platform/fft-cmsisdsp.h": "3f5325069321b29529d6d5b52964f0d409acad2f46bd87b06897f4ba038430c7",
-        "signalsmith_linear/platform/fft-ipp.h": "94fc6431bde1965aad24c0848265ea3647a3b518d53f0869f869f1fb103381b6",
-        "signalsmith_linear/platform/fft-linear.h": "151fc3f0be8f698ed7d3c529f397c0a04ccf3d96e9abc12d12157873805ee183",
-        "signalsmith_linear/platform/fft-pffft-double.h": "d76907bfb3b9e316355cb32a9d64ac88e79bb22c8c80fbf3dad1eec1cfc87628",
-        "signalsmith_linear/platform/fft-pffft.h": "5d8672af99a0501d6cb5847f577011832ac37d76e3e79835961d9ce22bdb2e43",
-        "signalsmith_linear/platform/linear-accelerate.h": "c786eaf1f057598492e79bc5bba6e60b02d3a1dbc6af29e279ce4890147d5f39",
-        "signalsmith_linear/platform/linear-cmsisdsp.h": "2139c77e8c983c9338d653fd418fa6d34a15cd81b86c5714bed6949590691184",
-        "signalsmith_linear/platform/linear-xsimd.h": "c950c7abae024a6f2755f2cd050bce31fe9a5b098db9fa2c4828120b382d7db1",
-        "signalsmith_linear/stft.h": "0fc36186c3f892d068fff4108536b0f2132552f5a450b1e1ea5657e2899c6df3"
+        "signalsmith_linear/LICENSE.txt": "072b5e9eb5b22880bdf6256324654cf3ce53dba828edb911921121e1be09d9c3",
+        "signalsmith_linear/approx.h": "bf6f703193253a241e7a80d44547bb73c383a9a1f1ebe1f7fefdcf3d234515bd",
+        "signalsmith_linear/fft.h": "fb55f69ac14cdbac66b9c76053069ff63bc36d18af20d8c028b9acc0aad6516a",
+        "signalsmith_linear/include/signalsmith-linear/approx.h": "55c090c621657ee1fbe23a8c582811e103acf8ba10263c4a6d9b66a62809fa1a",
+        "signalsmith_linear/include/signalsmith-linear/fft.h": "98e7e64093b6fc8ccbba31f710370d5548243bad35beb489e8282de4dc25d76d",
+        "signalsmith_linear/include/signalsmith-linear/linear.h": "5c5d55810af0b7f8c8fe27ef1a36a87a4529f95cbebbb5e49f39845f6a2a0d5e",
+        "signalsmith_linear/include/signalsmith-linear/stft.h": "a323656e5ed80b271262106ea782d6150ef2f1c8b2f3c5896552b90b2ad6c17e",
+        "signalsmith_linear/linear.h": "7cfd0f9e91ee1bb1f1a582824b404fffdc2c041fc1e3db67341d2ebb1035740f",
+        "signalsmith_linear/platform/approx-cmsisdsp.h": "ec2e21691147246ad3a1ae95804decdc6adba6197596b38aac4e2cc2de64feb4",
+        "signalsmith_linear/platform/basic-fill-warnings.h": "c2ebbedbbbcf4b13fa236404a249d418a07f6edfc5ef2effd08d8be1e594b02e",
+        "signalsmith_linear/platform/fft-accelerate.h": "969751cc7f800bf83bd5511a9e9293172465d931f6f3a8adec4ddca15c859fa0",
+        "signalsmith_linear/platform/fft-cmsisdsp.h": "def81ee9bdf261c39b44bef8d2e2e6873844f5d7b02373fe6b8b845685a02f54",
+        "signalsmith_linear/platform/fft-ipp.h": "5d04e3be7f78372a9a1b1073bfa2f072f1392be8af5127d1a8697e41de0e9f82",
+        "signalsmith_linear/platform/fft-linear.h": "7c2ed61df7895af7b1a37f1073f833abdc971953277ece58128c9c7b4ca6cef2",
+        "signalsmith_linear/platform/fft-pffft-double.h": "359cd0108c2e470b3641aea216747b18bd56a367615fbb185bbbe5d1ab23566b",
+        "signalsmith_linear/platform/fft-pffft.h": "28b83cc0d5b680b1f85915a5ea9ddd97308a106e8632a797d360b423e6bc62b2",
+        "signalsmith_linear/platform/linear-accelerate.h": "b2ec67cb97f774dc5954da946c44d2f5c13a46f1cadc081eb2df117a75ce22ea",
+        "signalsmith_linear/platform/linear-cmsisdsp.h": "d21a8491444b2d00425c684a10eabc33c5504b3549d604fae1c34a409e6a2549",
+        "signalsmith_linear/platform/linear-xsimd.h": "bf99af5932b37960c49c68af32ff19dfc7ff648e44d76799259fbdbbbaef483e",
+        "signalsmith_linear/stft.h": "7422ff5ddc2a017dc0587dcce99ce5ba30a2414bc2996081f6b00d56905d9b8c"
       }
     },
     {
@@ -224,9 +227,9 @@
       },
       "license_file": "signalsmith_stretch/LICENSE.txt",
       "content_sha256": {
-        "signalsmith_stretch/LICENSE.txt": "16bf62d475af149d96a24853e77c9e0d939259a9d55b23b41da7f9939db85085",
+        "signalsmith_stretch/LICENSE.txt": "ee2ef82481ffb445ecdd4b3a4c1f82c0cddb2da8fe39d8e8dc384fffb3e7f06f",
         "signalsmith_stretch/include/signalsmith-stretch/signalsmith-stretch.h": "869facc1853189bec91fb54960da2f59333284963d6b52a242d55a399d305e4d",
-        "signalsmith_stretch/signalsmith-stretch.h": "45a0b93b1e00257014d48e7ae494ec4e604f56b4ee15189a355cd9794653a37d"
+        "signalsmith_stretch/signalsmith-stretch.h": "1188667959ac19dd40c0a6abbce694e44705615ec4f0e8db8af0f1cfb4c5dea7"
       }
     },
     {
@@ -245,8 +248,8 @@
       },
       "license_file": "thread_pool/LICENSE.txt",
       "content_sha256": {
-        "thread_pool/LICENSE.txt": "281b77201a734ba85fa039dc57876a997b5367cc9b1ea67d97d92800c5d4557a",
-        "thread_pool/include/BS_thread_pool.hpp": "63c9674aefbb7dc346b246752ac4453b244fa6e0e93cd67177c2d2d8c26bf3fe"
+        "thread_pool/LICENSE.txt": "712a867cc12ebfcdecf6cea097f5aa7ec5acaa435a8f818c9f370960df35acbf",
+        "thread_pool/include/BS_thread_pool.hpp": "50e9f4ebd7b479417e34361e411f7973f3b23274f09a988e8ca287df878f707b"
       }
     },
     {
@@ -267,10 +270,10 @@
       },
       "license_file": "readerwriterqueue/LICENSE.md",
       "content_sha256": {
-        "readerwriterqueue/LICENSE.md": "80cab6dacb9e281ee39d83e6ac9aea7e3d2575e466064de5afe36f5109f17a7b",
-        "readerwriterqueue/include/readerwriterqueue/atomicops.h": "4c8f136c47109f330fe1e7425e51f490eb9fd43dbed340da101af17311ba6c8f",
+        "readerwriterqueue/LICENSE.md": "018fb474bdf10bc068f5e3f2c61e18df8326d60b46db3eb017b4411eda189afc",
+        "readerwriterqueue/include/readerwriterqueue/atomicops.h": "1aa77127a2e1e5e774390acfe9594c0b6f77948591b35c226bd971777363daf2",
         "readerwriterqueue/include/readerwriterqueue/readerwritercircularbuffer.h": "e31e824e582fd16fe10015acaa909102697d4f92380375022bcbb848b814cebe",
-        "readerwriterqueue/include/readerwriterqueue/readerwriterqueue.h": "55fae3489100f9bc593b6616379a33f70033eacd7c14c3d12c7808c1d28cf566"
+        "readerwriterqueue/include/readerwriterqueue/readerwriterqueue.h": "3ac7cf5782f21db39f97cda9ff24dfe1fc3d6041af38045eb1a588c36d0a696b"
       }
     },
     {
@@ -332,6 +335,7 @@
     {
       "name": "doctest",
       "purpose": "Test framework for tests/",
+      "test_only": true,
       "version": "2.5.3",
       "license": "MIT",
       "homepage": "https://github.com/doctest/doctest",
@@ -355,13 +359,15 @@
       "name": "Qt",
       "purpose": "Desktop user interface (Qt Widgets, Qt Concurrent)",
       "license": "LGPL-3.0-only",
-      "homepage": "https://www.qt.io"
+      "homepage": "https://www.qt.io",
+      "source": "https://download.qt.io/archive/qt/ (the Windows build ships the MSYS2 package mingw-w64-clang-x86_64-qt6-base: build recipe at https://github.com/msys2/MINGW-packages, source archives at https://repo.msys2.org/mingw/sources/)"
     },
     {
       "name": "FFmpeg",
       "purpose": "AAC, Opus, ALAC, WMA and other decoders (libavformat, libavcodec, libswresample)",
       "license": "LGPL-2.1-or-later; GPL-3.0-or-later as packaged by MSYS2 and most distributions (--enable-gpl)",
-      "homepage": "https://ffmpeg.org"
+      "homepage": "https://ffmpeg.org",
+      "source": "https://ffmpeg.org/download.html (the Windows build ships the MSYS2 package mingw-w64-clang-x86_64-ffmpeg: build recipe at https://github.com/msys2/MINGW-packages, source archives at https://repo.msys2.org/mingw/sources/)"
     }
   ]
 }

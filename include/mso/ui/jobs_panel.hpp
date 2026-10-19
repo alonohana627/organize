@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <utility>
+#include <vector>
 
 #include "mso/app/application.hpp"
 
@@ -29,6 +30,7 @@ public:
     /// Finished rows kept for their result summary; older ones are removed.
     static constexpr int kMaxFinishedRows = 50;
 
+    /// An empty jobs panel.
     explicit JobsPanel(QWidget* parent = nullptr);
 
     /// Adds an import operation that the Application started.
@@ -47,6 +49,9 @@ public:
     int row_count() const;
     /// Reflects the global analysis pause state on the toggle button.
     void set_analysis_paused(bool paused);
+    /// Forgets the analysis runs and worker status of libraries not in `open` (closed libraries):
+    /// unfinished runs are marked "Library closed", so nothing offers Cancel for them any more.
+    void retain_libraries(const std::vector<uuids::uuid>& open);
 
 signals:
     /// Cancel an import operation.
@@ -71,15 +76,17 @@ private:
     void prune_finished_rows();
     /// Drops a row from the lookup maps before it is deleted (a cleared run is not re-added).
     void forget(QTreeWidgetItem* item);
+    /// Shows every open library's worker status line.
+    void update_worker_label();
 
     /// Widgets (owned through Qt's parent tree).
     QTreeWidget* tree_ = nullptr;
-    QPushButton* cancel_button_ = nullptr;
-    QPushButton* pause_button_ = nullptr;
-    QPushButton* resume_button_ = nullptr;
-    QPushButton* pause_all_button_ = nullptr;
-    QPushButton* clear_button_ = nullptr;
-    QLabel* worker_label_ = nullptr;
+    QPushButton* cancel_button_ = nullptr;     ///< cancels the selected job
+    QPushButton* pause_button_ = nullptr;      ///< pauses the selected analysis run
+    QPushButton* resume_button_ = nullptr;     ///< resumes the selected analysis run
+    QPushButton* pause_all_button_ = nullptr;  ///< pauses or resumes all analysis
+    QPushButton* clear_button_ = nullptr;      ///< removes finished rows
+    QLabel* worker_label_ = nullptr;           ///< analysis worker status per library
     /// Whether all analysis is paused (toggle button state).
     bool analysis_paused_ = false;
 

@@ -22,7 +22,8 @@ namespace mso::media {
 
 /// Limits for one probe_file() call (docs/01_REQUIREMENTS.md section 5.2).
 struct ProbeLimits {
-    /// Total bytes the probe may read from the file, including footer and tail reads.
+    /// Total bytes the parsers may consume, including footer and tail reads (the read-ahead
+    /// window never fetches more than they could still be given).
     std::uint64_t max_bytes = 4ull * 1024 * 1024;
     /// Wall-clock budget; a read starting after it fails and the probe returns a partial result.
     std::chrono::milliseconds max_time{2000};
@@ -64,22 +65,34 @@ struct ProbeResult {
     bool partial = false;                     ///< a probe limit was hit: some fields are unknown (PROBE_LIMIT evidence)
     EmbeddedTags tags;                        ///< embedded text and musical tags
     std::vector<LoopPoint> loops;             ///< container loop markers that fit inside the stream (at most 64)
-    std::uint64_t bytes_read = 0;  ///< bytes the probe actually read (never more than ProbeLimits::max_bytes)
+    /// Bytes the parsers consumed (never more than ProbeLimits::max_bytes). The file is read through
+    /// a 16 KiB read-ahead window, so slightly more may have come off the disk.
+    std::uint64_t bytes_read = 0;
 };
 
 /// Bounded metadata probe. Identifies the container from its leading bytes (the extension is only a
-/// hint), reads headers and tags within `limits`, and never decodes the audio or hashes the file.
+/// hint), reads headers and tags within `limits`, and never hashes the file. The native parsers
+/// never decode audio; only the FFmpeg fallback for containers without a native parser (when built
+/// in) may decode a few packets to learn the stream parameters, within the same byte budget and
+/// deadline (FFmpeg's stream analysis is interrupted when the deadline passes).
 /// Hitting a limit is not an error: the result comes back with `partial` set.
 /// Thread-safe; may run concurrently on any thread.
 /// Errors: FileMissing, AccessDenied (retryable while another process locks the file),
 /// UnsupportedCodec (not audio, not a regular file, unknown or DRM-protected), CorruptAudio
 /// (damaged essential headers).
-Result<ProbeResult> probe_file(const std::filesystem::path& file, const ProbeLimits& limits = {});
+[[nodiscard]] Result<ProbeResult> probe_file(const std::filesystem::path& file, const ProbeLimits& limits = {});
+
+/// probe_file() over bytes in memory, for fuzzing and tests: the same parsers, budget and deadline,
+/// with `bytes` standing in for the file's content. `file_name_hint` (UTF-8, for example
+/// "sample.ogg") only supplies the extension hint. Never touches the filesystem.
+/// Errors: as probe_file(), except FileMissing and AccessDenied.
+[[nodiscard]] Result<ProbeResult> probe_memory(std::span<const std::uint8_t> bytes, std::string_view file_name_hint,
+                                               const ProbeLimits& limits = {});
 
 /// Extension pre-filter used by enumeration: true for suffixes worth probing. Takes the extension
 /// in lower case without the dot ("wav"). The suffix is only a hint; the probe identifies the
 /// actual container.
-bool is_candidate_extension(std::string_view extension_lowercase) noexcept;
+[[nodiscard]] bool is_candidate_extension(std::string_view extension_lowercase) noexcept;
 
 /// Streaming decoder producing interleaved float32 at the source rate and channel count.
 ///
@@ -91,22 +104,22 @@ public:
     virtual ~Decoder() = default;
 
     /// Channels per interleaved frame (at least 1).
-    virtual int channels() const = 0;
+    [[nodiscard]] virtual int channels() const = 0;
     /// Frames per second (at least 1).
-    virtual int sample_rate() const = 0;
+    [[nodiscard]] virtual int sample_rate() const = 0;
     /// Length of the stream in frames, when known (an estimate unless frames_exact()).
-    virtual std::optional<std::int64_t> total_frames() const = 0;
+    [[nodiscard]] virtual std::optional<std::int64_t> total_frames() const = 0;
     /// True when total_frames() is the exact number of frames a full read delivers.
-    virtual bool frames_exact() const = 0;
+    [[nodiscard]] virtual bool frames_exact() const = 0;
 
     /// Decodes up to `frames` frames into `out`, which must hold frames * channels() floats.
     /// Returns the number of frames written: fewer than requested only at the end, and 0 once the
     /// stream is exhausted. Never writes beyond frames * channels() floats.
     /// Errors: CorruptAudio for undecodable data, AccessDenied when the file can no longer be read.
-    virtual Result<std::size_t> read(float* out, std::size_t frames) = 0;
+    [[nodiscard]] virtual Result<std::size_t> read(float* out, std::size_t frames) = 0;
 
     /// read(float*, std::size_t) over a span: decodes at most out.size() / channels() frames.
-    Result<std::size_t> read(std::span<float> out) {
+    [[nodiscard]] Result<std::size_t> read(std::span<float> out) {
         const int channel_count = channels();
         return read(out.data(), out.size() / static_cast<std::size_t>(channel_count > 0 ? channel_count : 1));
     }
@@ -116,11 +129,11 @@ public:
     /// positioned at the end (position() reports the exact end when the length is exact, otherwise
     /// the frame actually reached) and the next read() returns 0.
     /// Errors: CorruptAudio when the stream cannot be repositioned.
-    virtual Result<void> seek(std::int64_t frame) = 0;
+    [[nodiscard]] virtual Result<void> seek(std::int64_t frame) = 0;
     /// Index of the next frame read() delivers.
-    virtual std::int64_t position() const = 0;
+    [[nodiscard]] virtual std::int64_t position() const = 0;
     /// Codec name, in the vocabulary of ProbeResult::codec.
-    virtual std::string codec() const = 0;
+    [[nodiscard]] virtual std::string codec() const = 0;
 };
 
 /// Opens a decoder for `file`. A bounded probe identifies the container and codec first; the backend
@@ -129,10 +142,10 @@ public:
 /// when built in for everything else. The file is opened with full sharing, so other applications
 /// can rename, move or delete it while it previews.
 /// Errors: those of probe_file(), plus UnsupportedCodec when no built-in backend decodes the codec.
-Result<std::unique_ptr<Decoder>> open_decoder(const std::filesystem::path& file);
+[[nodiscard]] Result<std::unique_ptr<Decoder>> open_decoder(const std::filesystem::path& file);
 
 /// Codec names this build can decode, for capability reports and UNSUPPORTED_CODEC messages.
-std::vector<std::string> decoder_capabilities();
+[[nodiscard]] std::vector<std::string> decoder_capabilities();
 
 /// Tempo and key read from a file name. Proposals are tagged as 'filename' evidence and never
 /// accepted silently.
@@ -143,6 +156,6 @@ struct FilenameHints {
 
 /// Conservative filename heuristics: ambiguous or conflicting tokens produce no proposal.
 /// `stem_utf8` is the file name without its extension, in UTF-8.
-FilenameHints filename_hints(std::string_view stem_utf8);
+[[nodiscard]] FilenameHints filename_hints(std::string_view stem_utf8);
 
 }  // namespace mso::media

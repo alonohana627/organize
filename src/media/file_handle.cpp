@@ -7,7 +7,7 @@
 #include <system_error>
 #include <utility>
 
-#include "mso/media/detail/native_file_support.hpp"
+#include "mso/media/native_file.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>

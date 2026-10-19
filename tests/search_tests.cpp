@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "mso/search/query_compiler.hpp"
 #include "mso/search/search_service.hpp"
 #include "test_support.hpp"
 
@@ -220,6 +221,49 @@ std::map<std::int64_t, SampleRow> all_rows(catalog::Library& library) {
     return rows;
 }
 
+/// Merges tag `source` into tag `target` (both paths must exist).
+void merge_tag(catalog::Library& library, std::string_view source, std::string_view target) {
+    const auto source_id = library.ensure_tag(source);
+    const auto target_id = library.ensure_tag(target);
+    REQUIRE(source_id.has_value());
+    REQUIRE(target_id.has_value());
+    catalog::TaxonomyCommand merge{
+        .kind = catalog::TaxonomyCommand::Kind::MergeTag, .target_id = *source_id, .other_id = *target_id};
+    REQUIRE(library.apply_taxonomy(merge).has_value());
+}
+
+/// Adds to the rich library a non-ASCII tag and category tree and merged tags: "Percusion" (on Pad
+/// and top) merged into "Drums", and a chain "Old" (on x) → "Newer" (on y) → "Bright".
+void add_unicode_and_merged_taxonomy(catalog::Library& library) {
+    const auto id = [&](std::string_view name) { return test::sample_id_named(library, name); };
+    catalog::EditCommand unicode;
+    unicode.sample_ids = {id("Pad"), id("top")};
+    unicode.tags_add = {"Ünïcode/Äther", "Percusion"};
+    REQUIRE(library.apply_edit(unicode).has_value());
+    catalog::EditCommand category;
+    category.sample_ids = {id("x"), id("Pad")};
+    category.category = std::optional<std::string>("Ärger/Öl");
+    REQUIRE(library.apply_edit(category).has_value());
+    catalog::EditCommand old_tag;
+    old_tag.sample_ids = {id("x")};
+    old_tag.tags_add = {"Old"};
+    REQUIRE(library.apply_edit(old_tag).has_value());
+    catalog::EditCommand newer_tag;
+    newer_tag.sample_ids = {id("y")};
+    newer_tag.tags_add = {"Newer"};
+    REQUIRE(library.apply_edit(newer_tag).has_value());
+    merge_tag(library, "Percusion", "Drums");
+    merge_tag(library, "Old", "Newer");
+    merge_tag(library, "Newer", "Bright");
+}
+
+/// The sorted ids of `matching_ids` for `text` (fails the test on error).
+std::vector<std::int64_t> sql_matches(catalog::Library& library, std::string_view text) {
+    auto ids = matching_ids(library, SearchRequest{.text = std::string(text)});
+    REQUIRE(ids.has_value());
+    return *ids;
+}
+
 /// Collection id by name (fails the test when absent).
 std::int64_t collection_named(catalog::Library& library, std::string_view name) {
     auto collections = library.list_collections();
@@ -251,6 +295,13 @@ TEST_SUITE("search") {
         auto phrase = parse_query("\"a*b\"");
         CHECK(phrase->root->text.text == "a*b");  // '*' is literal inside a phrase
         CHECK_FALSE(phrase->root->text.prefix);
+        CHECK(parse_query("(\"a b\")").has_value());  // a parenthesis may follow a closing quote
+        // Folders are addressed from a root down; leading separators are dropped.
+        CHECK(parse_query("folder:/Drums")->root->predicate.text == "Drums");
+#ifdef _WIN32
+        // '\' is a separator only on Windows (as in path_key).
+        CHECK(parse_query("folder:\"\\\\Drums/Kicks\"")->root->predicate.text == "Drums/Kicks");
+#endif
     }
 
     TEST_CASE("numeric values become inclusive bounds at the typed precision") {
@@ -265,7 +316,9 @@ TEST_SUITE("search") {
               Case{"duration:2s", 1'500'000, 2'499'999}, Case{"duration:2000ms", 1'999'500, 2'000'499},
               Case{"duration:1.5min", 87'000'000, 92'999'999}, Case{"rate:44.1k", 44'050, 44'149},
               Case{"rate:48000", 48'000, 48'000}, Case{"size:1kb", 500, 1'499}, Case{"rating:3", 3, 3},
-              Case{"channels:1..2", 1, 2}}) {
+              Case{"channels:1..2", 1, 2},
+              // Near the int64 limit: the rounding division must not overflow (it was UB).
+              Case{"size:4.611686017gb", 4'611'686'017, 4'611'686'017}}) {
             const std::string_view shown_text = text;
             CAPTURE(shown_text);
             auto query = parse_query(text);
@@ -306,7 +359,11 @@ TEST_SUITE("search") {
                                              Case{"bpm:5..2", 4},
                                              Case{"bpm:99999999999999999999", 4},
                                              Case{"format:.", 7},
-                                             Case{"analyzed:maybe", 9}}) {
+                                             Case{"analyzed:maybe", 9},
+                                             Case{"\"kick\"*", 6},
+                                             Case{"tag:\"x\"y", 7},
+                                             Case{"\"a\"\"b\"", 3},
+                                             Case{"folder:/", 7}}) {
             const std::string_view shown_text = text;
             CAPTURE(shown_text);
             auto query = parse_query(text);
@@ -316,6 +373,9 @@ TEST_SUITE("search") {
             CHECK(*query.error().position == position);
         }
         CHECK(parse_query(")").error().safe_detail == "unmatched ')'");
+        CHECK(parse_query("\"kick\"*").error().safe_detail ==
+              "a quoted phrase cannot be a prefix search; remove the quotes or the '*'");
+        CHECK(parse_query("tag:\"x\"y").error().safe_detail == "put a space after the closing quote");
         CHECK(parse_query("()").error().safe_detail == "empty parentheses");
         std::string deep;
         for (int level = 0; level < 20; ++level)
@@ -593,7 +653,9 @@ TEST_SUITE("search") {
             for (auto& [library, state] : document["libraries"].items())
                 state["v"] = nlohmann::json::array();
         });
-        mutate([](nlohmann::json& document) { document["offset"] = -3; });
+        mutate([](nlohmann::json& document) { document["ranked"] = "x"; });
+        mutate([](nlohmann::json& document) { document["ranked"] = {{"library", -3}}; });
+        mutate([](nlohmann::json& document) { document["ranked"] = {{"library", "3"}}; });
         for (const auto& token : malformed) {
             CAPTURE(token);
             expect_stale(one, SearchRequest{.text = "kick", .page_size = 2, .cursor = Cursor{token}});
@@ -811,11 +873,33 @@ TEST_SUITE("search") {
         };
         create("Nested", "collection:Flacs OR tag:Kick");
         CHECK(count_of(library, "collection:Nested") == 3);
-        create("Loop", "collection:Loop");
         catalog::Library* scope[] = {&library};
-        auto loop = SearchService().search(scope, SearchRequest{.text = "collection:Loop"});
-        REQUIRE_FALSE(loop.has_value());
-        CHECK(loop.error().code == ErrorCode::InvalidArgument);
+        // A stored query that cannot be compiled is this library's failure, never a request error.
+        const auto expect_library_failure = [&](const SearchRequest& request, ErrorCode code) {
+            auto page = SearchService().search(scope, request);
+            REQUIRE(page.has_value());
+            CHECK(page->rows.empty());
+            REQUIRE(page->coverage.size() == 1);
+            CHECK_FALSE(page->coverage.front().complete);
+            REQUIRE(page->coverage.front().error.has_value());
+            CHECK(page->coverage.front().error->code == code);
+            auto counted = SearchService().count(scope, request);
+            REQUIRE(counted.has_value());
+            CHECK(counted->total == 0);
+            CHECK_FALSE(counted->coverage.front().complete);
+            auto ids = matching_ids(library, request);
+            REQUIRE_FALSE(ids.has_value());
+            CHECK(ids.error().code == code);
+        };
+        create("Loop", "collection:Loop");
+        expect_library_failure(SearchRequest{.text = "collection:Loop"}, ErrorCode::ResourceLimit);
+        create("Broken", "tag:Drums//Kick");
+        expect_library_failure(SearchRequest{.text = "collection:Broken"}, ErrorCode::DbCorrupt);
+        expect_library_failure(SearchRequest{.scope = {.collection_id = collection_named(library, "Broken")}},
+                               ErrorCode::DbCorrupt);
+        create("Garbled", "bpm:");
+        expect_library_failure(SearchRequest{.text = "collection:Garbled"}, ErrorCode::DbCorrupt);
+        CHECK(count_of(library, "collection:Nested") == 3);  // unaffected by the broken ones
 
         std::string sixteen = "collection:C0";
         for (int index = 1; index < 16; ++index)
@@ -826,14 +910,31 @@ TEST_SUITE("search") {
         create("C2", sixteen);
         std::ranges::replace(sixteen, '1', '2');
         create("C3", sixteen);
-        CHECK(count_of(library, "collection:C2") == count_of(library, "format:wav"));  // 16 × 16 terms fit
-        auto exploded = SearchService().search(scope, SearchRequest{.text = "collection:C3"});
-        REQUIRE_FALSE(exploded.has_value());  // 16³ terms do not
-        CHECK(exploded.error().code == ErrorCode::InvalidArgument);
-        auto scoped =
-            SearchService().count(scope, SearchRequest{.scope = {.collection_id = collection_named(library, "C3")}});
-        REQUIRE_FALSE(scoped.has_value());
-        CHECK(scoped.error().code == ErrorCode::InvalidArgument);
+        CHECK(count_of(library, "collection:C2") == count_of(library, "format:wav"));              // 16 × 16 terms fit
+        expect_library_failure(SearchRequest{.text = "collection:C3"}, ErrorCode::ResourceLimit);  // 16³ do not
+        expect_library_failure(SearchRequest{.scope = {.collection_id = collection_named(library, "C3")}},
+                               ErrorCode::ResourceLimit);
+
+        // Federated: the other library still answers the same request.
+        auto other = test::make_library(scratch / "other", paging_fixture(), "Other");
+        catalog::Library* both[] = {&library, other.library.get()};
+        auto federated = SearchService().search(both, SearchRequest{.text = "collection:Loop OR format:flac"});
+        REQUIRE(federated.has_value());
+        CHECK(federated->rows.size() == 4);  // the paging fixture's four flac files
+        for (const auto& row : federated->rows)
+            CHECK(row.library == other.library->uuid());
+        REQUIRE(federated->coverage.size() == 2);
+        CHECK_FALSE(federated->coverage[0].complete);
+        CHECK(federated->coverage[1].complete);
+
+        // Text that could never compile is refused before it is stored.
+        SearchService service;
+        auto invalid_path = service.validate("tag:Drums//Kick");
+        REQUIRE_FALSE(invalid_path.has_value());
+        CHECK(invalid_path.error().code == ErrorCode::InvalidArgument);
+        CHECK_FALSE(service.validate("NOT (kick OR category:a/ /b)").has_value());
+        CHECK(service.validate("tag:Drums/Kick category:Drums").has_value());
+        CHECK(service.validate("bpm:").error().code == ErrorCode::ParseError);
     }
 
     TEST_CASE("analyzed: flags and availability follow the primary location") {
@@ -878,10 +979,10 @@ TEST_SUITE("search") {
         CHECK(kick_row.relative_path == "Drums/Kicks/Kick 01.wav");
         CHECK(kick_row.folder_path == "Drums/Kicks");
         CHECK(kick_row.file_name == "Kick 01.wav");
+        CHECK(kick_row.path_key == path_key("Drums/Kicks/Kick 01.wav", false));  // the stored locations.path_key
         CHECK(kick_row.category == "Drums/Kicks");
         REQUIRE(kick_row.category_id.has_value());
         CHECK(kick_row.tag_paths == std::vector<std::string>{"Drums/Kick/Acoustic"});
-        CHECK(kick_row.tags == "Drums/Kick/Acoustic");
         CHECK(kick_row.tag_ids == std::vector<std::int64_t>{*library.ensure_tag("Drums/Kick/Acoustic")});
         CHECK(kick_row.rating == 4);
         CHECK(kick_row.bpm_milli == 120'180);
@@ -895,6 +996,10 @@ TEST_SUITE("search") {
         CHECK((*rows)[0].tag_ids[1] == *library.ensure_tag("Drums/Snare"));
         CHECK((*rows)[2].folder_path.empty());
         CHECK(load_rows(library, std::vector<std::int64_t>{})->empty());
+        auto exact = load_rows(library, std::vector<std::int64_t>{test::sample_id_named(library, "Hit")});
+        REQUIRE(exact.has_value());
+        REQUIRE(exact->size() == 1);
+        CHECK(exact->front().path_key == path_key("CaseDir/Hit.wav", true));  // a case-sensitive root keeps case
 
         catalog::EditCommand remove;
         remove.sample_ids = {kick};
@@ -919,6 +1024,8 @@ TEST_SUITE("search") {
             const auto& streamed = rows.at(row.sample_id);
             CAPTURE(row.display_name);
             CHECK(streamed.relative_path == row.relative_path);
+            CHECK(streamed.path_key == row.path_key);
+            CHECK(row.path_key == path_key(row.relative_path, row.root_case_sensitive));
             CHECK(streamed.root_id == row.root_id);
             CHECK(streamed.tag_ids == row.tag_ids);
             CHECK(streamed.tag_paths == row.tag_paths);
@@ -930,7 +1037,7 @@ TEST_SUITE("search") {
         auto page = SearchService().search(std::array{&library}, SearchRequest{.page_size = 500});
         REQUIRE(page.has_value());
         for (const auto& row : page->rows)
-            CHECK(rows.at(row.sample_id).tags == row.tags);  // search pages hydrate the same way
+            CHECK(rows.at(row.sample_id).tag_paths == row.tag_paths);  // search pages hydrate the same way
     }
 
     TEST_CASE("matching_ids returns exactly the matches in ascending id order") {
@@ -950,6 +1057,13 @@ TEST_SUITE("search") {
         auto scoped = matching_ids(library, SearchRequest{.scope = {.root_id = rich.other_root}});
         REQUIRE(scoped.has_value());
         CHECK(scoped->size() == 2);
+        const auto every = sql_matches(library, "");
+        auto at_limit = matching_ids(library, SearchRequest{}, every.size());
+        REQUIRE(at_limit.has_value());
+        CHECK(*at_limit == every);
+        auto over_limit = matching_ids(library, SearchRequest{}, every.size() - 1);
+        REQUIRE_FALSE(over_limit.has_value());
+        CHECK(over_limit.error().code == ErrorCode::ResourceLimit);
         auto invalid = matching_ids(library, SearchRequest{.text = "bpm:"});
         REQUIRE_FALSE(invalid.has_value());
         CHECK(invalid.error().code == ErrorCode::ParseError);
@@ -959,69 +1073,27 @@ TEST_SUITE("search") {
         ScratchDirectory scratch;
         auto rich = make_rich_library(scratch / "lib");
         auto& library = *rich.library;
+        add_unicode_and_merged_taxonomy(library);
         const auto rows = all_rows(library);
-        for (const auto text : {"",
-                                "tag:Kick",
-                                "tag:kick",
-                                "tag:Bright",
-                                "NOT tag:Kick",
-                                "category:Drums",
-                                "category:drums/KICKS",
-                                "category:Loops/House",
-                                "category:Kicks",
-                                "NOT category:Drums",
-                                "folder:Drums",
-                                "folder:samples/drums",
-                                "folder:Samples",
-                                "folder:Other",
-                                "folder:ÜNÏCODE/äbc",
-                                "folder:a_b",
-                                "NOT folder:Loops",
-                                "folder:Drums/Kicks/",
-                                "folder:CaseDir",
-                                "folder:casedir",
-                                "folder:EXACT",
-                                "folder:Exact/CaseDir",
-                                "bpm:120",
-                                "bpm:120.2",
-                                "bpm:120.0",
-                                "bpm:>125",
-                                "NOT bpm:>125",
-                                "bpm:100..130",
-                                "duration:2s",
-                                "duration:<1s",
-                                "NOT duration:<1s",
-                                "duration:100ms..3s",
-                                "rating:>=3",
-                                "rating:0",
-                                "rating:<2",
-                                "favorite:true",
-                                "favorite:false",
-                                "format:flac",
-                                "format:wav",
-                                "NOT format:wav",
-                                "codec:pcm_",
-                                "codec:PCM_S16",
-                                "rate:44.1k",
-                                "rate:48000",
-                                "channels:2",
-                                "bits:24",
-                                "bits:>=24",
-                                "size:>1kb",
-                                "size:1kb",
-                                "available:true",
-                                "available:false",
-                                "analyzed:tempo",
-                                "analyzed:none",
-                                "analyzed:any",
-                                "key:Am",
-                                "key:C",
-                                "key:unknown",
-                                "NOT key:Am",
-                                "(tag:Kick OR format:flac) AND NOT rating:0",
-                                "tag:Kick OR NOT (bpm:120 OR duration:>2s)",
-                                "NOT NOT available:true",
-                                "favorite:true rating:2"}) {
+        const auto aliases = load_tag_aliases(library);
+        REQUIRE(aliases.has_value());
+        for (const auto text :
+             {"",
+              // Non-ASCII taxonomy and merged tags (matched by their old names).
+              "tag:ünïcode", "tag:ÄTHER", "tag:\"Äther\"", "NOT tag:äther", "category:ärger", "category:ÄRGER/öl",
+              "category:Öl", "NOT category:Ärger/Öl", "tag:Percusion", "tag:percusion OR tag:Bright",
+              "NOT tag:Percusion", "tag:Old", "tag:Newer", "tag:Drums NOT tag:Percusion", "tag:Kick", "tag:kick",
+              "tag:Bright", "NOT tag:Kick", "category:Drums", "category:drums/KICKS", "category:Loops/House",
+              "category:Kicks", "NOT category:Drums", "folder:Drums", "folder:samples/drums", "folder:Samples",
+              "folder:Other", "folder:ÜNÏCODE/äbc", "folder:a_b", "NOT folder:Loops", "folder:Drums/Kicks/",
+              "folder:CaseDir", "folder:casedir", "folder:EXACT", "folder:Exact/CaseDir", "bpm:120", "bpm:120.2",
+              "bpm:120.0", "bpm:>125", "NOT bpm:>125", "bpm:100..130", "duration:2s", "duration:<1s",
+              "NOT duration:<1s", "duration:100ms..3s", "rating:>=3", "rating:0", "rating:<2", "favorite:true",
+              "favorite:false", "format:flac", "format:wav", "NOT format:wav", "codec:pcm_", "codec:PCM_S16",
+              "rate:44.1k", "rate:48000", "channels:2", "bits:24", "bits:>=24", "size:>1kb", "size:1kb",
+              "available:true", "available:false", "analyzed:tempo", "analyzed:none", "analyzed:any", "key:Am", "key:C",
+              "key:unknown", "NOT key:Am", "(tag:Kick OR format:flac) AND NOT rating:0",
+              "tag:Kick OR NOT (bpm:120 OR duration:>2s)", "NOT NOT available:true", "favorite:true rating:2"}) {
             const std::string_view shown_text = text;
             CAPTURE(shown_text);
             auto query = parse_query(text);
@@ -1030,13 +1102,22 @@ TEST_SUITE("search") {
             auto sql = matching_ids(library, SearchRequest{.text = text});
             REQUIRE(sql.has_value());
             std::vector<std::int64_t> memory;
-            RowMatcher matcher(*query);
+            RowMatcher matcher(*query, std::span(&*aliases, 1));
             for (const auto& [id, row] : rows) {
                 if (matcher(row)) memory.push_back(id);
-                CHECK(matches(*query, row) == matcher(row));
+                CHECK(matches(*query, row, std::span(&*aliases, 1)) == matcher(row));
             }
             CHECK(memory == *sql);
         }
+        // Without the alias table an old name matches nothing in memory (documented), unlike SQL.
+        CHECK_FALSE(sql_matches(library, "tag:Percusion").empty());
+        RowMatcher without_aliases(*parse_query("tag:Percusion"));
+        CHECK(std::ranges::none_of(rows, [&](const auto& entry) { return without_aliases(entry.second); }));
+        // A moved-from matcher is safe and matches nothing.
+        RowMatcher moved(*parse_query(""));
+        RowMatcher target = std::move(moved);
+        CHECK(target(rows.begin()->second));
+        CHECK_FALSE(moved(rows.begin()->second));  // NOLINT(bugprone-use-after-move): documented state
         for (const auto text : {"kick", "name:kick", "collection:Flacs", "tag:Drums/Kick", "tag:Kick OR kick",
                                 "category:Drums//Kick", "NOT collection:x"}) {
             const std::string_view shown_text = text;
@@ -1044,6 +1125,182 @@ TEST_SUITE("search") {
             CHECK_FALSE(is_row_evaluable(*parse_query(text)));
         }
         CHECK(is_row_evaluable(*parse_query("category:Drums/Kicks")));
+    }
+
+    TEST_CASE("folder filters pick an index-driven or a streaming plan by selectivity, with equal results") {
+        ScratchDirectory scratch;
+        std::vector<catalog::ScannedFile> files;
+        for (int index = 0; index < 64; ++index)
+            files.push_back(test::synthetic_file(std::format("{}/file {:02}.wav",
+                                                             index == 0  ? "Rare"
+                                                             : index % 2 ? "Common/Odd"
+                                                                         : "Common/Even",
+                                                             index),
+                                                 100 + index, 1000));
+        auto populated = test::make_library(scratch / "lib", files);
+        auto& library = *populated.library;
+        const auto compiled_sql = [&](std::string_view text) {
+            auto reader = library.acquire_reader();
+            REQUIRE(reader.has_value());
+            auto compiled = compile_query(*parse_query(text), reader->connection());
+            REQUIRE(compiled.has_value());
+            return compiled->sql;
+        };
+        // 1 of 64 locations is below the 1/16 threshold; 63 and 32 are not.
+        CHECK(compiled_sql("folder:Rare").starts_with("s.id IN ("));
+        CHECK(compiled_sql("folder:Common").starts_with("EXISTS("));
+        CHECK(compiled_sql("folder:Common/Odd").starts_with("EXISTS("));
+        CHECK(compiled_sql("NOT folder:Rare").starts_with("NOT (COALESCE((s.id IN ("));
+        CHECK(count_of(library, "folder:Rare") == 1);
+        CHECK(count_of(library, "folder:Common") == 63);
+        CHECK(count_of(library, "folder:Common/Even") == 31);
+        CHECK(count_of(library, "NOT folder:Rare") == 63);
+        CHECK(count_of(library, "folder:Rare OR folder:Common/Odd") == 33);
+        CHECK(count_of(library, "", {.root_id = populated.root_id, .folder = "Rare"}) == 1);
+        CHECK(count_of(library, "", {.root_id = populated.root_id, .folder = "common"}) == 63);
+        CHECK(count_of(library, "", {.root_id = populated.root_id}) == 64);
+        const auto rows = all_rows(library);
+        for (const auto text : {"folder:Rare", "NOT folder:Rare", "folder:Common", "folder:Samples/Rare",
+                                "folder:Rare OR folder:Common/Odd", "folder:Nowhere"}) {
+            const std::string_view shown_text = text;
+            CAPTURE(shown_text);
+            RowMatcher matcher(*parse_query(text));
+            std::vector<std::int64_t> memory;
+            for (const auto& [id, row] : rows)
+                if (matcher(row)) memory.push_back(id);
+            CHECK(memory == sql_matches(library, text));
+            const auto ordered = single_page(library, SearchRequest{.text = text});  // paged, name order
+            CHECK(ordered.size() == memory.size());
+        }
+    }
+
+    TEST_CASE("a merged tag keeps matching by its old name, in queries and smart collections") {
+        ScratchDirectory scratch;
+        auto rich = make_rich_library(scratch / "lib");
+        auto& library = *rich.library;
+        const auto drums_before = count_of(library, "tag:Drums");
+        add_unicode_and_merged_taxonomy(library);
+        // Pad and top were tagged "Percusion", now merged into Drums: they joined its subtree.
+        CHECK(count_of(library, "tag:Drums") == drums_before + 2);
+        CHECK(sql_matches(library, "tag:Percusion") == sql_matches(library, "tag:Drums"));
+        CHECK(sql_matches(library, "tag:PERCUSION") == sql_matches(library, "tag:Drums"));
+        // A chain of merges: Old → Newer → Bright.
+        CHECK(sql_matches(library, "tag:Old") == sql_matches(library, "tag:Bright"));
+        CHECK(sql_matches(library, "tag:Newer") == sql_matches(library, "tag:Bright"));
+        CHECK(count_of(library, "tag:Bright") == 4);  // Snare_02, Ride, x (was Old), y (was Newer)
+        catalog::TaxonomyCommand smart{.kind = catalog::TaxonomyCommand::Kind::CreateCollection,
+                                       .new_name = "Old percussion",
+                                       .smart_query = std::string("tag:Percusion OR tag:Old")};
+        REQUIRE(library.apply_taxonomy(smart).has_value());
+        CHECK(count_of(library, "collection:\"Old percussion\"") == count_of(library, "tag:Drums OR tag:Bright"));
+
+        auto aliases = load_tag_aliases(library);
+        REQUIRE(aliases.has_value());
+        CHECK(aliases->library == library.uuid());
+        CHECK(aliases->canonical_paths.size() == 3);
+        CHECK(aliases->canonical_paths["percusion"] == std::vector<std::string>{"Drums"});
+        CHECK(aliases->canonical_paths["old"] == std::vector<std::string>{"Bright"});
+        CHECK(aliases->canonical_paths["newer"] == std::vector<std::string>{"Bright"});
+
+        // Undoing the last merge (Newer into Bright) brings Newer back; Old now redirects to it.
+        REQUIRE(library.undo().has_value());  // the smart collection
+        REQUIRE(library.undo().has_value());  // Newer into Bright
+        CHECK(sql_matches(library, "tag:Old") == sql_matches(library, "tag:Newer"));
+        CHECK(count_of(library, "tag:Newer") == 2);
+        auto after_undo = load_tag_aliases(library);
+        REQUIRE(after_undo.has_value());
+        CHECK(after_undo->canonical_paths["old"] == std::vector<std::string>{"Newer"});
+        CHECK_FALSE(after_undo->canonical_paths.contains("newer"));
+    }
+
+    TEST_CASE("one matcher agrees with SQL over two libraries whose ids collide") {
+        ScratchDirectory scratch;
+        auto rich = make_rich_library(scratch / "a");
+        auto& first = *rich.library;
+        add_unicode_and_merged_taxonomy(first);
+
+        // A second library whose root 1 is case-sensitive "Bänke", whose tag 1 is "Bright" (the
+        // first library's tag 1 is "Drums"), whose category 1 is "Loops", and where "Percusion"
+        // was merged into a different tag.
+        auto created = catalog::Library::create(scratch / "b", "Second");
+        REQUIRE(created.has_value());
+        auto& second = **created;
+        auto root = second.add_root("Bänke", catalog::RootMode::Referenced, true);
+        REQUIRE(root.has_value());
+        REQUIRE(second.set_root_availability(root->id, catalog::Availability::Online).has_value());
+        const std::vector<catalog::ScannedFile> files = {
+            rich_file("Loops/Ünï/K1.wav", 100, 1'000'000, "wav", "PCM_S16", 44100, 16),
+            rich_file("loops/x.wav", 200, 2'000'000, "flac", "flac", 48000, 24),
+            rich_file("Drums/Kick 9.wav", 300, 300'000, "wav", "pcm_s24", 44100, 24),
+            rich_file("Samples/Drums/z.wav", 400, 400'000, "wav", "pcm_s16", 44100, 16)};
+        auto session = second.begin_scan(root->id);
+        REQUIRE(session.has_value());
+        REQUIRE(second.commit_scan_batch(*session, files, {}, [](std::string_view) { return false; }).has_value());
+        REQUIRE(second.finish_scan(*session, false).has_value());
+        const auto id = [&](std::string_view name) { return test::sample_id_named(second, name); };
+        catalog::EditCommand tags;
+        tags.sample_ids = {id("K1"), id("Kick 9")};
+        tags.tags_add = {"Bright/Kick", "Percusion"};
+        tags.category = std::optional<std::string>("Loops/Äther");
+        REQUIRE(second.apply_edit(tags).has_value());
+        catalog::EditCommand drums;
+        drums.sample_ids = {id("z")};
+        drums.tags_add = {"Drums"};
+        REQUIRE(second.apply_edit(drums).has_value());
+        merge_tag(second, "Percusion", "Bright/Kick");
+        REQUIRE(*second.ensure_tag("Bright") == 1);
+        REQUIRE(*first.ensure_tag("Drums") == 1);
+        REQUIRE(rich.samples_root == root->id);
+
+        std::vector<SampleRow> rows;
+        for (auto& [sample_id, row] : all_rows(first))
+            rows.push_back(std::move(row));
+        for (auto& [sample_id, row] : all_rows(second))
+            rows.push_back(std::move(row));
+        std::ranges::sort(rows, {}, &SampleRow::sample_id);  // interleave the two libraries
+        auto first_aliases = load_tag_aliases(first);
+        auto second_aliases = load_tag_aliases(second);
+        REQUIRE(first_aliases.has_value());
+        REQUIRE(second_aliases.has_value());
+        const std::array aliases = {*first_aliases, *second_aliases};
+
+        for (const auto text : {"tag:Drums",
+                                "tag:Bright",
+                                "tag:Kick",
+                                "tag:Percusion",
+                                "NOT tag:Percusion",
+                                "tag:Old",
+                                "category:Loops",
+                                "category:Drums",
+                                "category:äther",
+                                "category:Loops/Äther",
+                                "folder:Loops",
+                                "folder:loops",
+                                "NOT folder:Loops",
+                                "folder:Bänke",
+                                "folder:BÄNKE/Loops",
+                                "folder:bänke/loops",
+                                "folder:Samples",
+                                "folder:Samples/Drums",
+                                "folder:Drums",
+                                "folder:Ünï",
+                                "codec:pcm_s16",
+                                "format:flac",
+                                "tag:Kick folder:Loops",
+                                "rate:44.1k NOT tag:Drums"}) {
+            const std::string_view shown_text = text;
+            CAPTURE(shown_text);
+            auto query = parse_query(text);
+            REQUIRE(query.has_value());
+            REQUIRE(is_row_evaluable(*query));
+            const std::map<uuids::uuid, std::vector<std::int64_t>> expected = {
+                {first.uuid(), sql_matches(first, text)}, {second.uuid(), sql_matches(second, text)}};
+            RowMatcher matcher(*query, aliases);
+            for (const auto& row : rows) {
+                CAPTURE(row.display_name);
+                CHECK(matcher(row) == std::ranges::contains(expected.at(row.library), row.sample_id));
+            }
+        }
     }
 
     TEST_CASE("for_each_row and page hydration scale to 100K samples (benchmark)" * doctest::skip()) {
@@ -1067,7 +1324,8 @@ TEST_SUITE("search") {
             std::vector<catalog::ScannedFile> batch;
             for (std::int64_t index = first; index < first + 500; ++index) {
                 auto file = test::synthetic_file(
-                    std::format("{}/{} {:07}.wav", kFolders[random() % 4], kWords[random() % 6], index),
+                    std::format("{}/{} {:07}.wav", index % 100 == 0 ? "Packs/Goa" : kFolders[random() % 4],
+                                kWords[random() % 6], index),
                     static_cast<std::int64_t>(10'000 + random() % 50'000'000),
                     static_cast<std::int64_t>(50'000 + random() % 30'000'000));
                 if (random() % 3 == 0)
@@ -1111,10 +1369,57 @@ TEST_SUITE("search") {
                 hits += matcher(row) ? 1 : 0;
         });
         CHECK(static_cast<std::int64_t>(hits) == count_of(library, "tag:Kick bpm:100..140 NOT folder:FX"));
-        MESSAGE(
-            std::format("for_each_row {} rows: {:.0f} ms; load_rows 200: {:.1f} ms; first page: {:.1f} ms; "
-                        "RowMatcher over {} rows: {:.1f} ms",
-                        streamed, stream_ms, load_ms, page_ms, rows.size(), match_ms));
+
+        // Single predicates typed as query text, median of five runs: in memory and in SQL.
+        const auto median_ms = [&](auto&& work) {
+            std::array<double, 5> runs{};
+            for (auto& run : runs)
+                run = time(work);
+            std::ranges::sort(runs);
+            return runs[runs.size() / 2];
+        };
+        const auto memory_ms = [&](std::string_view text) {
+            auto parsed = parse_query(text);
+            REQUIRE(parsed.has_value());
+            std::size_t matched = 0;
+            const double elapsed = median_ms([&] {
+                matched = 0;
+                RowMatcher matcher(*parsed);
+                for (const auto& row : rows)
+                    matched += matcher(row) ? 1 : 0;
+            });
+            CHECK(static_cast<std::int64_t>(matched) == count_of(library, std::string(text)));
+            return elapsed;
+        };
+        const double folder_memory_ms = memory_ms("folder:Loops");
+        const double tag_memory_ms = memory_ms("tag:Kick");
+        const double codec_memory_ms = memory_ms("codec:pcm");
+        // SQL: a broad folder (a quarter of the rows) and a selective one (1%), counted and paged.
+        const auto sql_page_ms = [&](std::string text) {
+            return median_ms(
+                [&] { CHECK_FALSE(SearchService().search(scope, SearchRequest{.text = text})->rows.empty()); });
+        };
+        const double broad_count_ms = median_ms([&] { CHECK(count_of(library, "folder:Loops") > 0); });
+        const double selective_count_ms =
+            median_ms([&] { CHECK(count_of(library, "folder:Packs/Goa") == kRows / 100); });
+        const double broad_page_ms = sql_page_ms("folder:Loops");
+        const double selective_page_ms = sql_page_ms("folder:Packs/Goa");
+        // docs/06: a filtered first page within 150 ms p95 (D1M). In memory at 100K rows the filters
+        // must stay far inside it; this is a release-build benchmark (see SKILLS/add-search-field).
+        CHECK(page_ms < 150.0);
+        CHECK(folder_memory_ms < 15.0);
+        CHECK(tag_memory_ms < 15.0);
+        CHECK(codec_memory_ms < 15.0);
+        CHECK(selective_count_ms < 150.0);
+        CHECK(broad_page_ms < 150.0);
+        CHECK(selective_page_ms < 150.0);
+        MESSAGE(std::format(
+            "for_each_row {} rows: {:.0f} ms; load_rows 200: {:.1f} ms; first page: {:.1f} ms; RowMatcher over {} "
+            "rows: {:.1f} ms; in memory: folder:Loops {:.2f} ms, tag:Kick {:.2f} ms, codec:pcm {:.2f} ms; SQL "
+            "folder:Loops count {:.1f} ms, first page {:.1f} ms; SQL folder:Packs/Goa (1%) count {:.1f} ms, first page "
+            "{:.1f} ms",
+            streamed, stream_ms, load_ms, page_ms, rows.size(), match_ms, folder_memory_ms, tag_memory_ms,
+            codec_memory_ms, broad_count_ms, broad_page_ms, selective_count_ms, selective_page_ms));
     }
 
 }  // TEST_SUITE("search")

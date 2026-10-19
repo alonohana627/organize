@@ -35,6 +35,7 @@
 #include <exception>
 #include <format>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,6 +50,7 @@
 #include <vector>
 
 #include "mso/analysis/analysis.hpp"
+#include "mso/analysis/progress_reporter.hpp"
 #include "mso/domain/core.hpp"
 #include "mso/domain/error.hpp"
 #include "mso/domain/overloaded.hpp"
@@ -64,14 +66,17 @@ using mso::ErrorCode;
 using mso::Overloaded;
 using mso::Result;
 
-constexpr int kExitClean = 0;
-constexpr int kExitInternalFailure = 1;
-constexpr int kExitProtocolViolation = 2;
-constexpr int kExitChannelBroken = 3;
-constexpr int kExitUsage = 64;
+// Exit statuses; the supervisor reports any status other than a clean one as a crash.
+constexpr int kExitClean = 0;              ///< Shutdown received, or the supervisor closed stdin
+constexpr int kExitInternalFailure = 1;    ///< a worker thread could not continue
+constexpr int kExitProtocolViolation = 2;  ///< malformed frame or message from the supervisor
+constexpr int kExitChannelBroken = 3;      ///< the handshake could not be written
+constexpr int kExitUsage = 64;             ///< invalid command line (EX_USAGE)
 
-/// Progress frames are throttled to this period (10 Hz) whatever rate the analyzer reports at.
-constexpr std::chrono::milliseconds kProgressInterval{100};
+/// Once the worker is told to stop (Shutdown, end of input, a protocol violation), how long it
+/// waits for its task thread to end. A thread stuck in a decoder or file read never ends; the
+/// worker then exits without it instead of waiting forever.
+constexpr std::chrono::milliseconds kTaskStopDeadline{2000};
 
 /// The compiler that built this worker, for the handshake's build id.
 #if defined(__clang__)
@@ -97,6 +102,8 @@ enum class Fault {
     StallTask,               ///< the task blocks forever, ignoring cancellation; heartbeats continue
     SilentTask,              ///< the task stops making progress but honors cancellation
     ExhaustMemory,           ///< the task allocates until the memory cap stops it
+    ForeignLimits,           ///< handshake reports resource limits other than the supervisor's
+    ExcessWaveformBins,      ///< the waveform segment holds more bins than the task asked for
 };
 
 /// Command-line names of the faults.
@@ -111,6 +118,8 @@ const std::map<std::string, Fault> kFaultNames{
     {"stall-task", Fault::StallTask},
     {"silent-task", Fault::SilentTask},
     {"exhaust-memory", Fault::ExhaustMemory},
+    {"foreign-limits", Fault::ForeignLimits},
+    {"excess-waveform-bins", Fault::ExcessWaveformBins},
 };
 
 /// Signature shared by mso::analysis::analyze_file and the self-test analyzer.
@@ -139,15 +148,16 @@ public:
 
     /// Writes raw bytes that are not a frame (fault injection only).
     Result<void> send_garbage() {
+        /// Not a frame: the magic is wrong.
         constexpr std::array<std::uint8_t, 32> kGarbage{'n', 'o', 't', ' ', 'a', ' ', 'f', 'r', 'a', 'm', 'e'};
         std::lock_guard lock(mutex_);
         return stream_.write_all(kGarbage);
     }
 
 private:
-    worker::HandleStream stream_;
-    std::mutex mutex_;
-    bool broken_ = false;
+    worker::HandleStream stream_;  ///< stdout
+    std::mutex mutex_;             ///< one frame at a time, whole frames only
+    bool broken_ = false;          ///< a write failed; the supervisor is gone
 };
 
 // ---------------------------------------------------------------- waveform segment output
@@ -176,7 +186,7 @@ Result<worker::WaveformSegment> write_waveform_segment(const analysis::WaveformO
 
 /// A deterministic sine-shaped overview with `bins` bins.
 analysis::WaveformOverview synthetic_waveform(int bins) {
-    constexpr std::int64_t kFramesPerBin = 64;
+    constexpr std::int64_t kFramesPerBin = 64;  ///< any positive width makes a consistent segment
     analysis::WaveformOverview overview;
     overview.frames_per_bin = kFramesPerBin;
     overview.total_frames = kFramesPerBin * bins;
@@ -220,8 +230,8 @@ analysis::AnalysisReport synthetic_report(const analysis::AnalysisRequest& reque
 /// to the task barrier (which reports RESOURCE_LIMIT). Gives up with INTERNAL after 8 GiB, which
 /// means no memory cap was enforced.
 Result<analysis::AnalysisReport> exhaust_memory() {
-    constexpr std::size_t kBlockBytes = 16u << 20;
-    constexpr std::size_t kMaximumBlocks = 512;
+    constexpr std::size_t kBlockBytes = 16u << 20;  ///< 16 MiB per allocation
+    constexpr std::size_t kMaximumBlocks = 512;     ///< 8 GiB in total
     std::vector<std::unique_ptr<char[]>> blocks;
     blocks.reserve(kMaximumBlocks);
     for (std::size_t block = 0; block < kMaximumBlocks; ++block) {
@@ -233,28 +243,33 @@ Result<analysis::AnalysisReport> exhaust_memory() {
 
 /// Stand-in for analyze_file in --self-test mode. It never opens the input file; it simulates
 /// `max_musical_seconds` of work in 20 ms blocks, honoring stop and counting one unit of work
-/// per block like the real analyzer, and returns a synthetic report. `fault` replaces the work
-/// with a misbehaviour.
+/// per block, with progress throttled by the same ProgressReporter as the real analyzer, and
+/// returns a synthetic report. `fault` replaces the work with a misbehaviour.
 Result<analysis::AnalysisReport> analyze_self_test(const analysis::AnalysisRequest& request, std::stop_token stop,
                                                    const analysis::ProgressCallback& progress,
                                                    analysis::WorkCounter* work_counter, Fault fault) {
     using namespace std::chrono;
-    constexpr milliseconds kBlock{20};
+    constexpr milliseconds kBlock{20};  ///< simulated duration of one decoded block
     if (fault == Fault::StallTask) block_forever();
     if (fault == Fault::ExhaustMemory) return exhaust_memory();
 
+    analysis::ProgressReporter reporter(progress, analysis::ProgressReporter::kDefaultInterval, work_counter);
     const auto simulated = duration_cast<milliseconds>(duration<double>(request.max_musical_seconds));
     const auto started = steady_clock::now();
     for (auto elapsed = 0ms; fault == Fault::SilentTask || elapsed < simulated;
          elapsed = duration_cast<milliseconds>(steady_clock::now() - started)) {
         if (stop.stop_requested()) return mso::fail(ErrorCode::Cancelled, "analysis cancelled");
         if (fault != Fault::SilentTask) {
-            if (work_counter != nullptr) work_counter->fetch_add(1, std::memory_order_relaxed);
-            if (progress) progress(static_cast<double>(elapsed.count()) / static_cast<double>(simulated.count()));
+            reporter.record_work();
+            reporter.report(static_cast<double>(elapsed.count()) / static_cast<double>(simulated.count()));
         }
         std::this_thread::sleep_for(kBlock);  // the simulated work itself
     }
-    return synthetic_report(request);
+    auto report = synthetic_report(request);
+    if (fault == Fault::ExcessWaveformBins && report.waveform)
+        report.waveform = synthetic_waveform(request.waveform_bins + 1);
+    reporter.finish();
+    return report;
 }
 
 // ---------------------------------------------------------------- task execution
@@ -270,8 +285,8 @@ public:
 
     /// What the heartbeat reports about the active task.
     struct ActiveTask {
-        uuids::uuid job_id;
-        std::uint64_t work_units = 0;
+        uuids::uuid job_id;            ///< the task's job
+        std::uint64_t work_units = 0;  ///< its work counter (analysis::WorkCounter units)
     };
 
     TaskRunner(OutputChannel& channel, Analyzer analyzer, Fault fault)
@@ -281,7 +296,11 @@ public:
           thread_([this](std::stop_token stop) { run(stop); }) {}
     TaskRunner(const TaskRunner&) = delete;
     TaskRunner& operator=(const TaskRunner&) = delete;
-    ~TaskRunner() { stop(Outcome::Discard); }
+    /// Stops the task thread. A thread stuck beyond kTaskStopDeadline cannot be joined, and
+    /// destroying the members it uses would be undefined, so the process ends instead.
+    ~TaskRunner() {
+        if (!stop(Outcome::Discard, kTaskStopDeadline)) std::_Exit(kExitInternalFailure);
+    }
 
     /// Hands `task` to the task thread. While another task runs the request is refused with a
     /// retryable RESOURCE_LIMIT failure: the worker runs one task at a time.
@@ -323,29 +342,49 @@ public:
         return ActiveTask{active_->job_id, work_units_.load(std::memory_order_relaxed)};
     }
 
-    /// Stops the active task (if any) and the task thread, and waits for it.
-    void stop(Outcome outcome) {
+    /// Stops the active task (if any) and the task thread, and waits up to `deadline` for the
+    /// thread to end. Returns false when it did not: the task is stuck in a call that ignores
+    /// cancellation, the thread still runs, and the caller must end the process (std::_Exit)
+    /// rather than destroy this runner. Idempotent.
+    [[nodiscard]] bool stop(Outcome outcome, std::chrono::milliseconds deadline) {
         report_outcome_ = outcome == Outcome::Report;
         {
             std::lock_guard lock(mutex_);
             task_stop_.request_stop();
         }
         thread_.request_stop();
+        {
+            std::unique_lock lock(mutex_);
+            if (!thread_finished_changed_.wait_for(lock, deadline, [&] { return thread_finished_; })) return false;
+        }
         if (thread_.joinable()) thread_.join();
+        return true;
     }
 
 private:
+    /// The task the heartbeat reports and Cancel addresses.
     struct Active {
-        uuids::uuid job_id;
-        std::int64_t cancel_epoch = 0;
+        uuids::uuid job_id;             ///< the task's job
+        std::int64_t cancel_epoch = 0;  ///< a Cancel with an older epoch is ignored
     };
+    /// A task handed over by the protocol thread and not yet picked up by the task thread.
     struct Pending {
-        worker::AnalyzeTask task;
-        std::uint64_t request_sequence = 0;
+        worker::AnalyzeTask task;            ///< the task as received
+        std::uint64_t request_sequence = 0;  ///< sequence of its AnalyzeTask frame, echoed in replies
     };
 
-    /// Task thread body: waits for a handed-over task, runs it, reports it.
+    /// Task thread body: runs tasks until stopped, then tells stop() that the thread is done.
     void run(std::stop_token thread_stop) {
+        run_tasks(thread_stop);
+        {
+            std::lock_guard lock(mutex_);
+            thread_finished_ = true;
+        }
+        thread_finished_changed_.notify_all();
+    }
+
+    /// Waits for a handed-over task, runs it, reports it; returns once the thread is stopped.
+    void run_tasks(const std::stop_token& thread_stop) {
         try {
             while (true) {
                 Pending next;
@@ -381,7 +420,7 @@ private:
         const auto failed = [&](const mso::Error& error) -> worker::WorkerMessage {
             return worker::TaskFailed{fence, error.code, error.retryable, error.safe_detail};
         };
-        const auto progress = throttled_progress(task, request_sequence);
+        const auto progress = forward_progress(task, request_sequence);
 
         Result<analysis::AnalysisReport> report = mso::fail(ErrorCode::Internal);
         try {
@@ -408,13 +447,12 @@ private:
         return result;
     }
 
-    /// Progress callback that forwards at most one frame per kProgressInterval.
-    analysis::ProgressCallback throttled_progress(const worker::AnalyzeTask& task, std::uint64_t request_sequence) {
-        return [this, job_id = task.job_id, cancel_epoch = task.cancel_epoch, request_sequence,
-                last_sent = std::chrono::steady_clock::time_point{}](double fraction) mutable {
-            const auto now = std::chrono::steady_clock::now();
-            if (!std::isfinite(fraction) || now - last_sent < kProgressInterval) return;
-            last_sent = now;
+    /// Progress callback that sends every fraction it receives as a Progress frame. Both analyzers
+    /// already throttle through analysis::ProgressReporter (10 Hz), so throttling again here would
+    /// only drop the final 1.0.
+    analysis::ProgressCallback forward_progress(const worker::AnalyzeTask& task, std::uint64_t request_sequence) {
+        return [this, job_id = task.job_id, cancel_epoch = task.cancel_epoch, request_sequence](double fraction) {
+            if (!std::isfinite(fraction)) return;
             // A lost progress frame is harmless; a broken channel ends the worker via the main loop.
             (void)channel_.send(worker::Progress{job_id, cancel_epoch, std::clamp(fraction, 0.0, 1.0)},
                                 request_sequence);
@@ -433,16 +471,18 @@ private:
         }
     }
 
-    OutputChannel& channel_;
-    Analyzer analyzer_;
-    const Fault fault_;
-    mutable std::mutex mutex_;
-    std::condition_variable_any task_ready_;
-    std::optional<Active> active_;
-    std::optional<Pending> pending_;
-    std::stop_source task_stop_;
-    analysis::WorkCounter work_units_{0};
-    std::atomic<bool> report_outcome_{true};
+    OutputChannel& channel_;                           ///< where progress and outcomes go
+    Analyzer analyzer_;                                ///< analyze_file or the self-test analyzer
+    const Fault fault_;                                ///< self-test misbehaviour, if any
+    mutable std::mutex mutex_;                         ///< guards every member below except the atomics
+    std::condition_variable_any task_ready_;           ///< signals pending_ to the task thread
+    std::condition_variable thread_finished_changed_;  ///< signals thread_finished_ to stop()
+    std::optional<Active> active_;                     ///< the task in progress (handed over or running)
+    std::optional<Pending> pending_;                   ///< the task waiting for the task thread
+    std::stop_source task_stop_;                       ///< cancels the active task
+    bool thread_finished_ = false;                     ///< the task thread left run_tasks()
+    analysis::WorkCounter work_units_{0};              ///< the active task's work counter
+    std::atomic<bool> report_outcome_{true};           ///< false once stopping with Outcome::Discard
     std::jthread thread_;  // declared last: starts after, and stops before, the members it uses
 };
 
@@ -499,6 +539,7 @@ worker::Handshake make_handshake(bool self_test, Fault fault) {
     handshake.self_test = self_test;
     if (fault == Fault::WrongProcessId) handshake.process_id += 1;
     if (fault == Fault::StaleAlgorithm) handshake.algorithm_versions["tempo"] = "tempo-stale-0";
+    if (fault == Fault::ForeignLimits) handshake.limits.maximum_waveform_bins /= 2;
     return handshake;
 }
 
@@ -526,9 +567,18 @@ bool introduce(OutputChannel& output, bool self_test, Fault fault) {
     return true;
 }
 
+/// Stops `runner` and returns `exit_code`. When the task thread is stuck in a call that ignores
+/// cancellation, it can be neither joined nor destroyed, so the process ends at once with
+/// `exit_code` (nothing is buffered: every frame was written straight to the pipe).
+int stop_and_exit(TaskRunner& runner, TaskRunner::Outcome outcome, int exit_code) {
+    if (!runner.stop(outcome, kTaskStopDeadline)) std::_Exit(exit_code);
+    return exit_code;
+}
+
 /// The protocol loop: handshake, then dispatch supervisor messages until Shutdown or end of
 /// input. A malformed frame or message, or a request sequence that does not increase, ends the
-/// worker with kExitProtocolViolation.
+/// worker with kExitProtocolViolation. The worker always exits within kTaskStopDeadline of being
+/// told to stop, even when its task is stuck.
 int run_worker(Analyzer analyzer, bool self_test, Fault fault) {
     worker::HandleStream input(worker::standard_input_handle());
     OutputChannel output(worker::standard_output_handle());
@@ -540,20 +590,14 @@ int run_worker(Analyzer analyzer, bool self_test, Fault fault) {
     std::uint64_t last_sequence = 0;
     while (true) {
         auto frame = worker::read_frame(input);
-        if (!frame) {
-            runner.stop(TaskRunner::Outcome::Discard);
-            return kExitProtocolViolation;
-        }
+        if (!frame) return stop_and_exit(runner, TaskRunner::Outcome::Discard, kExitProtocolViolation);
         if (!*frame) {  // the supervisor closed our input: nobody is left to report to
-            runner.stop(TaskRunner::Outcome::Discard);
-            return kExitClean;
+            return stop_and_exit(runner, TaskRunner::Outcome::Discard, kExitClean);
         }
         const auto request_sequence = (*frame)->request_sequence;
         auto message = worker::decode_supervisor_message((*frame)->payload);
-        if (!message || request_sequence <= last_sequence) {
-            runner.stop(TaskRunner::Outcome::Discard);
-            return kExitProtocolViolation;
-        }
+        if (!message || request_sequence <= last_sequence)
+            return stop_and_exit(runner, TaskRunner::Outcome::Discard, kExitProtocolViolation);
         last_sequence = request_sequence;
         const bool keep_running = std::visit(Overloaded{[&](worker::AnalyzeTask& task) {
                                                             runner.start(std::move(task), request_sequence);
@@ -563,12 +607,9 @@ int run_worker(Analyzer analyzer, bool self_test, Fault fault) {
                                                             runner.cancel(cancel);
                                                             return true;
                                                         },
-                                                        [&](const worker::Shutdown&) {
-                                                            runner.stop(TaskRunner::Outcome::Report);
-                                                            return false;
-                                                        }},
+                                                        [&](const worker::Shutdown&) { return false; }},
                                              *message);
-        if (!keep_running) return kExitClean;
+        if (!keep_running) return stop_and_exit(runner, TaskRunner::Outcome::Report, kExitClean);
     }
 }
 
@@ -595,8 +636,10 @@ std::optional<CommandLine> parse_command_line(int argument_count, char** argumen
     try {
         application.parse(argument_count, arguments);
     } catch (const CLI::ParseError& error) {
+        // Help and errors both go to stderr: stdout is the protocol channel, where CLI11's default
+        // (help on std::cout) would look like a garbled frame to a supervisor.
         exit_code = error.get_exit_code() == 0 ? kExitClean : kExitUsage;
-        application.exit(error);
+        (void)application.exit(error, std::cerr, std::cerr);  // the exit code is chosen above
         return std::nullopt;
     }
     if (!fault_name.empty()) command_line.fault = kFaultNames.at(fault_name);

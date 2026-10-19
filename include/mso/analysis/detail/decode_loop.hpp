@@ -19,7 +19,7 @@ namespace mso::analysis::detail {
 
 /// Checks the channel count and sample rate a decoder reports before any stage relies on them:
 /// CORRUPT_AUDIO for no channels or an impossible rate, UNSUPPORTED_CODEC above kMaximumChannels.
-inline Result<void> validate_stream_format(const media::Decoder& decoder) {
+[[nodiscard]] inline Result<void> validate_stream_format(const media::Decoder& decoder) {
     const int channels = decoder.channels();
     const int sample_rate = decoder.sample_rate();
     if (channels < 1) return fail(ErrorCode::CorruptAudio, "decoder reports no channels");
@@ -55,9 +55,13 @@ struct DecodeLoopSummary {
 /// The decoder's format must have passed validate_stream_format().
 ///
 /// Errors: CANCELLED (checked before every read), the decoder's own errors, and INTERNAL when a
-/// decoder returns more frames than requested.
+/// decoder reports more frames than requested. That last check is a contract assertion, not a
+/// guard: media::Decoder::read() promises to write at most the requested frames, and a decoder
+/// that broke the promise has already written past `block`. It stops such a count from being
+/// used as a span length; every media decoder sizes its writes from the request.
 template <class BlockHandler>
-Result<DecodeLoopSummary> decode_blocks(media::Decoder& decoder, const std::stop_token& stop, BlockHandler&& on_block) {
+[[nodiscard]] Result<DecodeLoopSummary> decode_blocks(media::Decoder& decoder, const std::stop_token& stop,
+                                                      BlockHandler&& on_block) {
     const auto channels = static_cast<std::size_t>(decoder.channels());
     std::vector<float> block(kDecodeBlockFrames * channels);
     DecodeLoopSummary summary;
@@ -69,8 +73,8 @@ Result<DecodeLoopSummary> decode_blocks(media::Decoder& decoder, const std::stop
             summary.reached_end = true;
             return summary;
         }
-        if (*frames_read > kDecodeBlockFrames)
-            return fail(ErrorCode::Internal, "decoder returned more frames than requested");
+        if (*frames_read > kDecodeBlockFrames)  // contract assertion; see the function comment
+            return fail(ErrorCode::Internal, "decoder reported more frames than requested");
 
         const std::span<float> samples(block.data(), *frames_read * channels);
         summary.non_finite_samples += replace_non_finite_samples(samples);

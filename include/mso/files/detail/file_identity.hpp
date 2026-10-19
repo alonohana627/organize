@@ -30,7 +30,7 @@ struct FileIdentity {
 /// reading file content and without blocking writers. Links are followed, so the identity is the
 /// target's. Works for directories too (cycle detection while following links).
 /// Errors: FileMissing, AccessDenied (retryable while locked).
-Result<FileIdentity> read_file_identity(const std::filesystem::path& file);
+[[nodiscard]] Result<FileIdentity> read_file_identity(const std::filesystem::path& file);
 
 /// What a directory entry is, beyond "file" or "directory", for the importer's link policy.
 enum class LinkKind {
@@ -43,8 +43,20 @@ enum class LinkKind {
     OtherReparsePoint  ///< another Windows reparse point whose behaviour is unknown
 };
 
-/// Classifies `path` without following it. Never throws; an entry that cannot be inspected is
-/// reported as LinkKind::None (the following open reports the real error).
-LinkKind classify_link(const std::filesystem::path& path) noexcept;
+/// What classify_entry() learned about a directory entry.
+struct EntryClassification {
+    LinkKind kind = LinkKind::None;  ///< link or placeholder kind
+    /// The entry is a directory, or a link or placeholder standing for one (from the entry's own
+    /// attributes on Windows, so a cloud-only folder is never opened to find out).
+    bool is_directory = false;
+};
+
+/// Classifies `path` without following it (on POSIX, a link's target type is read through it, but
+/// nothing is opened for reading). Never throws; an entry that cannot be inspected is reported as
+/// LinkKind::None and not a directory (the following open reports the real error).
+[[nodiscard]] EntryClassification classify_entry(const std::filesystem::path& path) noexcept;
+
+/// classify_entry(path).kind.
+[[nodiscard]] LinkKind classify_link(const std::filesystem::path& path) noexcept;
 
 }  // namespace mso::files::detail

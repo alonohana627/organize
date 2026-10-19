@@ -19,6 +19,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <string>
 
 #include "mso/ui/application_session.hpp"
 #include "mso/ui/display_format.hpp"
@@ -29,11 +30,12 @@ namespace mso::ui {
 
 namespace {
 
-/// Index of the override modes in the BPM/key mode combo boxes.
-enum OverrideChoice { AutomaticChoice = 0, UnknownChoice = 1, ValueChoice = 2 };
+/// Index of the override modes in the BPM/key mode combo boxes (-1: the selection differs).
+enum OverrideChoice { MixedChoice = -1, AutomaticChoice = 0, UnknownChoice = 1, ValueChoice = 2 };
 
 constexpr double kMinimumBpm = 20.0;
 constexpr double kMaximumBpm = 400.0;
+constexpr double kDefaultBpm = 120.0;
 
 /// Keys of `rows`.
 std::set<SampleKey> keys_of(const std::vector<search::SampleRow>& rows) {
@@ -51,10 +53,10 @@ std::set<uuids::uuid> libraries_of(const std::vector<search::SampleRow>& rows) {
     return libraries;
 }
 
-/// Sets a line edit's text unless the user is editing it (focused or modified), and without
-/// touching it when the text is already right: refreshes never clobber a rename in progress.
+/// Sets a line edit's text unless the user has typed into it (a draft), and without touching it
+/// when the text is already right: refreshes never clobber a rename in progress.
 void set_text_unless_edited(QLineEdit* edit, const QString& text) {
-    if (edit->hasFocus() || edit->isModified() || edit->text() == text) return;
+    if (edit->isModified() || edit->text() == text) return;
     const QSignalBlocker blocker(edit);
     edit->setText(text);
 }
@@ -88,6 +90,31 @@ auto common_value(const std::vector<search::SampleRow>& rows, Extract extract)
     return first;
 }
 
+/// Override mode a row's value source implies ("user": a manual value, "user_unknown": unknown).
+OverrideChoice choice_of_source(const std::string& source) {
+    if (source == "user") return ValueChoice;
+    if (source == "user_unknown") return UnknownChoice;
+    return AutomaticChoice;
+}
+
+/// Override mode of a stored override state.
+OverrideChoice choice_of_state(catalog::OverrideState state) {
+    switch (state) {
+        case catalog::OverrideState::Value:
+            return ValueChoice;
+        case catalog::OverrideState::Unknown:
+            return UnknownChoice;
+        case catalog::OverrideState::Automatic:
+            break;
+    }
+    return AutomaticChoice;
+}
+
+/// Key combo box data of a key: pitch class, plus 12 for minor.
+int key_code(const MusicalKey& key) {
+    return key.pitch_class + (key.mode == KeyMode::Minor ? 12 : 0);
+}
+
 QFrame* separator(QWidget* parent) {
     auto* line = new QFrame(parent);
     line->setFrameShape(QFrame::HLine);
@@ -102,26 +129,51 @@ InspectorPanel::InspectorPanel(ApplicationSession& session, QWidget* parent) : Q
     show_selection({}, 0);
 }
 
+// ---------------------------------------------------------------- construction
+
 void InspectorPanel::build_ui() {
     auto* content = new QWidget;
     auto* form = new QFormLayout(content);
     form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    build_identity_fields(*form, *content);
+    form->addRow(separator(content));
+    build_rating_fields(*form, *content);
+    build_notes_fields(*form, *content);
+    build_tag_fields(*form, *content);
+    build_category_fields(*form, *content);
+    form->addRow(separator(content));
+    build_override_fields(*form, *content);
+    form->addRow(separator(content));
+    build_collection_fields(*form, *content);
 
-    heading_label_ = new QLabel(content);
+    auto* scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidget(content);
+    auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(scroll);
+}
+
+void InspectorPanel::build_identity_fields(QFormLayout& form, QWidget& content) {
+    heading_label_ = new QLabel(&content);
     heading_label_->setWordWrap(true);
+    heading_label_->setTextFormat(Qt::PlainText);  // sample names are user text, never markup
     QFont heading_font = heading_label_->font();
     heading_font.setBold(true);
     heading_label_->setFont(heading_font);
     heading_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    form->addRow(heading_label_);
-    partial_label_ = new QLabel(content);
+    form.addRow(heading_label_);
+    partial_label_ = new QLabel(&content);
     partial_label_->setWordWrap(true);
-    form->addRow(partial_label_);
+    partial_label_->setTextFormat(Qt::PlainText);
+    form.addRow(partial_label_);
 
     // Display name: applied only with Enter or the Rename button.
-    name_edit_ = new QLineEdit(content);
+    name_edit_ = new QLineEdit(&content);
     name_edit_->setAccessibleName(tr("Display name"));
-    rename_button_ = new QPushButton(tr("Rename"), content);
+    rename_button_ = new QPushButton(tr("Rename"), &content);
     rename_button_->setAccessibleName(tr("Apply display name"));
     const auto rename = [this] {
         const QString name = name_edit_->text().trimmed();
@@ -136,21 +188,26 @@ void InspectorPanel::build_ui() {
     auto* name_row = new QHBoxLayout;
     name_row->addWidget(name_edit_, 1);
     name_row->addWidget(rename_button_);
-    form->addRow(tr("Name"), name_row);
+    form.addRow(tr("Name"), name_row);
 
-    original_name_label_ = new QLabel(content);
+    original_name_label_ = new QLabel(&content);
+    original_name_label_->setTextFormat(Qt::PlainText);
     original_name_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     original_name_label_->setWordWrap(true);
-    form->addRow(tr("Original file"), original_name_label_);
-    format_label_ = new QLabel(content);
+    original_name_label_->setAccessibleName(tr("Original file"));
+    form.addRow(tr("Original file"), original_name_label_);
+    format_label_ = new QLabel(&content);
     format_label_->setWordWrap(true);
-    form->addRow(tr("Format"), format_label_);
-    form->addRow(separator(content));
+    format_label_->setTextFormat(Qt::PlainText);
+    format_label_->setAccessibleName(tr("Format"));
+    form.addRow(tr("Format"), format_label_);
+}
 
+void InspectorPanel::build_rating_fields(QFormLayout& form, QWidget& content) {
     // Rating: click a star (clicking the current rating clears it). Only an explicit click or key
     // changes a multi-selection, which shows "Mixed" until then.
-    rating_stars_ = new StarRatingWidget(content);
-    rating_label_ = new QLabel(content);
+    rating_stars_ = new StarRatingWidget(&content);
+    rating_label_ = new QLabel(&content);
     connect(rating_stars_, &StarRatingWidget::ratingChosen, this, [this](int rating) {
         catalog::EditCommand command;
         command.rating = rating;
@@ -159,11 +216,11 @@ void InspectorPanel::build_ui() {
     auto* rating_row = new QHBoxLayout;
     rating_row->addWidget(rating_stars_);
     rating_row->addWidget(rating_label_, 1);
-    form->addRow(tr("Rating"), rating_row);
+    form.addRow(tr("Rating"), rating_row);
 
-    favorite_label_ = new QLabel(content);
-    favorite_set_button_ = new QPushButton(tr("Mark favorite"), content);
-    favorite_clear_button_ = new QPushButton(tr("Unmark"), content);
+    favorite_label_ = new QLabel(&content);
+    favorite_set_button_ = new QPushButton(tr("Mark favorite"), &content);
+    favorite_clear_button_ = new QPushButton(tr("Unmark"), &content);
     favorite_clear_button_->setAccessibleName(tr("Unmark favorite"));
     for (auto [button, value] : {std::pair{favorite_set_button_, true}, std::pair{favorite_clear_button_, false}}) {
         connect(button, &QPushButton::clicked, this, [this, value] {
@@ -176,26 +233,35 @@ void InspectorPanel::build_ui() {
     favorite_row->addWidget(favorite_label_, 1);
     favorite_row->addWidget(favorite_set_button_);
     favorite_row->addWidget(favorite_clear_button_);
-    form->addRow(tr("Favorite"), favorite_row);
+    form.addRow(tr("Favorite"), favorite_row);
+}
 
+void InspectorPanel::build_notes_fields(QFormLayout& form, QWidget& content) {
     // Notes: saved only with the Save button; switching selection discards an unsaved draft.
-    notes_edit_ = new QPlainTextEdit(content);
+    notes_edit_ = new QPlainTextEdit(&content);
     notes_edit_->setAccessibleName(tr("Notes"));
     notes_edit_->setTabChangesFocus(true);
     notes_edit_->setMaximumHeight(110);
     connect(notes_edit_, &QPlainTextEdit::textChanged, this, [this] {
-        notes_dirty_ = true;
+        notes_dirty_ = true;  // programmatic changes are made with signals blocked
         update_enabled();
     });
-    notes_save_button_ = new QPushButton(tr("Save notes"), content);
-    notes_clear_button_ = new QPushButton(tr("Clear notes"), content);
+    notes_save_button_ = new QPushButton(tr("Save notes"), &content);
+    notes_clear_button_ = new QPushButton(tr("Clear notes"), &content);
     connect(notes_save_button_, &QPushButton::clicked, this, [this] {
         catalog::EditCommand command;
         command.notes = DisplayFormat::to_utf8(notes_edit_->toPlainText());
         notes_dirty_ = false;
+        update_enabled();
         request(std::move(command));
     });
     connect(notes_clear_button_, &QPushButton::clicked, this, [this] {
+        notes_dirty_ = false;  // the draft is replaced by the cleared notes
+        {
+            const QSignalBlocker blocker(notes_edit_);
+            notes_edit_->clear();
+        }
+        update_enabled();
         catalog::EditCommand command;
         command.notes = std::string();
         request(std::move(command));
@@ -207,24 +273,28 @@ void InspectorPanel::build_ui() {
     auto* notes_box = new QVBoxLayout;
     notes_box->addWidget(notes_edit_);
     notes_box->addLayout(notes_buttons);
-    form->addRow(tr("Notes"), notes_box);
+    form.addRow(tr("Notes"), notes_box);
+}
 
+void InspectorPanel::build_tag_fields(QFormLayout& form, QWidget& content) {
     // Tags: multi-selection shows the union with "n of m" counts.
-    tags_list_ = new QListWidget(content);
+    tags_list_ = new QListWidget(&content);
     tags_list_->setAccessibleName(tr("Tags"));
     tags_list_->setMaximumHeight(110);
-    tag_edit_ = new QLineEdit(content);
+    tag_edit_ = new QLineEdit(&content);
     tag_edit_->setPlaceholderText(tr("Tag path, e.g. Drums/Kick"));
     tag_edit_->setAccessibleName(tr("Tag to add"));
-    tag_add_button_ = new QPushButton(tr("Add"), content);
+    tag_add_button_ = new QPushButton(tr("Add"), &content);
     tag_add_button_->setAccessibleName(tr("Add tag"));
-    tag_remove_button_ = new QPushButton(tr("Remove selected tag"), content);
+    tag_remove_button_ = new QPushButton(tr("Remove selected tag"), &content);
     const auto add_tag = [this] {
         const QString tag = tag_edit_->text().trimmed();
         if (tag.isEmpty()) return;
         catalog::EditCommand command;
         command.tags_add.push_back(DisplayFormat::to_utf8(tag));
-        tag_edit_->clear();
+        // The typed tag stays (selected, so typing replaces it) until the user moves on: if the
+        // save fails, it is not lost.
+        tag_edit_->selectAll();
         request(std::move(command));
     };
     connect(tag_add_button_, &QPushButton::clicked, this, add_tag);
@@ -244,17 +314,20 @@ void InspectorPanel::build_ui() {
     tags_box->addWidget(tags_list_);
     tags_box->addLayout(tag_row);
     tags_box->addWidget(tag_remove_button_, 0, Qt::AlignRight);
-    form->addRow(tr("Tags"), tags_box);
+    form.addRow(tr("Tags"), tags_box);
+}
 
+void InspectorPanel::build_category_fields(QFormLayout& form, QWidget& content) {
     // Category: one exclusive primary category per sample.
-    category_label_ = new QLabel(content);
-    category_combo_ = new QComboBox(content);
+    category_label_ = new QLabel(&content);
+    category_label_->setTextFormat(Qt::PlainText);
+    category_combo_ = new QComboBox(&content);
     category_combo_->setEditable(true);
     category_combo_->setInsertPolicy(QComboBox::NoInsert);
     category_combo_->setAccessibleName(tr("Category to set"));
-    category_set_button_ = new QPushButton(tr("Set"), content);
+    category_set_button_ = new QPushButton(tr("Set"), &content);
     category_set_button_->setAccessibleName(tr("Set category"));
-    category_clear_button_ = new QPushButton(tr("Clear"), content);
+    category_clear_button_ = new QPushButton(tr("Clear"), &content);
     category_clear_button_->setAccessibleName(tr("Clear category"));
     connect(category_set_button_, &QPushButton::clicked, this, [this] {
         const QString category = category_combo_->currentText().trimmed();
@@ -275,26 +348,35 @@ void InspectorPanel::build_ui() {
     auto* category_box = new QVBoxLayout;
     category_box->addWidget(category_label_);
     category_box->addLayout(category_row);
-    form->addRow(tr("Category"), category_box);
-    form->addRow(separator(content));
+    form.addRow(tr("Category"), category_box);
+}
 
-    // BPM: Automatic clears the override, Unknown suppresses inference, Value pins a tempo.
-    bpm_label_ = new QLabel(content);
+void InspectorPanel::build_override_fields(QFormLayout& form, QWidget& content) {
+    // BPM: Automatic clears the override, Unknown suppresses inference, Value pins a tempo. Every
+    // programmatic change happens with signals blocked, so these signals mean "the user changed it".
+    bpm_label_ = new QLabel(&content);
     bpm_label_->setWordWrap(true);
-    bpm_mode_combo_ = new QComboBox(content);
+    bpm_mode_combo_ = new QComboBox(&content);
     bpm_mode_combo_->addItems({tr("Automatic"), tr("Unknown"), tr("Value")});
     bpm_mode_combo_->setAccessibleName(tr("BPM override mode"));
-    bpm_spin_ = new QDoubleSpinBox(content);
+    bpm_mode_combo_->setPlaceholderText(tr("Mixed"));
+    bpm_spin_ = new QDoubleSpinBox(&content);
     bpm_spin_->setRange(kMinimumBpm, kMaximumBpm);
     bpm_spin_->setDecimals(2);
-    bpm_spin_->setValue(120.0);
+    bpm_spin_->setValue(kDefaultBpm);
     bpm_spin_->setAccessibleName(tr("BPM value"));
-    bpm_apply_button_ = new QPushButton(tr("Apply"), content);
+    bpm_apply_button_ = new QPushButton(tr("Apply"), &content);
     bpm_apply_button_->setAccessibleName(tr("Apply BPM"));
-    connect(bpm_mode_combo_, &QComboBox::currentIndexChanged, this, [this] { update_enabled(); });
+    connect(bpm_mode_combo_, &QComboBox::currentIndexChanged, this, [this] {
+        bpm_draft_ = true;
+        update_enabled();
+    });
+    connect(bpm_spin_, &QDoubleSpinBox::valueChanged, this, [this] { bpm_draft_ = true; });
     connect(bpm_apply_button_, &QPushButton::clicked, this, [this] {
         catalog::BpmOverrideEdit edit;
         switch (bpm_mode_combo_->currentIndex()) {
+            case MixedChoice:
+                return;  // nothing chosen for a selection whose overrides differ
             case UnknownChoice:
                 edit.state = catalog::OverrideState::Unknown;
                 break;
@@ -308,6 +390,7 @@ void InspectorPanel::build_ui() {
         }
         catalog::EditCommand command;
         command.bpm = edit;
+        bpm_draft_ = false;
         request(std::move(command));
     });
     auto* bpm_row = new QHBoxLayout;
@@ -317,27 +400,34 @@ void InspectorPanel::build_ui() {
     auto* bpm_box = new QVBoxLayout;
     bpm_box->addWidget(bpm_label_);
     bpm_box->addLayout(bpm_row);
-    form->addRow(tr("BPM"), bpm_box);
+    form.addRow(tr("BPM"), bpm_box);
 
-    key_label_ = new QLabel(content);
+    key_label_ = new QLabel(&content);
     key_label_->setWordWrap(true);
-    key_mode_combo_ = new QComboBox(content);
+    key_mode_combo_ = new QComboBox(&content);
     key_mode_combo_->addItems({tr("Automatic"), tr("Unknown"), tr("Value")});
     key_mode_combo_->setAccessibleName(tr("Key override mode"));
-    key_combo_ = new QComboBox(content);
+    key_mode_combo_->setPlaceholderText(tr("Mixed"));
+    key_combo_ = new QComboBox(&content);
     key_combo_->setAccessibleName(tr("Key value"));
     for (KeyMode mode : {KeyMode::Major, KeyMode::Minor}) {
         for (int pitch_class = 0; pitch_class < 12; ++pitch_class) {
             const MusicalKey key{pitch_class, mode};
-            key_combo_->addItem(DisplayFormat::key(key), pitch_class + (mode == KeyMode::Minor ? 12 : 0));
+            key_combo_->addItem(DisplayFormat::key(key), key_code(key));
         }
     }
-    key_apply_button_ = new QPushButton(tr("Apply"), content);
+    key_apply_button_ = new QPushButton(tr("Apply"), &content);
     key_apply_button_->setAccessibleName(tr("Apply key"));
-    connect(key_mode_combo_, &QComboBox::currentIndexChanged, this, [this] { update_enabled(); });
+    connect(key_mode_combo_, &QComboBox::currentIndexChanged, this, [this] {
+        key_draft_ = true;
+        update_enabled();
+    });
+    connect(key_combo_, &QComboBox::currentIndexChanged, this, [this] { key_draft_ = true; });
     connect(key_apply_button_, &QPushButton::clicked, this, [this] {
         catalog::KeyOverrideEdit edit;
         switch (key_mode_combo_->currentIndex()) {
+            case MixedChoice:
+                return;
             case UnknownChoice:
                 edit.state = catalog::OverrideState::Unknown;
                 break;
@@ -353,6 +443,7 @@ void InspectorPanel::build_ui() {
         }
         catalog::EditCommand command;
         command.key = edit;
+        key_draft_ = false;
         request(std::move(command));
     });
     auto* key_row = new QHBoxLayout;
@@ -362,18 +453,19 @@ void InspectorPanel::build_ui() {
     auto* key_box = new QVBoxLayout;
     key_box->addWidget(key_label_);
     key_box->addLayout(key_row);
-    form->addRow(tr("Key"), key_box);
-    form->addRow(separator(content));
+    form.addRow(tr("Key"), key_box);
+}
 
+void InspectorPanel::build_collection_fields(QFormLayout& form, QWidget& content) {
     // Collections: manual collections of the selection's library.
-    collections_list_ = new QListWidget(content);
+    collections_list_ = new QListWidget(&content);
     collections_list_->setAccessibleName(tr("Collections of this sample"));
     collections_list_->setMaximumHeight(80);
-    collection_combo_ = new QComboBox(content);
+    collection_combo_ = new QComboBox(&content);
     collection_combo_->setAccessibleName(tr("Collection"));
-    collection_add_button_ = new QPushButton(tr("Add to"), content);
+    collection_add_button_ = new QPushButton(tr("Add to"), &content);
     collection_add_button_->setAccessibleName(tr("Add to collection"));
-    collection_remove_button_ = new QPushButton(tr("Remove from"), content);
+    collection_remove_button_ = new QPushButton(tr("Remove from"), &content);
     collection_remove_button_->setAccessibleName(tr("Remove from collection"));
     for (auto [button, adding] :
          {std::pair{collection_add_button_, true}, std::pair{collection_remove_button_, false}}) {
@@ -395,25 +487,18 @@ void InspectorPanel::build_ui() {
     auto* collections_box = new QVBoxLayout;
     collections_box->addWidget(collections_list_);
     collections_box->addLayout(collection_row);
-    form->addRow(tr("Collections"), collections_box);
+    form.addRow(tr("Collections"), collections_box);
 
-    locations_group_ = new QGroupBox(tr("Locations"), content);
+    locations_group_ = new QGroupBox(tr("Locations"), &content);
     locations_list_ = new QListWidget(locations_group_);
     locations_list_->setAccessibleName(tr("File locations"));
     locations_list_->setMaximumHeight(90);
     auto* locations_layout = new QVBoxLayout(locations_group_);
     locations_layout->addWidget(locations_list_);
-    form->addRow(locations_group_);
-
-    auto* scroll = new QScrollArea(this);
-    scroll->setWidgetResizable(true);
-    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setWidget(content);
-    auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(scroll);
+    form.addRow(locations_group_);
 }
+
+// ---------------------------------------------------------------- selection and details
 
 void InspectorPanel::show_selection(std::vector<search::SampleRow> rows, std::size_t total_selected) {
     const std::set<SampleKey> keys = keys_of(rows);
@@ -428,13 +513,55 @@ void InspectorPanel::show_selection(std::vector<search::SampleRow> rows, std::si
         // Another selection: drafts of the previous one are discarded, details re-read.
         detail_.reset();
         ++detail_request_;
-        notes_dirty_ = false;
-        name_edit_->setModified(false);
+        reset_drafts();
     }
     update_summary();
     if (rows_.size() == 1 && !same_samples) load_detail(rows_.front());
     if (!same_libraries) reload_library_choices();
     update_enabled();
+}
+
+void InspectorPanel::reset_drafts() {
+    notes_dirty_ = false;
+    bpm_draft_ = false;
+    key_draft_ = false;
+    // Even a field that still has the focus shows the new selection: Enter or Apply must never
+    // write the previous sample's draft to it.
+    name_edit_->setModified(false);
+    {
+        const QSignalBlocker blocker(name_edit_);
+        name_edit_->setText(rows_.size() == 1 ? DisplayFormat::from_utf8(rows_.front().display_name.empty()
+                                                                             ? rows_.front().file_name
+                                                                             : rows_.front().display_name)
+                                              : QString());
+    }
+    {
+        const QSignalBlocker blocker(notes_edit_);
+        notes_edit_->clear();  // a single selection's notes arrive with its detail
+    }
+    show_row_overrides();
+}
+
+void InspectorPanel::show_row_overrides() {
+    const QSignalBlocker bpm_mode_blocker(bpm_mode_combo_);
+    const QSignalBlocker bpm_value_blocker(bpm_spin_);
+    const QSignalBlocker key_mode_blocker(key_mode_combo_);
+    const QSignalBlocker key_value_blocker(key_combo_);
+    if (rows_.empty()) {
+        bpm_mode_combo_->setCurrentIndex(AutomaticChoice);
+        key_mode_combo_->setCurrentIndex(AutomaticChoice);
+        return;
+    }
+    // A blank mode (MixedChoice) when the rows differ: Apply waits for an explicit choice.
+    const auto bpm_mode = common_value(rows_, [](const auto& row) { return choice_of_source(row.bpm_source); });
+    bpm_mode_combo_->setCurrentIndex(bpm_mode ? *bpm_mode : MixedChoice);
+    if (const auto bpm = common_value(rows_, [](const auto& row) { return row.bpm_milli; }); bpm && *bpm)
+        bpm_spin_->setValue(static_cast<double>(**bpm) / 1000.0);
+    const auto key_mode = common_value(rows_, [](const auto& row) { return choice_of_source(row.key_source); });
+    key_mode_combo_->setCurrentIndex(key_mode ? *key_mode : MixedChoice);
+    if (const auto key = common_value(rows_, [](const auto& row) { return row.key; });
+        key && *key && (*key)->mode != KeyMode::Unknown)
+        key_combo_->setCurrentIndex(key_combo_->findData(key_code(**key)));
 }
 
 void InspectorPanel::reload_detail() {
@@ -496,7 +623,7 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
     format_label_->setText(format.join(QStringLiteral(" · ")));
 
     const QString notes = DisplayFormat::from_utf8(detail.notes);
-    if (!notes_dirty_ && !notes_edit_->hasFocus() && notes_edit_->toPlainText() != notes) {
+    if (!notes_dirty_ && notes_edit_->toPlainText() != notes) {
         const QSignalBlocker blocker(notes_edit_);
         notes_edit_->setPlainText(notes);
     }
@@ -526,29 +653,22 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
                                               DisplayFormat::provenance(detail.key_source, detail.key_confidence),
                                               describe_override(detail.key_override))
                                    : tr("Unknown; override: %1").arg(describe_override(detail.key_override)));
-    // Override controls the user is working with keep their (unapplied) values.
-    const bool bpm_in_use = bpm_mode_combo_->hasFocus() || bpm_spin_->hasFocus();
-    const bool key_in_use = key_mode_combo_->hasFocus() || key_combo_->hasFocus();
-    {
-        const QSignalBlocker bpm_blocker(bpm_mode_combo_);
-        const QSignalBlocker key_blocker(key_mode_combo_);
-        const auto choice = [](catalog::OverrideState state) {
-            return state == catalog::OverrideState::Value     ? ValueChoice
-                   : state == catalog::OverrideState::Unknown ? UnknownChoice
-                                                              : AutomaticChoice;
-        };
-        if (!bpm_in_use) {
-            bpm_mode_combo_->setCurrentIndex(choice(detail.bpm_override));
-            if (detail.bpm_override_milli)
-                bpm_spin_->setValue(static_cast<double>(*detail.bpm_override_milli) / 1000.0);
-            else if (detail.bpm_milli)
-                bpm_spin_->setValue(static_cast<double>(*detail.bpm_milli) / 1000.0);
-        }
-        if (!key_in_use) key_mode_combo_->setCurrentIndex(choice(detail.key_override));
+    // Override controls the user changed keep their (unapplied) values, focused or not.
+    if (!bpm_draft_) {
+        const QSignalBlocker mode_blocker(bpm_mode_combo_);
+        const QSignalBlocker value_blocker(bpm_spin_);
+        bpm_mode_combo_->setCurrentIndex(choice_of_state(detail.bpm_override));
+        if (detail.bpm_override_milli)
+            bpm_spin_->setValue(static_cast<double>(*detail.bpm_override_milli) / 1000.0);
+        else if (detail.bpm_milli)
+            bpm_spin_->setValue(static_cast<double>(*detail.bpm_milli) / 1000.0);
+    }
+    if (!key_draft_) {
+        const QSignalBlocker mode_blocker(key_mode_combo_);
+        const QSignalBlocker value_blocker(key_combo_);
+        key_mode_combo_->setCurrentIndex(choice_of_state(detail.key_override));
         const auto key = detail.key_override_value ? detail.key_override_value : detail.key;
-        if (!key_in_use && key && key->mode != KeyMode::Unknown)
-            key_combo_->setCurrentIndex(
-                key_combo_->findData(key->pitch_class + (key->mode == KeyMode::Minor ? 12 : 0)));
+        if (key && key->mode != KeyMode::Unknown) key_combo_->setCurrentIndex(key_combo_->findData(key_code(*key)));
     }
 
     collections_list_->clear();
@@ -620,12 +740,14 @@ void InspectorPanel::load_library_choices(const uuids::uuid& library) {
 
 void InspectorPanel::update_summary() {
     const std::size_t count = rows_.size();
-    partial_label_->setText(total_selected_ > count
-                                ? tr("%1 of %2 selected samples are loaded; edits apply to the loaded ones.")
-                                      .arg(DisplayFormat::count(static_cast<std::int64_t>(count)),
-                                           DisplayFormat::count(static_cast<std::int64_t>(total_selected_)))
-                                : QString());
-    partial_label_->setVisible(total_selected_ > count);
+    partial_label_->setText(
+        whole_selection_loaded()
+            ? QString()
+            : tr("Only %1 of the %2 selected samples are loaded, so editing is off: an edit would miss the "
+                 "others. Select fewer samples to edit them.")
+                  .arg(DisplayFormat::count(static_cast<std::int64_t>(count)),
+                       DisplayFormat::count(static_cast<std::int64_t>(total_selected_))));
+    partial_label_->setVisible(!whole_selection_loaded());
     const QString mixed = tr("Mixed");
 
     if (count == 0) {
@@ -639,24 +761,30 @@ void InspectorPanel::update_summary() {
 
     set_text_unless_edited(name_edit_, count == 1 ? heading_label_->text() : QString());
     name_edit_->setPlaceholderText(count > 1 ? tr("Select one sample to rename") : QString());
-    original_name_label_->setText(count == 1  ? DisplayFormat::from_utf8(rows_.front().file_name)
-                                  : count > 1 ? mixed
-                                              : QString());
-    const auto format = common_value(rows_, [](const auto& row) { return row.format; });
-    format_label_->setText(count <= 1 ? QString() : format ? DisplayFormat::from_utf8(*format).toUpper() : mixed);
+    if (count != 1 || !detail_) {
+        // A single selection's file name and format come from its detail (show_detail), which a
+        // row refresh must not blank; before the detail arrives the row's values stand in.
+        original_name_label_->setText(count == 1  ? DisplayFormat::from_utf8(rows_.front().file_name)
+                                      : count > 1 ? mixed
+                                                  : QString());
+        const auto format = common_value(rows_, [](const auto& row) { return row.format; });
+        format_label_->setText(count == 0 ? QString() : format ? DisplayFormat::from_utf8(*format).toUpper() : mixed);
+    }
 
     const auto rating = common_value(rows_, [](const auto& row) { return row.rating; });
     if (rating)
         rating_stars_->set_rating(*rating);
+    else if (count == 0)
+        rating_stars_->set_rating(0);  // nothing selected: no stars left over from the last sample
     else
-        rating_stars_->set_mixed(count > 1);
+        rating_stars_->set_mixed(true);
     rating_label_->setText(count > 1 && !rating ? mixed : QString());
 
     const auto favorite = common_value(rows_, [](const auto& row) { return row.favorite; });
     favorite_label_->setText(count == 0 ? QString() : favorite ? (*favorite ? tr("Yes") : tr("No")) : mixed);
 
     if (count != 1 || !detail_) {
-        if (!notes_dirty_ && !notes_edit_->hasFocus() && !notes_edit_->toPlainText().isEmpty()) {
+        if (!notes_dirty_ && !notes_edit_->toPlainText().isEmpty()) {
             const QSignalBlocker blocker(notes_edit_);
             notes_edit_->clear();
         }
@@ -672,8 +800,11 @@ void InspectorPanel::update_summary() {
         std::vector<std::pair<QString, QString>> tags;
         for (const auto& [path, tag_count] : tag_counts) {
             const QString tag = DisplayFormat::from_utf8(path);
+            // One multi-argument arg(): a "%2" inside a tag name is never substituted.
             tags.emplace_back(count > 1 && static_cast<std::size_t>(tag_count) < count
-                                  ? tr("%1 (%2 of %3)").arg(tag).arg(tag_count).arg(count)
+                                  ? tr("%1 (%2 of %3)")
+                                        .arg(tag, DisplayFormat::count(tag_count),
+                                             DisplayFormat::count(static_cast<std::int64_t>(count)))
                                   : tag,
                               tag);
         }
@@ -702,7 +833,7 @@ void InspectorPanel::update_summary() {
 
 void InspectorPanel::update_enabled() {
     const bool has_selection = !rows_.empty();
-    const bool editable = has_selection && !read_only_;
+    const bool editable = has_selection && !read_only_ && whole_selection_loaded();
     const bool single = rows_.size() == 1;
     name_edit_->setEnabled(editable && single);
     rename_button_->setEnabled(editable && single);
@@ -722,10 +853,10 @@ void InspectorPanel::update_enabled() {
     category_clear_button_->setEnabled(editable);
     bpm_mode_combo_->setEnabled(editable);
     bpm_spin_->setEnabled(editable && bpm_mode_combo_->currentIndex() == ValueChoice);
-    bpm_apply_button_->setEnabled(editable);
+    bpm_apply_button_->setEnabled(editable && bpm_mode_combo_->currentIndex() != MixedChoice);
     key_mode_combo_->setEnabled(editable);
     key_combo_->setEnabled(editable && key_mode_combo_->currentIndex() == ValueChoice);
-    key_apply_button_->setEnabled(editable);
+    key_apply_button_->setEnabled(editable && key_mode_combo_->currentIndex() != MixedChoice);
     const bool collections_available = editable && single_library && !manual_collection_ids_.empty();
     collection_combo_->setEnabled(collections_available);
     collection_add_button_->setEnabled(collections_available);
@@ -733,7 +864,7 @@ void InspectorPanel::update_enabled() {
 }
 
 void InspectorPanel::request(catalog::EditCommand command) {
-    if (rows_.empty() || read_only_) return;
+    if (rows_.empty() || read_only_ || !whole_selection_loaded()) return;
     emit editRequested(command);
 }
 

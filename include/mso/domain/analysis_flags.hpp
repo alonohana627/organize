@@ -21,7 +21,7 @@ inline constexpr std::int64_t kAnalyzedAny =
 
 /// The bit an analysis stage sets when its result is recorded ("tempo", "key", "waveform",
 /// "byte_hash", "pcm_hash", "loudness"); 0 for stages that have no flag.
-constexpr std::int64_t analysis_flag_for_stage(std::string_view stage) noexcept {
+[[nodiscard]] constexpr std::int64_t analysis_flag_for_stage(std::string_view stage) noexcept {
     if (stage == "tempo") return kAnalyzedTempo;
     if (stage == "key") return kAnalyzedKey;
     if (stage == "waveform") return kAnalyzedWaveform;

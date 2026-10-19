@@ -267,11 +267,12 @@ Result<void> SourceStream::refill_staging() {
                 break;
             }
             // The source ended inside the loop (its length was an estimate): the real end is the
-            // loop end from now on, for reading and for reported positions.
+            // loop end from now on, for reading and for reported positions. The loop keeps its
+            // minimum length, starting earlier when the shorter end would leave less.
             loop_.end_frame = read_position_;
-            if (configured_loop_) {
-                configured_loop_->end_frame = read_position_;
-            }
+            loop_.start_frame =
+                std::min(loop_.start_frame, std::max<std::int64_t>(0, loop_.end_frame - minimum_loop_frames_));
+            configured_loop_ = LoopRegion{loop_.start_frame, loop_.end_frame};
             if (auto wrapped = wrap_to_loop_start(); !wrapped) {
                 return wrapped;
             }

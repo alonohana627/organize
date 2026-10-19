@@ -24,8 +24,9 @@ the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviat
    `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change. `README.md` is
    for the people who use the app (producers, sound designers): change it when something they see
    changes, in plain words with no implementation detail.
-7. **Windows and Linux:** Windows (MSYS2 CLANG64, clang + libc++) is verified; Linux must stay
-   buildable. Platform code goes behind `#ifdef _WIN32` with a POSIX branch.
+7. **Windows first, Linux buildable:** Windows (MSYS2 CLANG64, clang + libc++) is the owner's focus
+   and is verified; Linux must stay buildable, but Linux-only work waits (`CODE_REVIEW.md` §8).
+   Platform code goes behind `#ifdef _WIN32` with a POSIX branch.
 8. **Git:** never commit or push without the owner's explicit OK for that commit.
 
 ## Product invariants (from the specification, as amended)
@@ -43,4 +44,10 @@ the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviat
     Never claim atomicity across libraries or across SQLite and the filesystem.
 15. Schema changes are new numbered migrations; released migrations are immutable (checksummed).
 16. Never relax tests or acceptance criteria to make something pass. Report real command output in
-    `IMPLEMENTATION_STATUS.md`, never invented results.
+    `IMPLEMENTATION_STATUS.md`, never invented results; a claim cites the run that showed it or says
+    "not verified".
+17. **Stability, bug catching and performance come first** (owner, 2026-10-19). The app runs on the
+    user's own workstation. Basic robustness is required: no crash, hang or memory corruption from a
+    bad, damaged or unusual file, tag, query or catalog, and nothing read from a file or a library is
+    ever run as code. Sanitizers, fuzzing and hardened debug builds exist to catch bugs and crashes.
+    Security-only hardening is out of scope: secured named pipes, sandboxing, threat-model findings.

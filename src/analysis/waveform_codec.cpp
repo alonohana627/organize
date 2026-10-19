@@ -31,47 +31,64 @@
 namespace mso::analysis {
 namespace {
 
+/// First eight bytes of every segment file.
 constexpr std::array<std::uint8_t, 8> kMagic{'M', 'S', 'O', 'W', 'A', 'V', 'E', '\0'};
+/// The only layout version written and accepted.
 constexpr std::uint32_t kFormatVersion = 1;
+/// Flag bit: the overview covers the whole stream.
 constexpr std::uint32_t kFlagComplete = 1U << 0;
+/// Every flag bit this version defines; any other set bit is a parse error.
 constexpr std::uint32_t kKnownFlags = kFlagComplete;
+/// Bytes before the per-bin arrays (offsets 0 to 47 in the layout above).
 constexpr std::size_t kHeaderSize = 48;
+/// Bytes of the trailing SHA-256 checksum.
 constexpr std::size_t kChecksumSize = 32;
+/// Bytes per bin: minimum, maximum and RMS as f32.
 constexpr std::size_t kBytesPerBin = 3 * sizeof(float);
 
 /// Appends the segment's fixed-width fields to a byte vector (byte order from byte_order.hpp).
 class SegmentWriter {
 public:
+    /// Appends to `bytes`, which must outlive the writer.
     explicit SegmentWriter(std::vector<std::uint8_t>& bytes) : bytes_(bytes) {}
 
+    /// Appends raw bytes unchanged.
     void write_bytes(std::span<const std::uint8_t> data) { bytes_.insert(bytes_.end(), data.begin(), data.end()); }
+    /// Appends a little-endian u32.
     void write_u32(std::uint32_t value) { append_little_endian(bytes_, value); }
+    /// Appends a little-endian i64 (two's complement).
     void write_i64(std::int64_t value) { append_little_endian(bytes_, static_cast<std::uint64_t>(value)); }
+    /// Appends the IEEE-754 bit pattern of `value` as a little-endian u32.
     void write_f32(float value) { write_u32(std::bit_cast<std::uint32_t>(value)); }
 
 private:
-    std::vector<std::uint8_t>& bytes_;
+    std::vector<std::uint8_t>& bytes_;  ///< the segment being built
 };
 
 /// Reads the segment's fixed-width fields from a byte span whose size the caller has validated.
 class SegmentReader {
 public:
+    /// Reads from `bytes`, which must outlive the reader.
     explicit SegmentReader(std::span<const std::uint8_t> bytes) : bytes_(bytes) {}
 
+    /// The next `count` bytes; the caller has checked that they exist.
     std::span<const std::uint8_t> read_bytes(std::size_t count) {
         const auto data = bytes_.subspan(offset_, count);
         offset_ += count;
         return data;
     }
+    /// The next little-endian u32.
     std::uint32_t read_u32() { return load_little_endian<std::uint32_t>(read_bytes(4).first<4>()); }
+    /// The next little-endian i64 (two's complement).
     std::int64_t read_i64() {
         return static_cast<std::int64_t>(load_little_endian<std::uint64_t>(read_bytes(8).first<8>()));
     }
+    /// The next f32, from its little-endian IEEE-754 bit pattern.
     float read_f32() { return std::bit_cast<float>(read_u32()); }
 
 private:
-    std::span<const std::uint8_t> bytes_;
-    std::size_t offset_ = 0;
+    std::span<const std::uint8_t> bytes_;  ///< the whole segment
+    std::size_t offset_ = 0;               ///< position of the next field
 };
 
 /// SHA-256 of `bytes`, the segment's trailing checksum.

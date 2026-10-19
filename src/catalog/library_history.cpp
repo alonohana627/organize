@@ -40,7 +40,7 @@ std::string command_digest(const EditCommand& command) {
     if (command.add_to_collection) document["add_to_collection"] = *command.add_to_collection;
     if (command.remove_from_collection) document["remove_from_collection"] = *command.remove_from_collection;
     if (command.removed) document["removed"] = *command.removed;
-    return picosha2::hash256_hex_string(detail::to_json_text(document));
+    return picosha2::hash256_hex_string(json_fields::dump_json(document));
 }
 
 std::string command_digest(const TaxonomyCommand& command) {
@@ -51,7 +51,7 @@ std::string command_digest(const TaxonomyCommand& command) {
         {"parent", command.new_parent_id ? nlohmann::json(*command.new_parent_id) : nlohmann::json()},
         {"name", command.new_name},
         {"query", command.smart_query ? nlohmann::json(*command.smart_query) : nlohmann::json()}};
-    return picosha2::hash256_hex_string(detail::to_json_text(document));
+    return picosha2::hash256_hex_string(json_fields::dump_json(document));
 }
 
 /// Digest of an undo or redo request (they carry no content beyond their direction).
@@ -80,25 +80,25 @@ struct StoredReceipt {
 
 Result<StoredReceipt> stored_receipt_from(const std::string& text, std::string state,
                                           std::optional<std::int64_t> action_id) {
-    const auto document = detail::parse_json(text);
-    const auto operation = detail::json_string_member(document, "operation");
+    const auto document = json_fields::parse_json(text);
+    const auto operation = json_fields::string_field(document, "operation");
     const auto parsed_operation = operation ? uuids::uuid::from_string(*operation) : std::nullopt;
     if (document.is_discarded() || !parsed_operation) return fail(ErrorCode::DbCorrupt, "stored receipt is malformed");
     StoredReceipt stored;
     stored.state = std::move(state);
     stored.action_id = action_id;
     stored.receipt.operation = *parsed_operation;
-    stored.receipt.committed_revision = detail::json_integer_member(document, "revision").value_or(0);
-    if (const auto action = detail::json_string_member(document, "action")) {
+    stored.receipt.committed_revision = json_fields::integer_field(document, "revision").value_or(0);
+    if (const auto action = json_fields::string_field(document, "action")) {
         const auto action_uuid = uuids::uuid::from_string(*action);
         if (!action_uuid) return fail(ErrorCode::DbCorrupt, "stored receipt names a malformed action");
         stored.receipt.history_action = *action_uuid;
     }
-    stored.receipt.applied = detail::json_integer_member(document, "applied").value_or(0);
-    stored.receipt.skipped = detail::json_integer_member(document, "skipped").value_or(0);
-    stored.receipt.conflicted = detail::json_integer_member(document, "conflicted").value_or(0);
+    stored.receipt.applied = json_fields::integer_field(document, "applied").value_or(0);
+    stored.receipt.skipped = json_fields::integer_field(document, "skipped").value_or(0);
+    stored.receipt.conflicted = json_fields::integer_field(document, "conflicted").value_or(0);
     stored.next_offset = static_cast<std::size_t>(
-        std::max<std::int64_t>(0, detail::json_integer_member(document, "next_offset").value_or(0)));
+        std::max<std::int64_t>(0, json_fields::integer_field(document, "next_offset").value_or(0)));
     stored.receipt.replayed = true;
     stored.receipt.partial = stored.state != "completed";
     return stored;
@@ -134,7 +134,7 @@ Result<void> store_receipt(sqlite::Connection& connection, const MutationReceipt
         "receipt_json=excluded.receipt_json, updated_at=excluded.updated_at");
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, uuids::to_string(receipt.operation)).bind(2, digest).bind(3, state).bind(4, action_id);
-    statement->bind(5, detail::to_json_text(receipt_json(receipt, next_offset))).bind(6, now_unix_ms());
+    statement->bind(5, json_fields::dump_json(receipt_json(receipt, next_offset))).bind(6, now_unix_ms());
     return statement->run();
 }
 
@@ -176,8 +176,7 @@ public:
             .bind(4, now_unix_ms());
         if (auto inserted = insert->run(); !inserted) return inserted;
         action_id_ = connection_.last_insert_rowid();
-        return run_with_id(connection_, "UPDATE history_state SET cursor_action_id=?1, active_action_id=?1",
-                           action_id_);
+        return run_with_id(connection_, "UPDATE history_state SET cursor_action_id=?1", action_id_);
     }
 
     /// Adopts an existing partial action (a retried chunked edit) without touching the database.
@@ -195,11 +194,7 @@ public:
         if (!has_row) return std::unexpected(has_row.error());
         next_chunk_index_ = *has_row ? next->column_int64(0) : 0;
         next->reset();
-        if (auto applying =
-                run_with_id(connection_, "UPDATE history_actions SET state='applying' WHERE id=?1", action_id_);
-            !applying)
-            return applying;
-        return run_with_id(connection_, "UPDATE history_state SET active_action_id=?1", action_id_);
+        return run_with_id(connection_, "UPDATE history_actions SET state='applying' WHERE id=?1", action_id_);
     }
 
     /// Stores one chunk of operations at the given revision. The inverse column of the released
@@ -209,27 +204,28 @@ public:
             "INSERT INTO history_chunks(action_id,chunk_index,forward_json,inverse_json,state,catalog_revision) "
             "VALUES(?1,?2,?3,'[]','applied',?4)");
         if (!insert) return std::unexpected(insert.error());
-        insert->bind(1, action_id_).bind(2, next_chunk_index_++).bind(3, detail::to_json_text(operations));
+        insert->bind(1, action_id_).bind(2, next_chunk_index_++).bind(3, json_fields::dump_json(operations));
         insert->bind(4, revision);
         return insert->run();
     }
 
-    /// Marks the action completely applied and clears the in-progress marker.
+    /// Marks the action completely applied. (history_state.active_action_id of the released schema
+    /// is retired: an action in progress is the one in state 'applying', which recovery marks partial.)
     Result<void> finish() {
         auto update = connection_.prepare("UPDATE history_actions SET state='applied', completed_at=?2 WHERE id=?1");
         if (!update) return std::unexpected(update.error());
         update->bind(1, action_id_).bind(2, now_unix_ms());
-        if (auto updated = update->run(); !updated) return updated;
-        return connection_.execute_script("UPDATE history_state SET active_action_id=NULL");
+        return update->run();
     }
 
     /// Marks the action partially applied (its committed chunks stay undoable).
     Result<void> mark_partial() {
-        if (auto partial =
-                run_with_id(connection_, "UPDATE history_actions SET state='partial' WHERE id=?1", action_id_);
-            !partial)
-            return partial;
-        return connection_.execute_script("UPDATE history_state SET active_action_id=NULL");
+        return run_with_id(connection_, "UPDATE history_actions SET state='partial' WHERE id=?1", action_id_);
+    }
+
+    /// The action row id for a receipt: nullopt while no action was created.
+    std::optional<std::int64_t> recorded_action_id() const {
+        return exists() ? std::optional<std::int64_t>(action_id_) : std::nullopt;
     }
 
 private:
@@ -572,7 +568,7 @@ private:
                    : patch::category_row(command_.target_id, "parent_id", nlohmann::json(), nlohmann::json());
         auto parent = current(probe);
         if (!parent) return std::unexpected(parent.error());
-        const auto parent_id = detail::json_integer(*parent);
+        const auto parent_id = json_fields::integer_value(*parent);
         if (auto unique = ensure_unique_sibling(connection_, table, command_.target_id, parent_id, name); !unique)
             return std::unexpected(unique.error());
         nlohmann::json operation = is_tag ? patch::tag_row(command_.target_id, "name", nlohmann::json(), name)
@@ -681,7 +677,7 @@ private:
         if (!insert) return std::unexpected(insert.error());
         insert->bind(1, name).bind(2, command_.smart_query ? "smart" : "manual");
         if (command_.smart_query)
-            insert->bind(3, detail::to_json_text(nlohmann::json{{"text", *command_.smart_query}})).bind(4, 1);
+            insert->bind(3, json_fields::dump_json(nlohmann::json{{"text", *command_.smart_query}})).bind(4, 1);
         else
             insert->bind_null(3).bind_null(4);
         if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
@@ -794,15 +790,17 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
         if (auto began = transaction.begin(); !began) return began;
         if (!prepared) {
             if (auto ready = planner.prepare(); !ready) return ready;
-            if (resuming) {
+            if (resuming)
                 if (auto resumed = action.resume(); !resumed) return resumed;
-            } else {
-                if (auto started = action.start(label); !started) return started;
-                receipt.history_action = action.action_uuid();
-            }
         }
         if (auto applied = planner.apply(chunk); !applied) return applied;
         const nlohmann::json operations = planner.take_operations();
+        // The action is created with the first real change, so an edit that changes nothing leaves
+        // history (and the redo tail) untouched.
+        if (!operations.empty() && !action.exists()) {
+            if (auto started = action.start(label); !started) return started;
+            receipt.history_action = action.action_uuid();
+        }
         auto revision =
             detail::advance_revision(writer_, {.kind = "edit",
                                                .structure_changed = planner.effects().structure_changed,
@@ -810,15 +808,15 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
         if (!revision) return std::unexpected(revision.error());
         if (!operations.empty())
             if (auto chunked = action.add_chunk(operations, *revision); !chunked) return chunked;
-        if (last_chunk)
+        if (last_chunk && action.exists())
             if (auto finished = action.finish(); !finished) return finished;
         MutationReceipt next = receipt;
         next.committed_revision = *revision;
         next.applied = planner.applied_count();
         next.skipped = planner.skipped_count();
         const std::size_t next_offset = static_cast<std::size_t>(chunk.data() - all_samples.data()) + chunk.size();
-        if (auto saved = store_receipt(writer_, next, digest, last_chunk ? "completed" : "running", action.action_id(),
-                                       next_offset);
+        if (auto saved = store_receipt(writer_, next, digest, last_chunk ? "completed" : "running",
+                                       action.recorded_action_id(), next_offset);
             !saved)
             return saved;
         if (auto committed = commit_revision(transaction, *revision); !committed) return committed;
@@ -838,8 +836,9 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
                 // with the same operation id resumes here) instead of looking applied or running.
                 sqlite::WriteTransaction transaction(writer_);
                 auto marked = transaction.begin();
-                if (marked) marked = action.mark_partial();
-                if (marked) marked = store_receipt(writer_, receipt, digest, "partial", action.action_id(), offset);
+                if (marked && action.exists()) marked = action.mark_partial();
+                if (marked)
+                    marked = store_receipt(writer_, receipt, digest, "partial", action.recorded_action_id(), offset);
                 if (marked) marked = transaction.commit();
                 if (!marked) {
                     Error error = committed.error();
@@ -916,7 +915,7 @@ Result<std::int64_t> replay_action(sqlite::Connection& connection, std::int64_t 
     chunks->bind(1, action_id);
     std::vector<std::pair<std::int64_t, nlohmann::json>> loaded;
     auto walked = detail::for_each_row(*chunks, [&](sqlite::PreparedStatement& row) -> Result<void> {
-        auto operations = detail::parse_json(row.column_text(1));
+        auto operations = json_fields::parse_json(row.column_text(1));
         if (!operations.is_array())
             return fail(ErrorCode::DbCorrupt,
                         std::format("history chunk {} of action {} is malformed", row.column_int64(0), action_id));
@@ -1004,7 +1003,11 @@ Result<MutationReceipt> Library::step_history(const uuids::uuid& operation, bool
     const std::lock_guard lock(writer_mutex_);
     auto stored = find_receipt(writer_, operation, digest);
     if (!stored) return std::unexpected(stored.error());
-    if (*stored) return (*stored)->receipt;  // a retried undo never reverts a second action
+    if (*stored) {  // a retried undo never reverts a second action
+        if ((*stored)->state == "failed")
+            return fail(ErrorCode::HistoryConflict, "this operation already ended in a history conflict");
+        return (*stored)->receipt;
+    }
 
     HistoryTarget target;
     Error conflict;
@@ -1069,7 +1072,18 @@ Result<MutationReceipt> Library::step_history(const uuids::uuid& operation, bool
     if (recorded) {
         auto revision = detail::advance_revision(
             writer_, {.kind = "history_conflict", .details = {{"action", uuids::to_string(target.uuid)}}});
-        recorded = revision ? commit_revision(transaction, *revision) : Result<void>(std::unexpected(revision.error()));
+        // The receipt remembers the outcome, so resending the same operation reports the conflict
+        // again instead of undoing (or redoing) the next action.
+        if (revision)
+            recorded = store_receipt(writer_,
+                                     MutationReceipt{.operation = operation,
+                                                     .committed_revision = *revision,
+                                                     .history_action = target.uuid,
+                                                     .conflicted = 1},
+                                     digest, "failed", target.id);
+        else
+            recorded = std::unexpected(revision.error());
+        if (recorded) recorded = commit_revision(transaction, *revision);
     }
     if (!recorded)
         conflict.safe_detail += std::format(" (and recording the conflict failed: {})", recorded.error().safe_detail);

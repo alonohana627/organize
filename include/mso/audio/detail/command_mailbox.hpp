@@ -20,6 +20,11 @@ namespace mso::audio::detail {
 ///    pending value instead of queuing again, so scrubbing a seek bar or dragging a slider can
 ///    never fill the queue and the newest value always wins.
 /// The decoder thread receives volumes already converted to linear gain (SetVolumeLinear).
+///
+/// The Stop side channel and the coalescing are written here (a recorded exception to owner rule 1):
+/// moodycamel's queues, like every vendored queue, cannot amend or reorder an element once it is
+/// queued, and the transport needs both "the newest seek/volume/speed/pitch wins" and "Stop is never
+/// refused" without the producer ever blocking or allocating.
 class CommandMailbox {
 public:
     /// Queue entries available to commands other than Stop (moodycamel may round this up).
@@ -33,10 +38,10 @@ public:
 
     /// Producer side. Returns false (and counts a drop) when the command had to be rejected:
     /// the queue is full, or the value is unusable (NaN speed).
-    bool post(const TransportCommand& command) noexcept;
+    [[nodiscard]] bool post(const TransportCommand& command) noexcept;
 
     /// Consumer side: oldest pending command with its newest coalesced value, or nullopt when empty.
-    std::optional<TransportCommand> take() noexcept;
+    [[nodiscard]] std::optional<TransportCommand> take() noexcept;
 
     /// Commands rejected so far.
     std::uint64_t dropped_count() const noexcept { return dropped_count_.load(std::memory_order_relaxed); }

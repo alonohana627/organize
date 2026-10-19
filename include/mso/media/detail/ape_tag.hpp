@@ -20,7 +20,7 @@ inline constexpr std::size_t kApeTagFooterSize = 32;
 /// oversized values are skipped unread. Returns the offset where the tag starts (its header
 /// included), or nullopt when no APE tag ends at `end_offset`.
 /// Errors: only the reader's (ProbeLimit).
-Result<std::optional<std::uint64_t>> read_ape_tag(BoundedFileReader& reader, std::uint64_t end_offset,
-                                                  EmbeddedTags& tags);
+[[nodiscard]] Result<std::optional<std::uint64_t>> read_ape_tag(BoundedFileReader& reader, std::uint64_t end_offset,
+                                                                EmbeddedTags& tags);
 
 }  // namespace mso::media::detail

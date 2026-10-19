@@ -1,10 +1,11 @@
 // The catalog's SQLite wrapper: statement cache, moves, bind errors, the busy path, read snapshots,
-// online backup and the new_uuid() SQL function.
+// online backup and its busy deadline, and the new_uuid(), fold_key() and path_key() SQL functions.
 #include <doctest.h>
 
 #include <chrono>
 
 #include "mso/catalog/sqlite.hpp"
+#include "mso/domain/core.hpp"
 #include "test_support.hpp"
 
 using namespace mso;
@@ -26,7 +27,7 @@ std::int64_t scalar(sqlite::Connection& connection, std::string_view sql) {
 
 }  // namespace
 
-TEST_SUITE("catalog") {
+TEST_SUITE("sqlite") {
     TEST_CASE("cached statements are reused with their bindings cleared") {
         ScratchDirectory scratch;
         auto connection = open_database(scratch / "cache.sqlite");
@@ -49,7 +50,7 @@ TEST_SUITE("catalog") {
 
     TEST_CASE("the statement cache keeps idle statements and finalizes them after closing") {
         sqlite::StatementCache cache;
-        CHECK(cache.take("SELECT 1") == nullptr);
+        CHECK(cache.take("SELECT 1").empty());
         ScratchDirectory scratch;
         auto connection = open_database(scratch / "idle.sqlite");
         for (int round = 0; round < 3; ++round)
@@ -183,6 +184,38 @@ TEST_SUITE("catalog") {
         CHECK(copy->integrity_check().value_or("") == "ok");
     }
 
+    TEST_CASE("online backup gives up with a retryable DB_BUSY when the source stays locked") {
+        ScratchDirectory scratch;
+        auto source = sqlite::Connection::open(scratch / "locked.sqlite", {.create = true, .write_ahead_log = false});
+        REQUIRE(source.has_value());
+        REQUIRE(source->execute_script("CREATE TABLE item(value INTEGER); INSERT INTO item VALUES(1)").has_value());
+        auto holder = sqlite::Connection::open(scratch / "locked.sqlite", {.write_ahead_log = false});
+        REQUIRE(holder.has_value());
+        REQUIRE(holder->execute_script("BEGIN EXCLUSIVE; INSERT INTO item VALUES(2)").has_value());
+        const auto started = std::chrono::steady_clock::now();
+        auto backup = source->backup_to(scratch / "copy.sqlite", 8, std::chrono::milliseconds(100));
+        REQUIRE_FALSE(backup.has_value());
+        CHECK(backup.error().code == ErrorCode::DbBusy);
+        CHECK(backup.error().retryable);
+        CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(100));
+        holder->rollback();
+        CHECK(source->backup_to(scratch / "copy.sqlite", 8, std::chrono::milliseconds(100)).has_value());
+    }
+
+    TEST_CASE("the fold_key() and path_key() SQL functions match the domain functions") {
+        ScratchDirectory scratch;
+        auto connection = open_database(scratch / "keys.sqlite");
+        auto statement = connection.prepare("SELECT fold_key(?1), path_key(?1, 0), path_key(?1, 1), fold_key(NULL)");
+        REQUIRE(statement.has_value());
+        const std::string text = "Drums/Kick É.WAV";
+        statement->bind(1, text);
+        REQUIRE(statement->next_row().value_or(false));
+        CHECK(statement->column_text(0) == fold_key(text));
+        CHECK(statement->column_text(1) == path_key(text, false));
+        CHECK(statement->column_text(2) == path_key(text, true));
+        CHECK(statement->column_is_null(3));
+    }
+
     TEST_CASE("new_uuid() mints distinct canonical UUIDs per row") {
         ScratchDirectory scratch;
         auto connection = open_database(scratch / "uuid.sqlite");
@@ -204,4 +237,4 @@ TEST_SUITE("catalog") {
         REQUIRE_FALSE(missing.has_value());
         CHECK(missing.error().code == ErrorCode::NotFound);
     }
-}  // TEST_SUITE("catalog")
+}  // TEST_SUITE("sqlite")

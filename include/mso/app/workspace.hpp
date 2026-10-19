@@ -30,6 +30,7 @@ struct KnownLibrary {
     std::string name;
     std::filesystem::path directory;
     bool open = false;  ///< reopened by the desktop app at start-up
+    bool operator==(const KnownLibrary&) const = default;
 };
 
 /// Machine-local path of one root of one library.
@@ -56,8 +57,9 @@ public:
     /// Loads the workspace (or starts empty when no file exists yet). A corrupt or newer-version
     /// file is renamed aside and replaced with defaults instead of preventing start-up. Fails only
     /// when the folder cannot be determined, created or read.
-    static Result<Workspace> load(const std::filesystem::path& directory);
+    [[nodiscard]] static Result<Workspace> load(const std::filesystem::path& directory);
 
+    /// Moves the state of a loaded workspace (load() returns it by value).
     Workspace(Workspace&& other) noexcept;
     Workspace& operator=(Workspace&&) = delete;
 
@@ -65,22 +67,27 @@ public:
 
     /// Libraries this workstation knows (as of the last load or change made by this process).
     std::vector<KnownLibrary> known_libraries() const;
-    /// Adds or replaces the entry for `library.uuid`.
-    Result<void> remember_library(const KnownLibrary& library);
+    /// Adds or replaces the entry for `library.uuid` (no write when it is already recorded exactly).
+    [[nodiscard]] Result<void> remember_library(const KnownLibrary& library);
     /// Marks a known library open or closed (no-op for an unknown library).
-    Result<void> set_library_open(const uuids::uuid& library, bool open);
+    [[nodiscard]] Result<void> set_library_open(const uuids::uuid& library, bool open);
+
+    /// Re-reads workspace.json when another process (the CLI) changed it since this process last
+    /// read or wrote it, so its root bindings and preferences become visible here. True when the
+    /// file was re-read. A damaged or newer file is left alone (the next change reports it).
+    [[nodiscard]] Result<bool> reload_if_changed();
 
     /// The local folder bound to a root, if any.
     std::optional<std::filesystem::path> root_binding(const uuids::uuid& library, const uuids::uuid& root) const;
     /// Every binding of one library.
     std::vector<RootBinding> root_bindings(const uuids::uuid& library) const;
     /// Adds or replaces the binding of (binding.library, binding.root).
-    Result<void> bind_root(const RootBinding& binding);
+    [[nodiscard]] Result<void> bind_root(const RootBinding& binding);
 
     /// Free-form preferences (volume, audition on select, shortcuts, layout presets...); null when unset.
     nlohmann::json preference(std::string_view key) const;
     /// Stores one preference (merged into the latest file, other keys untouched).
-    Result<void> set_preference(std::string_view key, nlohmann::json value);
+    [[nodiscard]] Result<void> set_preference(std::string_view key, nlohmann::json value);
 
 private:
     /// Everything stored in workspace.json.
@@ -91,6 +98,12 @@ private:
     };
     /// Outcome of reading workspace.json from disk.
     enum class FileState { Absent, Readable, Unreadable, Newer };
+    /// What identifies one version of workspace.json on disk (write time and size).
+    struct FileStamp {
+        std::filesystem::file_time_type write_time{};
+        std::uintmax_t size = 0;
+        bool operator==(const FileStamp&) const = default;
+    };
 
     explicit Workspace(std::filesystem::path directory) : directory_(std::move(directory)) {}
     /// Reads and parses workspace.json into `document`; entries of the wrong shape are skipped.
@@ -98,10 +111,13 @@ private:
     /// Applies `change` to the latest on-disk document under the inter-process lock and writes it
     /// atomically when `change` reports a modification (returns true).
     Result<void> update(const std::function<bool(Document&)>& change);
+    /// The current stamp of workspace.json; nullopt when it does not exist or cannot be read.
+    std::optional<FileStamp> current_stamp() const;
 
     std::filesystem::path directory_;
-    mutable std::mutex mutex_;  ///< guards document_ and serializes updates inside this process
+    mutable std::mutex mutex_;  ///< guards document_ and stamp_, and serializes updates inside this process
     Document document_;
+    std::optional<FileStamp> stamp_;  ///< the file version document_ reflects
 };
 
 }  // namespace mso::app

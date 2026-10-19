@@ -6,7 +6,7 @@
 
 #include <readerwriterqueue/readerwriterqueue.h>
 
-#include "mso/audio/detail/overloaded.hpp"
+#include "mso/domain/overloaded.hpp"
 
 namespace mso::audio::detail {
 namespace {

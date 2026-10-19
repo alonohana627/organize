@@ -26,6 +26,23 @@ if(MSO_SANITIZERS)
   list(APPEND _mso_test_environment
        "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
        "ASAN_OPTIONS=abort_on_error=0:detect_stack_use_after_return=1:strict_string_checks=1")
+  # Symbolized reports (file:line) need llvm-symbolizer; it sits next to clang in MSYS2 CLANG64 and in
+  # the LLVM apt packages. An ASAN_SYMBOLIZER_PATH set when configuring wins.
+  get_filename_component(_mso_toolchain_directory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  find_program(MSO_LLVM_SYMBOLIZER NAMES llvm-symbolizer HINTS "${_mso_toolchain_directory}")
+  if(MSO_LLVM_SYMBOLIZER AND NOT DEFINED ENV{ASAN_SYMBOLIZER_PATH})
+    list(APPEND _mso_test_environment "ASAN_SYMBOLIZER_PATH=${MSO_LLVM_SYMBOLIZER}")
+  endif()
+endif()
+
+# Windows has no rpath: an executable finds libc++, the sanitizer runtimes, Qt and FFmpeg through PATH.
+# CTest prepends the toolchain's bin directory (MSYS2 CLANG64: clang64/bin, which holds all of them,
+# the AddressSanitizer runtime libclang_rt.asan_dynamic-x86_64.dll included), so `ctest` works from any
+# shell, not only from one whose PATH already starts with clang64/bin.
+set(_mso_test_path_modification "")
+if(WIN32)
+  get_filename_component(_mso_toolchain_directory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  set(_mso_test_path_modification "PATH=path_list_prepend:${_mso_toolchain_directory}")
 endif()
 
 # ---------------------------------------------------------------- shared helpers
@@ -62,6 +79,7 @@ function(mso_register_test_suites executable catch_all group)
     add_test(NAME "${suite}" COMMAND ${executable} "--test-suite=${suite}" --no-intro)
     # doctest exits 0 when a filter matches nothing; an empty named entry is a configuration error.
     set_tests_properties("${suite}" PROPERTIES TIMEOUT ${_mso_test_timeout} ENVIRONMENT "${ARG_ENVIRONMENT}"
+                         ENVIRONMENT_MODIFICATION "${_mso_test_path_modification}"
                          LABELS "${group};${suite}" FAIL_REGULAR_EXPRESSION "test cases: +0 \\|")
   endforeach()
   list(JOIN suites "," excluded)
@@ -71,6 +89,7 @@ function(mso_register_test_suites executable catch_all group)
     add_test(NAME "${catch_all}" COMMAND ${executable} "--test-suite-exclude=${excluded}" --no-intro)
   endif()
   set_tests_properties("${catch_all}" PROPERTIES TIMEOUT ${_mso_test_timeout} ENVIRONMENT "${ARG_ENVIRONMENT}"
+                       ENVIRONMENT_MODIFICATION "${_mso_test_path_modification}"
                        LABELS "${group};catch-all")
 endfunction()
 
@@ -83,8 +102,13 @@ list(FILTER _mso_test_sources EXCLUDE REGEX "/ui_[^/]*\\.cpp$")
 
 # ---------------------------------------------------------------- core tests (no Qt)
 add_executable(mso_tests test_main.cpp ${_mso_test_sources})
-target_link_libraries(mso_tests PRIVATE mso_app mso_audio mso_cli mso_test_support mso::generated mso::doctest)
+target_link_libraries(mso_tests PRIVATE mso_app mso_audio mso_cli mso_test_support mso::generated mso::doctest
+                                        mso::picosha2)
 mso_apply_options(mso_tests)
+if(TARGET mso::ffmpeg)
+  # Same switch as mso_media's, so tests can tell whether the FFmpeg backend is built in.
+  target_compile_definitions(mso_tests PRIVATE MSO_HAVE_FFMPEG=1)
+endif()
 add_dependencies(mso_tests mso-worker)  # worker tests spawn it
 mso_register_test_suites(mso_tests unlisted-suites core
                          SOURCES ${_mso_test_sources} ENVIRONMENT ${_mso_test_environment})

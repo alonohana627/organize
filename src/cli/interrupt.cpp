@@ -23,17 +23,20 @@ static_assert(std::atomic<bool>::is_always_lock_free);
 constexpr auto kWatchInterval = std::chrono::milliseconds(50);
 
 #ifdef _WIN32
-/// Console control handler: records Ctrl+C / Ctrl+Break and keeps the process alive.
+/// Console control handler: the first Ctrl+C / Ctrl+Break is recorded and the process keeps
+/// running to stop cooperatively; a second one is left to the default handler, which ends the
+/// process, so a stop that hangs can still be forced.
 BOOL WINAPI on_console_control(DWORD control) {
     if (control != CTRL_C_EVENT && control != CTRL_BREAK_EVENT) return FALSE;
-    interrupt_requested.store(true);
-    return TRUE;  // handled: the process keeps running and stops cooperatively
+    if (interrupt_requested.exchange(true)) return FALSE;  // second press: default handling
+    return TRUE;
 }
 #else
 /// The SIGINT disposition to restore when the scope ends.
 struct sigaction previous_action{};
 
-/// SIGINT handler: only stores the lock-free flag (async-signal-safe).
+/// SIGINT handler: only stores the lock-free flag (async-signal-safe). Installed with
+/// SA_RESETHAND, so a second SIGINT gets the default disposition and ends the process.
 void on_interrupt_signal(int) {
     interrupt_requested.store(true);  // the only thing done in signal context
 }
@@ -42,12 +45,15 @@ void on_interrupt_signal(int) {
 }  // namespace
 
 InterruptScope::InterruptScope() {
-    interrupt_requested.store(false);
+    // The flag is cleared when a scope ends, so one still set here is an interrupt that arrived
+    // while no scope was active (only simulate_interrupt() can do that): honour it at once.
+    if (interrupt_requested.load()) stop_.request_stop();
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_control, TRUE);
 #else
     struct sigaction action{};
     action.sa_handler = on_interrupt_signal;
+    action.sa_flags = SA_RESETHAND;
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, &previous_action);
 #endif

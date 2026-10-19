@@ -359,6 +359,12 @@ Compile plain text to escaped FTS5 terms and explicit prefix terms only when use
 
 Search index content excludes deleted samples by removing their search projection. Known unknown values use `IS NULL`; zero duration is not unknown. Tag subtree predicates use bounded descendant IDs/temporary tables, not gigantic interpolated IN lists. Folder filters use folder-tree membership and location EXISTS. Combine matches using EXISTS to avoid duplicate rows from multi-tag or multi-location joins.
 
+> **Amendment (implementation, 2026-10-19).** The implemented query semantics refine this section;
+> `IMPLEMENTATION_STATUS.md` ("Search semantics") is authoritative: equality at typed precision
+> (`bpm:120` = 119.5 ≤ x < 120.5), two-valued `NOT` (X and NOT X partition the library), primary-location
+> semantics for `folder:` and root/folder scopes, `analyzed:none`/`false`, a 1,024-node cap on
+> smart-collection expansion, and relevance ranking that keeps non-text OR matches after the text hits.
+
 ## 7. Query plans, sorting and bounded pagination
 
 Page size defaults to 200, maximum 500. Sort whitelist: name, duration, size, rate, BPM, key, rating, added date, format, availability and relevance (where applicable). Stable total ordering includes library UUID and sample UUID as final tie-breakers. Nulls sort last in both directions using a two-part cursor (non-null partition, then null partition), or a matching expression index; do not add an unindexed CASE sort and assume an existing simple index remains sufficient. Sort strings use pinned normalized keys; original text remains for display.
@@ -1074,7 +1080,7 @@ The application is complete through the core desktop scope only when P0–P6 pas
 
 # 10 — Repository agent rules
 
-Read `README.md`, `IMPLEMENTATION_STATUS.md` and the relevant guide in `SKILLS/` before coding. The
+Read `docs/DEVELOPING.md`, `IMPLEMENTATION_STATUS.md` and the relevant guide in `SKILLS/` before coding. The
 specification in `docs/01`–`09` and `contracts/schema.sql` remains the requirements baseline; where
 the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviation and it wins.
 
@@ -1089,12 +1095,18 @@ the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviat
    `deps/manifest.json` and re-applied by `deps/update_deps.py`.
 3. **Clear names, no abbreviations**, and a `///` doc comment on every meaningful class and
    non-trivial function. Aim for code a reviewer rates 10/10.
-4. **Layout:** all headers in `include/mso/<module>/`, all sources in `src/<module>/` (`.cpp` only).
+4. **Layout:** all headers in `include/mso/<module>/` (internal ones in `include/mso/<module>/detail/`),
+   all sources in `src/<module>/` (`.cpp` only). A module includes only the modules it declares in
+   `CMakeLists.txt` (`mso_module(... MODULES ...)`); the `include-graph` CTest entry enforces it.
+   Exception: test-only helpers live next to the tests (`tests/test_support.{hpp,cpp}`).
 5. **Every component has doctest tests** (`tests/<area>_tests.cpp`, `TEST_SUITE("<area>")`).
-6. **Docs move with code:** update `README.md`, `docs/BUILDING.md`, `deps/README.md`,
-   `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change.
-7. **Windows and Linux:** Windows (MSYS2 CLANG64, clang + libc++) is verified; Linux must stay
-   buildable. Platform code goes behind `#ifdef _WIN32` with a POSIX branch.
+6. **Docs move with code:** update `docs/DEVELOPING.md`, `docs/BUILDING.md`, `deps/README.md`,
+   `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change. `README.md` is
+   for the people who use the app (producers, sound designers): change it when something they see
+   changes, in plain words with no implementation detail.
+7. **Windows first, Linux buildable:** Windows (MSYS2 CLANG64, clang + libc++) is the owner's focus
+   and is verified; Linux must stay buildable, but Linux-only work waits (`CODE_REVIEW.md` §8).
+   Platform code goes behind `#ifdef _WIN32` with a POSIX branch.
 8. **Git:** never commit or push without the owner's explicit OK for that commit.
 
 ## Product invariants (from the specification, as amended)
@@ -1112,7 +1124,13 @@ the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviat
     Never claim atomicity across libraries or across SQLite and the filesystem.
 15. Schema changes are new numbered migrations; released migrations are immutable (checksummed).
 16. Never relax tests or acceptance criteria to make something pass. Report real command output in
-    `IMPLEMENTATION_STATUS.md`, never invented results.
+    `IMPLEMENTATION_STATUS.md`, never invented results; a claim cites the run that showed it or says
+    "not verified".
+17. **Stability, bug catching and performance come first** (owner, 2026-10-19). The app runs on the
+    user's own workstation. Basic robustness is required: no crash, hang or memory corruption from a
+    bad, damaged or unusual file, tag, query or catalog, and nothing read from a file or a library is
+    ever run as code. Sanitizers, fuzzing and hardened debug builds exist to catch bugs and crashes.
+    Security-only hardening is out of scope: secured named pipes, sandboxing, threat-model findings.
 
 ---
 
@@ -1337,6 +1355,7 @@ CREATE TABLE scan_sessions (
 CREATE TABLE scan_frontier (
  scan_id INTEGER NOT NULL REFERENCES scan_sessions(id), relative_directory TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('queued','running','complete','denied','failed')),
+ directory_key TEXT,  -- path key of relative_directory for the root's case sensitivity (migration 6)
  PRIMARY KEY(scan_id,relative_directory)
 ) STRICT;
 CREATE TABLE catalog_outbox (
@@ -1371,6 +1390,13 @@ CREATE TRIGGER sample_search_au AFTER UPDATE ON sample_search BEGIN
  INSERT INTO sample_fts(rowid,name,path,tags,category,notes,embedded)
  VALUES(new.sample_id,new.name,new.path,new.tags,new.category,new.notes,new.embedded);
 END;
+-- Indexes added by later migrations (src/catalog/migrations.cpp, migrations 4-6).
+CREATE INDEX locations_missing_by_size ON locations(byte_size) WHERE state='missing';
+CREATE INDEX history_actions_state ON history_actions(state,id);
+CREATE INDEX jobs_sample ON jobs(sample_id,state);
+CREATE INDEX command_receipts_state ON command_receipts(state,updated_at);
+CREATE INDEX jobs_ready ON jobs(run_id,priority DESC,id) WHERE state IN ('queued','interrupted');
+CREATE INDEX scan_frontier_state ON scan_frontier(scan_id,state);
 PRAGMA user_version=1;
 COMMIT;
 ```
@@ -1398,7 +1424,7 @@ Validated 2026-10-19 in the preparation environment with Python's SQLite 3.53.1.
 
 The source schema intentionally relies on application validation for recursive hierarchy cycles, cross-root folder references, field provenance, content revisions, command-digest comparisons, history semantics and publication protocols. The checks do not claim those future services are implemented.
 
-Not executed: C++/Qt build, Windows/WASAPI/DAW integration, real-media decoding, million-row performance, model export/inference, ANN recall, audio-quality evaluation, application crash recovery, or production migration execution. Their acceptance procedures and gates are specified in chapter 06.
+Not executed in this specification-phase validation (before any implementation existed): C++/Qt build, Windows/WASAPI/DAW integration, real-media decoding, million-row performance, model export/inference, ANN recall, audio-quality evaluation, application crash recovery, or production migration execution. Their acceptance procedures and gates are specified in chapter 06. What the implementation has since built and verified, and what is still unverified, is recorded in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 To repeat document/schema checks, run `python3 tools/validate_spec.py`. To regenerate the combined handoff after source edits, run `python3 tools/build_handoff.py`. The build script does not require network access or third-party Python packages.
 
@@ -1408,12 +1434,12 @@ To repeat document/schema checks, run `python3 tools/validate_spec.py`. To regen
 | --- | --- |
 | `docs/01_REQUIREMENTS.md` | `3f9fdf1c5119efa2c90dd11c131a68e0d098372f755ae1ac0bcf70ca9afbdd04` |
 | `docs/02_ARCHITECTURE.md` | `c9a92cd205e2215cfd2793068ba51da9fbda420e8f2a348ebe95ef71f9f3fd48` |
-| `docs/03_DATA_AND_SEARCH.md` | `f0825eb6d98cb21879b510bdcfce2a6522b814cd0335efd6c25df1fc981d71c8` |
+| `docs/03_DATA_AND_SEARCH.md` | `209a40a663278e79fbd2020788134691fd6e3815f49c973e3b3bce92d1f45da3` |
 | `docs/04_CONTRACTS.md` | `a1322e5d064b37ec84302d4f8030daeb2e3e6925bbb17d2d371f804f898e6872` |
 | `docs/05_AUDIO_INTELLIGENCE.md` | `9fa043c303d15bbfbf0ccdceb9ad5386c686c35789f30b044c4f1640b491efab` |
 | `docs/06_QUALITY_AND_OPERATIONS.md` | `0112bf09f9cbbcd5464f2e14266757e294065b663c789d81a25f3c41813cda0b` |
 | `docs/07_ROADMAP.md` | `de84dfbe830fa87a5f416928e4aad544eb037f235a992b7e4fe2bdf5817b163b` |
 | `docs/08_IMPLEMENTATION_PROMPT.md` | `0fc35af6757407e6de7a4ec97617f57003b2e85ea5cfabf8702a8011b373c1d6` |
 | `docs/09_DECISIONS_AND_SOURCES.md` | `581c14d7c950bf44be987ab7f96d361cdbd496c01be21e5914729c2cef2707c5` |
-| `AGENTS.md` | `74b6d8d2689e930f2c8099d515cc26359ae3667387f5ace0f234de53fcccedec` |
-| `contracts/schema.sql` | `ec810cd0e9178e153238a2c3760a51e897af57fc9f8d6e3d0c3cd8afa39abebb` |
+| `AGENTS.md` | `f1f08933bb75d4ecf549ad1360c7be791d253f1d6bf0426a0d4d3702bce27248` |
+| `contracts/schema.sql` | `2c40d8645741a6fde24d9f2dc1c22c47ef4d0b8575d7e872d732fc0f6ef7ff70` |

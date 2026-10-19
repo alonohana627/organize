@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <mutex>
 
+#include "mso/app/analysis_supervisor.hpp"
 #include "mso/cli/command_context.hpp"
 #include "mso/cli/interrupt.hpp"
 
@@ -14,8 +15,10 @@ using Clock = std::chrono::steady_clock;
 
 /// How often the run counts are re-read while waiting.
 constexpr auto kPollInterval = std::chrono::milliseconds(250);
-/// A run whose counts do not move for this long is reported as stalled.
-constexpr auto kStallTimeout = std::chrono::minutes(15);
+/// A run whose counts do not move for this long is reported as stalled. Longer than the
+/// supervisor's own wall-clock cap of one job plus its cancel grace, so a long file that is still
+/// legitimately analyzing is never mistaken for a stall.
+constexpr auto kStallTimeout = app::AnalysisSupervisor::Timing{}.maximum_job_deadline + std::chrono::minutes(5);
 /// Runs listed when looking a run up by id (the newest first; ours were just created).
 constexpr std::size_t kRunLookupLimit = 1000;
 
@@ -61,21 +64,26 @@ int wait_for_runs(CommandContext& context, app::Application& application, const 
     while (true) {
         auto runs = current_runs(application, library, run_ids);
         if (!runs) return context.report(runs.error());
-        std::int64_t pending = 0, completed = 0, failed = 0, blocked = 0, stale = 0, finished = 0;
+        std::int64_t pending = 0, completed = 0, failed = 0, blocked = 0, paused = 0, stale = 0, finished = 0;
         for (const auto& run : *runs) {
             pending += run.queued + run.running;
             completed += run.completed;
             failed += run.failed;
             blocked += run.blocked;
+            paused += run.paused;
             stale += run.stale;
             finished += run.completed + run.failed + run.cancelled + run.stale;
         }
-        context.progress("  {} done, {} pending, {} failed, {} blocked", completed, pending, failed, blocked);
+        context.progress("  {} done, {} pending, {} failed, {} blocked, {} paused", completed, pending, failed, blocked,
+                         paused);
         if (pending == 0) {
+            // Jobs of a paused run (paused elsewhere, e.g. in the desktop app) wait for a resume that
+            // this command will not give: report them as not done instead of waiting.
             context.end_progress();
-            context.print("finished: {} analyzed, {} failed, {} blocked (offline), {} changed while analyzed",
-                          completed, failed, blocked, stale);
-            return failed + blocked + stale > 0 ? kExitPartial : kExitSuccess;
+            context.print(
+                "finished: {} analyzed, {} failed, {} blocked (offline), {} paused, {} changed while analyzed",
+                completed, failed, blocked, paused, stale);
+            return failed + blocked + paused + stale > 0 ? kExitPartial : kExitSuccess;
         }
         const auto now = Clock::now();
         if (finished != last_finished) {
@@ -84,14 +92,21 @@ int wait_for_runs(CommandContext& context, app::Application& application, const 
         }
         const auto status = application.analysis_status();
         std::optional<Error> stop_reason;
-        if (status.worker_unavailable)
-            stop_reason = Error{ErrorCode::WorkerCrash, false, status.detail, {}, {}};
-        else if (status.paused)
-            stop_reason = Error{ErrorCode::Cancelled, false, "the analysis queue was paused", {}, {}};
+        // A worker that failed to start is retried by the supervisor with backoff; only a paused
+        // queue (a missing worker, repeated failures, or a user pause) means nothing will move.
+        if (status.paused)
+            stop_reason = status.worker_unavailable
+                              ? Error{ErrorCode::WorkerCrash, false, status.detail, {}, {}}
+                              : Error{ErrorCode::Cancelled, false, "the analysis queue was paused", {}, {}};
         else if (timeout.count() > 0 && now - started >= timeout)
             stop_reason = Error{ErrorCode::Cancelled, false, std::format("timed out after {}", timeout), {}, {}};
         else if (now - last_movement >= kStallTimeout)
-            stop_reason = Error{ErrorCode::WorkerCrash, false, "no job finished for 15 minutes", {}, {}};
+            stop_reason = Error{ErrorCode::WorkerCrash,
+                                false,
+                                std::format("no job finished for {} minutes",
+                                            std::chrono::duration_cast<std::chrono::minutes>(kStallTimeout).count()),
+                                {},
+                                {}};
         if (interrupt.interrupted() || stop_reason) {
             context.end_progress();
             cancel_runs(context, application, library, run_ids);
@@ -110,21 +125,27 @@ int wait_for_runs(CommandContext& context, app::Application& application, const 
 
 void register_analysis_commands(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("analyze", "Run an explicit analysis profile on matching samples and wait");
-    auto directory = std::make_shared<std::string>();
-    auto profile = std::make_shared<std::string>("Musical");
-    auto query = std::make_shared<std::string>();
-    auto force = std::make_shared<bool>(false);
-    auto timeout_seconds = std::make_shared<std::int64_t>(0);
-    command->add_option("library", *directory, "Library folder")->required();
-    command->add_option("query", *query, "Only samples matching this search (default: all)");
-    command->add_option("--profile", *profile, "Analysis profile")->check(CLI::IsMember(kProfiles));
-    command->add_flag("--force", *force, "Re-analyze even when current results exist");
-    command->add_option("--timeout", *timeout_seconds, "Give up (and cancel) after this many seconds; 0 = no limit")
+    /// Every option of `analyze`.
+    struct Options {
+        std::string directory;
+        std::string profile = "Musical";
+        std::string query;
+        bool force = false;
+        std::int64_t timeout_seconds = 0;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "Library folder")->required();
+    command->add_option("query", options.query, "Only samples matching this search (default: all)");
+    command->add_option("--profile", options.profile, "Analysis profile")->check(CLI::IsMember(kProfiles));
+    command->add_flag("--force", options.force, "Re-analyze even when current results exist");
+    command
+        ->add_option("--timeout", options.timeout_seconds, "Give up (and cancel) after this many seconds; 0 = no limit")
         ->check(CLI::Range(std::int64_t{0}, std::int64_t{7 * 24 * 3600}));
-    command->callback([&, directory, profile, query, force, timeout_seconds] {
+    command->callback([&] {
+        const auto& [directory, profile, query, force, timeout_seconds] = options;
         auto application = context.application(/*with_analysis=*/true);
         if (!application) return void(exit_code = context.report(application.error()));
-        auto library = context.open_library(path_from_utf8(*directory), Access::Write);
+        auto library = context.open_library(path_from_utf8(directory), Access::Write);
         if (!library) return void(exit_code = context.report(library.error()));
         auto& app = **application;
         app.set_analysis_paused(false);
@@ -137,22 +158,22 @@ void register_analysis_commands(CLI::App& root, CommandContext& context, int& ex
             queued += run.queued;
             skipped += run.skipped;
         };
-        if (query->empty()) {
+        if (query.empty()) {
             // Everything: one set-based run per root, no id list in memory.
             auto roots = app.with_library(library->uuid, [](catalog::Library& opened) { return opened.list_roots(); });
             if (!roots) return void(exit_code = context.report(roots.error()));
             for (const auto& root_record : *roots) {
-                auto run = app.start_root_analysis(library->uuid, root_record.id, *profile, *force);
+                auto run = app.start_root_analysis(library->uuid, root_record.id, profile, force);
                 if (!run) return void(exit_code = context.report(run.error()));
                 record(*run);
             }
         } else {
-            search::SearchRequest request{.text = *query};
+            search::SearchRequest request{.text = query};
             auto ids = app.with_library(
                 library->uuid, [&](catalog::Library& opened) { return search::matching_ids(opened, request); });
             if (!ids) return void(exit_code = context.report(ids.error()));
             if (!ids->empty()) {
-                auto run = app.start_analysis(library->uuid, *profile, *ids, *force);
+                auto run = app.start_analysis(library->uuid, profile, *ids, force);
                 if (!run) return void(exit_code = context.report(run.error()));
                 record(*run);
             }
@@ -162,7 +183,7 @@ void register_analysis_commands(CLI::App& root, CommandContext& context, int& ex
         if (queued == 0) return;
         InterruptScope interrupt;
         exit_code =
-            wait_for_runs(context, app, library->uuid, run_ids, std::chrono::seconds(*timeout_seconds), interrupt);
+            wait_for_runs(context, app, library->uuid, run_ids, std::chrono::seconds(timeout_seconds), interrupt);
     });
 }
 

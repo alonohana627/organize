@@ -1,6 +1,8 @@
 // Import and reconciliation against a real folder: probing, renames, changes, missing files,
 // cancellation with resume, small batches, probe failures, catalog failures mid-batch, gaps for
-// unreadable directories, link policy and cycles, unsafe paths, file identity and invariant 11.
+// unreadable directories, link policy, cycles and duplicate links, skipped entries that must not
+// become missing (links, cloud-only files), stored stats across batches, long paths and the depth
+// limit, unsafe paths, file identity and invariant 11.
 #include <doctest.h>
 
 #include <sqlite3.h>
@@ -14,6 +16,7 @@
 
 #include "mso/files/detail/file_identity.hpp"
 #include "mso/files/importer.hpp"
+#include "mso/media/native_file.hpp"
 #include "mso/search/search_service.hpp"
 #include "test_support.hpp"
 
@@ -56,6 +59,14 @@ struct ImportFixture {
         auto summary = files::import_root(*library, root_id, source, stop, {}, options);
         REQUIRE_MESSAGE(summary.has_value(), (summary ? std::string() : summary.error().message()));
         return *summary;
+    }
+
+    /// Samples the catalog reports as missing.
+    std::size_t missing_count() {
+        catalog::Library* scope[] = {library.get()};
+        auto missing = search::SearchService().search(scope, {.text = "available:false"});
+        REQUIRE(missing.has_value());
+        return missing->rows.size();
     }
 };
 
@@ -106,16 +117,38 @@ private:
     bool applied_ = false;
 };
 
+/// True when this process can make a directory unlistable (false as root, or for an account that
+/// bypasses the ACL, such as an elevated runner with backup privileges). Decided once, before the
+/// tests run, so the case that needs it is reported as skipped instead of passing silently.
+bool listing_restriction_unavailable() {
+    static const bool unavailable = [] {
+        std::error_code error;
+        const fs::path probe =
+            fs::temp_directory_path(error) /
+            ("mso-listing-probe-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        if (error || !fs::create_directories(probe, error)) return true;
+        bool applied = false;
+        {
+            ListingDenied denied(probe);
+            applied = denied.applied();
+        }
+        fs::remove_all(probe, error);
+        return !applied;
+    }();
+    return unavailable;
+}
+
 /// A directory link (junction on Windows, symbolic link elsewhere) removed again on destruction,
 /// before the scratch directory is deleted, so cleanup never walks through it.
 class DirectoryLink {
 public:
     DirectoryLink(fs::path link, const fs::path& target) : link_(std::move(link)) {
 #ifdef _WIN32
-        // Junctions need no privileges, unlike symbolic links.
-        const std::string command = "mklink /J \"" + path_to_utf8(link_.lexically_normal().make_preferred()) + "\" \"" +
-                                    path_to_utf8(fs::path(target).lexically_normal().make_preferred()) + "\" >NUL";
-        created_ = std::system(command.c_str()) == 0;
+        // Junctions need no privileges, unlike symbolic links. _wsystem passes the UTF-16 paths
+        // through unchanged (std::system would read UTF-8 in the ANSI code page).
+        const std::wstring command = L"mklink /J \"" + link_.lexically_normal().make_preferred().native() + L"\" \"" +
+                                     fs::path(target).lexically_normal().make_preferred().native() + L"\" >NUL";
+        created_ = _wsystem(command.c_str()) == 0;
 #else
         std::error_code error;
         fs::create_directory_symlink(target, link_, error);
@@ -317,14 +350,12 @@ TEST_SUITE("import") {
         sqlite3_close(connection);
     }
 
-    TEST_CASE("an unlistable directory becomes a gap: its files are not marked missing") {
+    TEST_CASE("an unlistable directory becomes a gap: its files are not marked missing" *
+              doctest::skip(listing_restriction_unavailable())) {
         ImportFixture fixture;
         fixture.import();
         ListingDenied denied(fixture.source / "Loops");
-        if (!denied.applied()) {
-            MESSAGE("cannot restrict directory access here (root, or an account that bypasses the ACL)");
-            return;
-        }
+        REQUIRE(denied.applied());
         const auto summary = fixture.import();
         CHECK(summary.progress.inaccessible_directories == 1);
         CHECK_FALSE(summary.finish.complete_coverage);
@@ -434,5 +465,141 @@ TEST_SUITE("import") {
         auto roots = fixture.library->list_roots();
         CHECK(roots->front().availability == catalog::Availability::Offline);
     }
+
+    TEST_CASE("a directory link skipped on a rescan keeps the samples imported through it") {
+        ImportFixture fixture;
+        test::write_sine_wav(fixture.scratch / "outside/Outside Tone.wav", 0.1, 500);
+        DirectoryLink outside(fixture.source / "Linked", fixture.scratch / "outside");
+        REQUIRE(outside.created());
+        files::ImportOptions follow;
+        follow.follow_reparse_points = true;
+        CHECK(fixture.import(follow).progress.added == 4);
+
+        const auto rescan = fixture.import();  // links are not followed now
+        CHECK(rescan.progress.links_skipped == 1);
+        CHECK(rescan.finish.marked_missing == 0);
+        CHECK_FALSE(rescan.finish.complete_coverage);  // the link's subtree was not looked at
+        CHECK(fixture.missing_count() == 0);
+        CHECK(fixture.library->sample_count().value_or(0) == 4);
+    }
+
+    TEST_CASE("a file skipped on a rescan (cloud-only, or a link) is not marked missing") {
+        ImportFixture fixture;
+        fixture.import();
+        const fs::path kick = fixture.source / "Drums/Kick 01.wav";
+#ifdef _WIN32
+        // OneDrive "Free up space" leaves the entry with its data elsewhere; FILE_ATTRIBUTE_OFFLINE
+        // is what such a file reports without a reparse point.
+        const DWORD attributes = GetFileAttributesW(kick.c_str());
+        REQUIRE(attributes != INVALID_FILE_ATTRIBUTES);
+        REQUIRE(SetFileAttributesW(kick.c_str(), attributes | FILE_ATTRIBUTE_OFFLINE));
+        struct RestoreAttributes {
+            const fs::path& file;
+            DWORD attributes;
+            ~RestoreAttributes() { SetFileAttributesW(file.c_str(), attributes); }
+        } restore{kick, attributes};
+        CHECK(files::detail::classify_link(kick) == files::detail::LinkKind::CloudOnly);
+#else
+        // The file moves away and a link takes its place: links are skipped by default.
+        fs::rename(kick, fixture.scratch / "Kick 01.wav");
+        fs::create_symlink(fixture.scratch / "Kick 01.wav", kick);
+#endif
+        const auto rescan = fixture.import();
+#ifdef _WIN32
+        CHECK(rescan.progress.cloud_only_skipped == 1);
+#else
+        CHECK(rescan.progress.links_skipped == 1);
+#endif
+        CHECK(rescan.finish.marked_missing == 0);
+        CHECK(rescan.finish.complete_coverage);  // a skipped file is seen, not a gap
+        CHECK(fixture.missing_count() == 0);
+    }
+
+    TEST_CASE("two links to one folder import it once") {
+        ImportFixture fixture;
+        test::write_sine_wav(fixture.scratch / "outside/Outside Tone.wav", 0.1, 500);
+        DirectoryLink first(fixture.source / "Linked", fixture.scratch / "outside");
+        DirectoryLink second(fixture.source / "Linked Again", fixture.scratch / "outside");
+        REQUIRE(first.created());
+        REQUIRE(second.created());
+        files::ImportOptions follow;
+        follow.follow_reparse_points = true;
+        const auto summary = fixture.import(follow);
+        CHECK(summary.progress.added == 4);
+        CHECK(summary.progress.link_cycles_skipped == 1);
+        CHECK(fixture.library->sample_count().value_or(0) == 4);
+    }
+
+    TEST_CASE("a rescan of a flat folder larger than a batch probes nothing again") {
+        ImportFixture fixture;
+        for (int index = 0; index < 40; ++index)
+            test::write_sine_wav(fixture.source / ("Flat/Hit " + std::to_string(index) + ".wav"), 0.02, 300);
+        files::ImportOptions options;
+        options.batch_size = 7;  // stored stats must survive across batches of one directory
+        CHECK(fixture.import(options).progress.added == 43);
+        const auto rescan = fixture.import(options);
+        CHECK(rescan.progress.files_committed == 43);
+        CHECK(rescan.progress.files_probed == 0);
+        CHECK(rescan.progress.updated == 0);
+        CHECK(rescan.finish.marked_missing == 0);
+    }
+
+    TEST_CASE("files under paths longer than MAX_PATH are imported, and the depth limit leaves a gap") {
+        ImportFixture fixture;
+        // 30 levels of 12 characters: about 400 characters below the scratch folder.
+        fs::path long_directory = fixture.source / "Long";
+        for (int level = 0; level < 30; ++level)
+            long_directory /= "level-" + std::to_string(100000 + level);
+        // Past the depth limit: 260 nested single-letter folders.
+        fs::path deep_directory = fixture.source / "Deep";
+        for (int level = 0; level < 260; ++level)
+            deep_directory /= "d";
+        std::error_code error;
+        fs::create_directories(media::native_path(long_directory), error);
+        REQUIRE_FALSE(error);
+        fs::create_directories(media::native_path(deep_directory), error);
+        REQUIRE_FALSE(error);
+        // The test helpers write through short paths; the files are then moved into place.
+        test::write_sine_wav(fixture.scratch / "long.wav", 0.1, 440);
+        test::write_sine_wav(fixture.scratch / "deep.wav", 0.1, 440);
+        fs::rename(media::native_path(fixture.scratch / "long.wav"),
+                   media::native_path(long_directory / "Long Tone.wav"));
+        fs::rename(media::native_path(fixture.scratch / "deep.wav"),
+                   media::native_path(deep_directory / "Deep Tone.wav"));
+        REQUIRE(path_to_utf8(long_directory / "Long Tone.wav").size() > 300);
+
+        const auto summary = fixture.import();
+        CHECK(summary.progress.added == 4);  // the three fixture files and Long Tone
+        CHECK(summary.progress.probe_failures == 0);
+        CHECK(summary.progress.inaccessible_directories == 1);  // the first folder below the limit
+        CHECK_FALSE(summary.finish.complete_coverage);
+        auto long_tone = fixture.library->sample_detail(test::sample_id_named(*fixture.library, "Long Tone"));
+        REQUIRE(long_tone.has_value());
+        CHECK(long_tone->format == "wav");  // probed through the extended-length path
+        CHECK(long_tone->duration_exact);
+
+        // ScratchDirectory removes the rest; these trees need extended-length paths.
+        fs::remove_all(media::native_path(fixture.source / "Long"), error);
+        fs::remove_all(media::native_path(fixture.source / "Deep"), error);
+    }
+
+#ifdef _WIN32
+    TEST_CASE("a file name with an unpaired surrogate is skipped as a path the catalog cannot store") {
+        ImportFixture fixture;
+        // U+D800 alone is a valid NTFS name but not valid UTF-16, so it has no UTF-8 spelling.
+        const std::wstring lone_surrogate =
+            LR"(\\?\)" + fs::absolute(fixture.source / "Drums").make_preferred().native() + L"\\\xD800 tone.wav";
+        const HANDLE created = CreateFileW(lone_surrogate.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        REQUIRE(created != INVALID_HANDLE_VALUE);
+        CloseHandle(created);
+        struct RemoveFile {
+            const std::wstring& path;
+            ~RemoveFile() { DeleteFileW(path.c_str()); }
+        } remove_file{lone_surrogate};
+        const auto summary = fixture.import();
+        CHECK(summary.progress.unsafe_paths_skipped == 1);
+        CHECK(summary.progress.added == 3);
+    }
+#endif
 
 }  // TEST_SUITE("import")

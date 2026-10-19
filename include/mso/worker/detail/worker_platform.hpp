@@ -24,8 +24,8 @@ public:
     /// directory, only the two pipe ends inherited and stderr sent to the null device, confined by
     /// `options`' memory and CPU limits. A confinement step that fails in the child is reported
     /// as an error here (RESOURCE_LIMIT), not as a crash after the fact.
-    static Result<std::unique_ptr<ChildProcess>> spawn(const std::filesystem::path& executable,
-                                                       const WorkerOptions& options);
+    [[nodiscard]] static Result<std::unique_ptr<ChildProcess>> spawn(const std::filesystem::path& executable,
+                                                                     const WorkerOptions& options);
 
     virtual ~ChildProcess() = default;
 
@@ -48,7 +48,7 @@ public:
     /// POSIX the worker reports RESOURCE_LIMIT itself).
     virtual bool memory_limit_hit() const = 0;
     /// Waits up to `timeout` (zero polls) and returns the exit status once the process ended.
-    virtual std::optional<std::uint32_t> wait_for_exit(std::chrono::milliseconds timeout) = 0;
+    [[nodiscard]] virtual std::optional<std::uint32_t> wait_for_exit(std::chrono::milliseconds timeout) = 0;
 
     /// Remembers the calling thread as the one blocked reading from_child().
     virtual void register_reader_thread() = 0;

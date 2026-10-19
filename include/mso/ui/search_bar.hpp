@@ -21,6 +21,7 @@ public:
     /// Quiet time after typing before a query runs.
     static constexpr int kDebounceMilliseconds = 150;
 
+    /// An empty search box.
     explicit SearchBar(QWidget* parent = nullptr);
 
     /// Current text of the box.
@@ -47,11 +48,11 @@ private:
     /// The query box.
     QLineEdit* input_ = nullptr;
     QAction* error_action_ = nullptr;  ///< warning icon inside the box while the query is invalid
-    QLabel* error_label_ = nullptr;
+    QLabel* error_label_ = nullptr;    ///< parse error with the position marked
     /// Restarted by every keystroke.
     QTimer debounce_;
-    QString last_submitted_;  ///< last text emitted, to skip duplicate submissions
-    bool submitted_once_ = false;
+    QString last_submitted_;       ///< last text emitted, to skip duplicate submissions
+    bool submitted_once_ = false;  ///< a query was submitted (last_submitted_ is meaningful)
 };
 
 }  // namespace mso::ui

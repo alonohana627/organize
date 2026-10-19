@@ -27,6 +27,12 @@ every existing library refuse to open (`DB_CORRUPT`). Always add a new one.
 6. Tests (`tests/catalog_tests.cpp`): create a library, exercise the new table through the public
    `catalog::Library` API, reopen it, and check `integrity_report()` stays clean. If you add a
    constraint, test that invalid data is rejected without partial writes.
+7. Pin the new migration's checksum in the test "released migrations are pinned: their checksums never
+   change" (`tests/catalog_tests.cpp`) in the same change, so a later edit of the shipped SQL fails the
+   tests instead of every existing library. Pinned so far: migrations 1-6; migration 6 (`jobs_ready`
+   and `scan_frontier_state` indexes, `scan_frontier.directory_key`) is
+   `d626e8ddfd71f63dfdc0c742c4942cfdf2dd2f85fca222dc844667ec36817b5c`.
+8. Update `contracts/schema.sql` (the end-state reference) with the new tables, columns and indexes.
 
 ## Do not
 

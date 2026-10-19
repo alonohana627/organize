@@ -1,4 +1,5 @@
-#include "mso/media/detail/native_file_support.hpp"
+// Extended-length paths, the owning Win32 handle and native error mapping (mso/media/native_file.hpp).
+#include "mso/media/native_file.hpp"
 
 #include <format>
 #include <string>
@@ -11,7 +12,7 @@
 #include <cerrno>
 #endif
 
-namespace mso::media::detail {
+namespace mso::media {
 
 #ifdef _WIN32
 
@@ -25,15 +26,17 @@ constexpr std::size_t kClassicPathLimit = MAX_PATH - 12;
 
 std::filesystem::path native_path(const std::filesystem::path& path) {
     const std::wstring& text = path.native();
-    if (text.size() < kClassicPathLimit || text.starts_with(LR"(\\?\)") || text.starts_with(LR"(\\.\)")) {
-        return path;
-    }
-    // The prefix turns off all path normalisation, so the path must already be absolute, use only
-    // backslashes and contain no "." or ".." components.
+    if (text.starts_with(LR"(\\?\)") || text.starts_with(LR"(\\.\)")) return path;
+    // An absolute path is judged by its own length; a relative one by the absolute path it resolves
+    // to, which can pass the limit although the relative text is short.
+    if (path.is_absolute() && text.size() < kClassicPathLimit) return path;
     std::error_code error;
     std::filesystem::path absolute = std::filesystem::absolute(path, error);
     if (error) return path;
     absolute = absolute.lexically_normal();
+    if (absolute.native().size() < kClassicPathLimit) return path;
+    // The prefix turns off all path normalisation, so the path must be absolute, use only
+    // backslashes and contain no "." or ".." components.
     absolute.make_preferred();
     const std::wstring& normal = absolute.native();
     if (normal.starts_with(LR"(\\)")) return std::filesystem::path(LR"(\\?\UNC\)" + normal.substr(2));
@@ -116,4 +119,4 @@ Error error_from_errno(int error_number, std::string_view operation) {
 
 #endif
 
-}  // namespace mso::media::detail
+}  // namespace mso::media

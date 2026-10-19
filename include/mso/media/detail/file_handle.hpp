@@ -14,7 +14,7 @@
 #include "mso/domain/error.hpp"
 
 #ifdef _WIN32
-#include "mso/media/detail/native_file_support.hpp"
+#include "mso/media/native_file.hpp"
 #endif
 
 namespace mso::media::detail {
@@ -25,7 +25,7 @@ public:
     /// Opens `file` for reading. Only regular files are accepted.
     /// Errors: FileMissing, AccessDenied (retryable for sharing violations), UnsupportedCodec when
     /// the path is a directory, FIFO, device or other non-regular file.
-    static Result<FileHandle> open_for_read(const std::filesystem::path& file);
+    [[nodiscard]] static Result<FileHandle> open_for_read(const std::filesystem::path& file);
 
     FileHandle(FileHandle&& other) noexcept;
     FileHandle& operator=(FileHandle&& other) noexcept;
@@ -34,18 +34,18 @@ public:
     ~FileHandle();
 
     /// Current length of the file in bytes.
-    Result<std::uint64_t> size() const;
+    [[nodiscard]] Result<std::uint64_t> size() const;
 
     /// Reads up to destination.size() bytes starting at `offset`. Returns the number of bytes
     /// read, which is smaller than requested only at end of file. Positional: concurrent reads
     /// through the same handle do not disturb each other.
-    Result<std::size_t> read_at(std::uint64_t offset, std::span<std::uint8_t> destination) const;
+    [[nodiscard]] Result<std::size_t> read_at(std::uint64_t offset, std::span<std::uint8_t> destination) const;
 
     /// Transfers the open file to a C stdio stream positioned at the start (for libraries that
     /// only accept a FILE*). The stream keeps the same sharing mode; the caller must fclose() it.
     /// This handle is empty afterwards, whether or not the transfer succeeds.
     /// Errors: ResourceLimit when the C runtime cannot wrap the handle.
-    Result<std::FILE*> release_to_stdio();
+    [[nodiscard]] Result<std::FILE*> release_to_stdio();
 
 private:
 #ifdef _WIN32

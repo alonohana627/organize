@@ -101,6 +101,7 @@ Result<std::unordered_map<std::int64_t, RootFacts>> load_roots(sqlite::Connectio
 }
 
 /// Display paths ("Drums/Kick") of tag or category nodes, built from one read of the tree.
+/// Includes tombstoned nodes, so a path can always be built.
 class TaxonomyPaths {
 public:
     /// Reads the nodes of `table` ("tags" or "categories"): all of them, or only the nodes listed in
@@ -164,10 +165,11 @@ private:
 };
 
 /// Fills the primary-location fields of a row from its first-ranked live location.
-void apply_location(SampleRow& row, std::int64_t root_id, std::string relative_path, std::string_view state,
-                    const std::unordered_map<std::int64_t, RootFacts>& roots) {
+void apply_location(SampleRow& row, std::int64_t root_id, std::string relative_path, std::string stored_path_key,
+                    std::string_view state, const std::unordered_map<std::int64_t, RootFacts>& roots) {
     row.root_id = root_id;
     row.relative_path = std::move(relative_path);
+    row.path_key = std::move(stored_path_key);
     const auto slash = row.relative_path.rfind('/');
     row.file_name = slash == std::string::npos ? row.relative_path : row.relative_path.substr(slash + 1);
     row.folder_path = slash == std::string::npos ? std::string() : row.relative_path.substr(0, slash);
@@ -200,11 +202,8 @@ void apply_taxonomy(SampleRow& row, TaxonomyPaths& tags, TaxonomyPaths& categori
     std::vector<std::int64_t> sorted_ids;
     sorted_ids.reserve(order.size());
     row.tag_paths.clear();
-    row.tags.clear();
     for (const auto index : order) {
         sorted_ids.push_back(row.tag_ids[index]);
-        if (!row.tags.empty()) row.tags += ", ";
-        row.tags += paths[index];
         row.tag_paths.push_back(std::move(paths[index]));
     }
     row.tag_ids = std::move(sorted_ids);
@@ -260,7 +259,7 @@ Result<void> stream_rows(sqlite::Connection& connection, const uuids::uuid& libr
                                        kRowColumns, filter_samples));
     if (!samples) return std::unexpected(samples.error());
     auto locations = connection.prepare(
-        std::format("SELECT l.sample_id, l.root_id, l.relative_path, l.state FROM locations l "
+        std::format("SELECT l.sample_id, l.root_id, l.relative_path, l.path_key, l.state FROM locations l "
                     "JOIN roots r ON r.id=l.root_id WHERE l.state<>'retired'{} ORDER BY l.sample_id, {}",
                     filter_locations, detail::kPrimaryLocationOrder));
     if (!locations) return std::unexpected(locations.error());
@@ -284,7 +283,8 @@ Result<void> stream_rows(sqlite::Connection& connection, const uuids::uuid& libr
         auto located = location_cursor.for_sample(row.sample_id, [&](const sqlite::PreparedStatement& location) {
             if (primary_seen) return;  // ranked first by kPrimaryLocationOrder
             primary_seen = true;
-            apply_location(row, location.column_int64(1), location.column_text(2), location.column_text(3), roots);
+            apply_location(row, location.column_int64(1), location.column_text(2), location.column_text(3),
+                           location.column_text(4), roots);
         });
         if (!located) return located;
         auto tagged = tag_cursor.for_sample(
@@ -366,6 +366,43 @@ Result<void> for_each_row(catalog::Library& library, const std::function<void(Sa
         apply_taxonomy(row, tag_paths, category_paths);
         visit(std::move(row));
     });
+}
+
+Result<TagAliases> load_tag_aliases(catalog::Library& library) {
+    TagAliases aliases;
+    aliases.library = library.uuid();
+    auto reader = library.acquire_reader();
+    if (!reader) return std::unexpected(reader.error());
+    auto& connection = reader->connection();
+    if (auto begun = connection.execute_script("BEGIN"); !begun) return std::unexpected(begun.error());
+    // Every aliased (merged) tag's folded name with the end of its redirect chain: the tag that has
+    // no alias itself. Chains are bounded like the catalog's canonical_tag(); a cycle yields nothing.
+    auto statement = connection.prepare(std::format(
+        "WITH RECURSIVE redirect(name_key,id,hops) AS ("
+        "SELECT t.name_key, a.canonical_tag_id, 1 FROM tag_aliases a JOIN tags t ON t.id=a.source_tag_id "
+        "UNION SELECT redirect.name_key, a.canonical_tag_id, redirect.hops+1 FROM redirect "
+        "JOIN tag_aliases a ON a.source_tag_id=redirect.id WHERE redirect.hops<={0}) "
+        "SELECT DISTINCT redirect.name_key, redirect.id FROM redirect JOIN tags canonical ON canonical.id=redirect.id "
+        "WHERE canonical.deleted=0 AND redirect.id NOT IN (SELECT source_tag_id FROM tag_aliases) "
+        "ORDER BY redirect.name_key, redirect.id",
+        kMaxTaxonomyDepth));
+    if (!statement) return std::unexpected(statement.error());
+    std::vector<std::pair<std::string, std::int64_t>> redirects;
+    while (true) {
+        auto has_row = statement->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        if (!*has_row) break;
+        redirects.emplace_back(statement->column_text(0), statement->column_int64(1));
+    }
+    if (redirects.empty()) return aliases;
+    std::vector<std::int64_t> canonical_ids;
+    for (const auto& [name_key, id] : redirects)
+        canonical_ids.push_back(id);
+    TaxonomyPaths paths;
+    if (auto read = paths.load(connection, "tags", canonical_ids); !read) return std::unexpected(read.error());
+    for (const auto& [name_key, id] : redirects)
+        aliases.canonical_paths[name_key].push_back(paths.path(id));
+    return aliases;
 }
 
 }  // namespace mso::search

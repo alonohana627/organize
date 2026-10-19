@@ -2,14 +2,17 @@
 // taxonomy paths, analysis flags, musical keys, UUIDs and display formatting.
 #include <doctest.h>
 
+#include <cstdint>
 #include <format>
 #include <set>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "mso/domain/analysis_flags.hpp"
 #include "mso/domain/core.hpp"
 #include "mso/domain/error.hpp"
+#include "mso/domain/json_fields.hpp"
 #include "mso/domain/overloaded.hpp"
 #include "mso/domain/taxonomy.hpp"
 
@@ -56,20 +59,26 @@ TEST_SUITE("domain") {
         CHECK(fold_key("KICK\xFF") == fold_key("kick\xFF"));
         CHECK(fold_key("\xFF") != fold_key("\xFE"));  // distinct invalid bytes stay distinct
         CHECK(fold_key("A\xC3 B") == "a\xC3 b");      // truncated sequence kept verbatim
-        CHECK(fold_path_key("DIR\xFF/Kick.WAV") == "dir\xFF/kick.wav");
+        CHECK(fold_path_key("DIR\xFF/Kick.WAV") == "DIR\xFF/KICK.WAV");
     }
 
     TEST_CASE("path keys fold case on case-insensitive roots and keep it on case-sensitive ones") {
-        CHECK(path_key("Drums/Kick.WAV", false) == "drums/kick.wav");
+        CHECK(path_key("Drums/Kick.WAV", false) == "DRUMS/KICK.WAV");
         CHECK(path_key("Drums/Kick.WAV", true) == "Drums/Kick.WAV");
         CHECK(path_key("Kick.wav", true) != path_key("kick.wav", true));
         CHECK(path_key("Kick.wav", false) == path_key("kick.wav", false));
         CHECK(fold_path_key("Drums/Kick.WAV") == path_key("Drums/Kick.WAV", false));
-        CHECK(fold_path_key("ﬁle.wav") != fold_path_key("file.wav"));              // no compatibility mapping for paths
-        CHECK(fold_path_key("Cafe\u0301.wav") == fold_path_key("Caf\u00c9.wav"));  // NFC, then lowercase
+        CHECK(fold_path_key("ﬁle.wav") != fold_path_key("file.wav"));  // no compatibility mapping for paths
+        // Like NTFS: simple uppercase per code point, no normalization, so names NTFS keeps apart
+        // keep different keys, and names it treats as one file share a key.
+        CHECK(fold_path_key("Caf\u00e9.wav") == fold_path_key("CAF\u00c9.WAV"));
+        CHECK(fold_path_key("Cafe\u0301.wav") != fold_path_key("Caf\u00e9.wav"));    // decomposed vs composed
+        CHECK(fold_path_key("\u0130.wav") != fold_path_key("i.wav"));                // dotted capital I vs i
+        CHECK(fold_path_key("\u212A.wav") != fold_path_key("k.wav"));                // Kelvin sign vs k
+        CHECK(fold_path_key("Stra\u00dfe") != fold_path_key("STRASSE"));             // no full case folding
         CHECK(path_key("Cafe\u0301.wav", true) != path_key("Caf\u00e9.wav", true));  // exact bytes
 #ifdef _WIN32
-        CHECK(fold_path_key("Drums\\Kick.WAV") == "drums/kick.wav");  // '\' is a separator on Windows
+        CHECK(fold_path_key("Drums\\Kick.WAV") == "DRUMS/KICK.WAV");  // '\' is a separator on Windows
         CHECK(path_key("Drums\\Kick.WAV", true) == "Drums/Kick.WAV");
 #else
         CHECK(fold_path_key("a\\b.wav") == "a\\b.wav");  // a legal file-name character on POSIX
@@ -265,12 +274,69 @@ TEST_SUITE("domain") {
 
     TEST_CASE("display formatting") {
         CHECK(format_duration(1'500'000) == "1.50s");
+        CHECK(format_duration(9'994'999) == "9.99s");
+        CHECK(format_duration(9'999'999) == "0:09");  // never "10.00s"
+        CHECK(format_duration(10'000'000) == "0:10");
         CHECK(format_duration(75'000'000) == "1:15");
         CHECK(format_duration(-1).empty());
         CHECK(format_byte_size(512) == "512 B");
         CHECK(format_byte_size(2048) == "2.0 KiB");
         CHECK(format_byte_size(3 * 1024 * 1024) == "3.0 MiB");
         CHECK(format_bpm(128'000) == "128.00");
+    }
+
+    TEST_CASE("JSON fields read damaged documents without throwing") {
+        CHECK(json_fields::parse_json("{\"broken\":").is_discarded());
+        CHECK(json_fields::parse_json("").is_discarded());
+        const auto document = json_fields::parse_json(
+            R"({"name":"Kick","count":7,"big":18446744073709551615,"negative":-3,"ratio":0.5,"flag":true,)"
+            R"("list":[1,2,3],"mixed":[1,"two"],"names":["a","b"],"child":{"x":1}})");
+        REQUIRE_FALSE(document.is_discarded());
+
+        CHECK(json_fields::string_field(document, "name") == "Kick");
+        CHECK_FALSE(json_fields::string_field(document, "count").has_value());  // wrong type
+        CHECK_FALSE(json_fields::string_field(document, "absent").has_value());
+        CHECK_FALSE(json_fields::string_field(nlohmann::json::array(), "name").has_value());  // not an object
+
+        CHECK(json_fields::integer_field(document, "count") == 7);
+        CHECK(json_fields::integer_field(document, "negative") == -3);
+        CHECK_FALSE(json_fields::integer_field(document, "big").has_value());    // above INT64_MAX
+        CHECK_FALSE(json_fields::integer_field(document, "ratio").has_value());  // not an integer
+        CHECK_FALSE(json_fields::integer_field(document, "flag").has_value());
+
+        CHECK(json_fields::number_field(document, "ratio") == 0.5);
+        CHECK(json_fields::number_field(document, "count") == 7.0);
+        CHECK(json_fields::number_field(document, "negative") == -3.0);
+        CHECK_FALSE(json_fields::number_field(document, "name").has_value());
+
+        CHECK(json_fields::boolean_field(document, "flag") == true);
+        CHECK_FALSE(json_fields::boolean_field(document, "count").has_value());
+
+        REQUIRE(json_fields::array_field(document, "list") != nullptr);
+        CHECK(json_fields::array_field(document, "list")->size() == 3);
+        CHECK(json_fields::array_field(document, "child") == nullptr);
+        REQUIRE(json_fields::object_field(document, "child") != nullptr);
+        CHECK(json_fields::integer_field(*json_fields::object_field(document, "child"), "x") == 1);
+        CHECK(json_fields::object_field(document, "list") == nullptr);
+        CHECK(json_fields::member_field(document, "flag") != nullptr);
+        CHECK(json_fields::member_field(document, "absent") == nullptr);
+
+        CHECK(json_fields::integer_array_field(document, "list") == std::vector<std::int64_t>{1, 2, 3});
+        CHECK_FALSE(json_fields::integer_array_field(document, "mixed").has_value());
+        CHECK(json_fields::string_array_field(document, "names") == std::vector<std::string>{"a", "b"});
+        CHECK_FALSE(json_fields::string_array_field(document, "mixed").has_value());
+        CHECK_FALSE(json_fields::string_array_field(document, "name").has_value());
+
+        CHECK(json_fields::integer_value(nlohmann::json(42u)) == 42);
+        CHECK_FALSE(json_fields::integer_value(nlohmann::json("42")).has_value());
+    }
+
+    TEST_CASE("JSON dump replaces invalid UTF-8 instead of throwing") {
+        const nlohmann::json document = {{"name", std::string("bad\xFF")}};
+        std::string text;
+        CHECK_NOTHROW(text = json_fields::dump_json(document));
+        CHECK(text == "{\"name\":\"bad\xEF\xBF\xBD\"}");
+        CHECK(json_fields::dump_json(nlohmann::json{{"a", 1}}, 2) == "{\n  \"a\": 1\n}");
     }
 
 }  // TEST_SUITE("domain")

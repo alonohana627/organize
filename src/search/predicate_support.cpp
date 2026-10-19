@@ -1,8 +1,11 @@
 #include "mso/search/detail/predicate_support.hpp"
 
+#include <format>
+
 #include <nlohmann/json.hpp>
 
 #include "mso/domain/core.hpp"
+#include "mso/domain/json_fields.hpp"
 #include "mso/domain/taxonomy.hpp"
 
 namespace mso::search::detail {
@@ -28,26 +31,70 @@ std::vector<std::string_view> split_on_slash(std::string_view key) {
     }
 }
 
+/// ASCII lower case of one byte; every other byte (including UTF-8 continuation bytes) unchanged.
+constexpr char lower_ascii(char character) noexcept {
+    return character >= 'A' && character <= 'Z' ? static_cast<char>(character - 'A' + 'a') : character;
+}
+
 }  // namespace
+
+std::string primary_location_id_sql(std::string_view sample_id_expression) {
+    return std::format(
+        "(SELECT l.id FROM locations l JOIN roots r ON r.id=l.root_id WHERE l.sample_id={} AND l.state<>'retired' "
+        "ORDER BY {} LIMIT 1)",
+        sample_id_expression, kPrimaryLocationOrder);
+}
+
+bool is_predicate_row_evaluable(const FieldPredicate& predicate) {
+    switch (predicate.field) {
+        case Field::Collection:
+            return false;
+        case Field::Tag:
+            return predicate.text.find('/') == std::string::npos;
+        case Field::Category:
+            return predicate.text.find('/') == std::string::npos ||
+                   folded_taxonomy_segments(predicate.text).has_value();
+        case Field::Name:  // column-restricted text terms are Text nodes, never predicates
+        case Field::Path:
+        case Field::Notes:
+            return false;
+        case Field::Folder:
+        case Field::Bpm:
+        case Field::Key:
+        case Field::Duration:
+        case Field::Rating:
+        case Field::Favorite:
+        case Field::Format:
+        case Field::Codec:
+        case Field::SampleRate:
+        case Field::Channels:
+        case Field::BitDepth:
+        case Field::Size:
+        case Field::Available:
+        case Field::Analyzed:
+            return true;
+    }
+    return false;
+}
 
 RootFolderMatch match_folder_in_root(std::string_view value, std::string_view root_name, bool root_case_sensitive) {
     RootFolderMatch match;
-    const std::string folded_value = without_trailing_slashes(fold_path_key(value));
-    if (folded_value.empty()) return match;
+    const std::string insensitive_value = without_trailing_slashes(fold_path_key(value));
+    if (insensitive_value.empty()) return match;
     const std::string exact_value = without_trailing_slashes(path_key(value, true));
 
     // A folder anywhere below the root, compared with the root's own case sensitivity.
-    match.prefixes.push_back((root_case_sensitive ? exact_value : folded_value) + '/');
+    match.prefixes.push_back((root_case_sensitive ? exact_value : insensitive_value) + '/');
 
     // The root itself, or a folder addressed as "<root name>/<folder>".
-    const std::string folded_root = without_trailing_slashes(fold_path_key(root_name));
-    if (folded_root.empty()) return match;
-    if (folded_value == folded_root) {
+    const std::string insensitive_root = without_trailing_slashes(fold_path_key(root_name));
+    if (insensitive_root.empty()) return match;
+    if (insensitive_value == insensitive_root) {
         match.whole_root = true;
-    } else if (folded_value.starts_with(folded_root + '/')) {
-        // Folding maps code points one to one and keeps '/', so the exact value has the same
-        // segments; drop the ones that spelled the root name.
-        const std::size_t root_segments = split_on_slash(folded_root).size();
+    } else if (insensitive_value.starts_with(insensitive_root + '/')) {
+        // The case-insensitive key maps code points one to one and keeps '/', so the exact value
+        // has the same segments; drop the ones that spelled the root name.
+        const std::size_t root_segments = split_on_slash(insensitive_root).size();
         const auto exact_segments = split_on_slash(exact_value);
         std::string rest;
         for (std::size_t index = root_segments; index < exact_segments.size(); ++index) {
@@ -81,22 +128,19 @@ std::vector<std::string> folded_display_segments(std::string_view path) {
     return segments;
 }
 
-std::optional<std::string> smart_collection_text(std::string_view query_json) {
-    const auto document = nlohmann::json::parse(query_json, nullptr, false);
-    if (!document.is_object()) return std::nullopt;
-    const auto text = document.find("text");
-    if (text == document.end() || !text->is_string()) return std::nullopt;
-    return text->get<std::string>();
+bool starts_with_ascii_case_insensitive(std::string_view text, std::string_view lowered_prefix) noexcept {
+    if (text.size() < lowered_prefix.size()) return false;
+    for (std::size_t index = 0; index < lowered_prefix.size(); ++index)
+        if (lower_ascii(text[index]) != lowered_prefix[index]) return false;
+    return true;
 }
 
-std::string id_array_json(const std::vector<std::int64_t>& ids) {
-    std::string json = "[";
-    for (const auto id : ids) {
-        if (json.size() > 1) json += ',';
-        json += std::to_string(id);
-    }
-    json += ']';
-    return json;
+std::optional<std::string> smart_collection_text(std::string_view query_json) {
+    return json_fields::string_field(json_fields::parse_json(query_json), "text");
+}
+
+std::string id_array_json(std::span<const std::int64_t> ids) {
+    return json_fields::dump_json(nlohmann::json(std::vector<std::int64_t>(ids.begin(), ids.end())));
 }
 
 }  // namespace mso::search::detail

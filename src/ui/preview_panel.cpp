@@ -5,6 +5,7 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -28,8 +29,9 @@ namespace mso::ui {
 namespace {
 
 constexpr int kPollIntervalMilliseconds = 30;
-constexpr int kSeekResolution = 1000;        ///< slider steps across the whole sample
-constexpr int kMinimumVolumeDecibels = -60;  ///< slider bottom = silence
+constexpr int kDeviceCheckMilliseconds = 1000;  ///< device-state polling while nothing plays
+constexpr int kSeekResolution = 1000;           ///< slider steps across the whole sample
+constexpr int kMinimumVolumeDecibels = -60;     ///< slider bottom = silence
 constexpr int kWaveformBins = 1024;
 constexpr std::size_t kWaveformCacheEntries = 8;
 constexpr std::int64_t kMillisecondsPerHour = 3'600'000;
@@ -54,12 +56,22 @@ audio::OutputBackend backend_from_environment() {
 PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidget(parent), session_(session) {
     waveform_pool_.setMaxThreadCount(1);
     engine_pool_.setMaxThreadCount(1);
+    engine_pool_.setObjectName(QStringLiteral("PreviewEngine"));
     // Open the output device in the background right away, so the first preview starts instantly.
     QTimer::singleShot(0, this, &PreviewPanel::request_engine);
     poll_timer_.setInterval(kPollIntervalMilliseconds);
     connect(&poll_timer_, &QTimer::timeout, this, &PreviewPanel::poll_engine);
+    device_timer_.setInterval(kDeviceCheckMilliseconds);
+    connect(&device_timer_, &QTimer::timeout, this, [this] {
+        if (engine_) update_device_notice(engine_->snapshot());
+    });
+    build_ui();
+    update_controls_enabled();
+}
 
+void PreviewPanel::build_ui() {
     title_label_ = new QLabel(tr("No sample selected"), this);
+    title_label_->setTextFormat(Qt::PlainText);  // sample names are user text
     title_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     title_label_->setAccessibleName(tr("Previewed sample"));
 
@@ -102,7 +114,7 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
         if (selected_key_ && selected_path_)
             start_waveform(*selected_key_, *selected_path_);
         else
-            open_selected(false);  // resolves the path; the waveform starts with the preview
+            resolve_selected(PathUse::WaveformOnly);  // never replaces what the engine plays
     });
 
     volume_slider_ = new QSlider(Qt::Horizontal, this);
@@ -148,8 +160,32 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
     connect(speed_spin_, &QDoubleSpinBox::valueChanged, this,
             [this](double ratio) { post(audio::transport::SetSpeed{ratio}); });
 
+    device_menu_ = new QMenu(this);
+    connect(device_menu_, &QMenu::aboutToShow, this, &PreviewPanel::fill_device_menu);
+    device_button_ = new QToolButton(this);
+    device_button_->setText(tr("Output"));
+    device_button_->setToolTip(tr("Audio output device for previews"));
+    device_button_->setAccessibleName(tr("Output device"));
+    device_button_->setMenu(device_menu_);
+    device_button_->setPopupMode(QToolButton::InstantPopup);
+
+    device_notice_ = new QWidget(this);
+    device_notice_label_ = new QLabel(device_notice_);
+    device_notice_label_->setWordWrap(true);
+    device_notice_label_->setTextFormat(Qt::PlainText);
+    device_notice_label_->setAccessibleName(tr("Audio device notice"));
+    auto* retry_button = new QPushButton(tr("Retry"), device_notice_);
+    retry_button->setAccessibleName(tr("Retry audio device"));
+    connect(retry_button, &QPushButton::clicked, this, &PreviewPanel::retry_output_device);
+    auto* notice_layout = new QHBoxLayout(device_notice_);
+    notice_layout->setContentsMargins(0, 0, 0, 0);
+    notice_layout->addWidget(device_notice_label_, 1);
+    notice_layout->addWidget(retry_button);
+    device_notice_->hide();
+
     status_label_ = new QLabel(this);
     status_label_->setWordWrap(true);
+    status_label_->setTextFormat(Qt::PlainText);  // error texts may quote file names
     status_label_->setAccessibleName(tr("Preview status"));
 
     auto* transport_row = new QHBoxLayout;
@@ -167,22 +203,24 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
     options_row->addWidget(new QLabel(tr("Speed"), this));
     options_row->addWidget(speed_spin_);
     options_row->addWidget(generate_button_);
+    options_row->addWidget(device_button_);
 
     auto* layout = new QVBoxLayout(this);
     layout->addWidget(title_label_);
     layout->addLayout(transport_row);
     layout->addWidget(waveform_view_, 1);
     layout->addLayout(options_row);
+    layout->addWidget(device_notice_);
     layout->addWidget(status_label_);
-
-    update_controls_enabled();
 }
 
 PreviewPanel::~PreviewPanel() {
     cancel_waveform();
     waveform_pool_.waitForDone();
-    engine_pool_.waitForDone();  // an engine still being created is destroyed with its future
-    engine_.reset();             // stops the device and joins the decoder thread
+    engine_pool_.waitForDone();  // a creation still running finishes first
+    // The engine keeps COM on its own output thread, so destroying it here is safe; it closes the
+    // device and joins its threads.
+    engine_.reset();
 }
 
 void PreviewPanel::load_preferences() {
@@ -208,40 +246,47 @@ void PreviewPanel::select_sample(const std::optional<SampleKey>& key, const QStr
 
 void PreviewPanel::toggle_play_pause() {
     if (engine_ && loaded_key_ && loaded_key_ == selected_key_) {
+        if (engine_->snapshot().state != audio::PreviewState::Playing) recover_device_before_play();
         post(audio::transport::TogglePlayPause{});
         return;
     }
-    open_selected(true);
+    resolve_selected(PathUse::Play);
 }
 
 void PreviewPanel::play_selected() {
     if (engine_ && loaded_key_ && loaded_key_ == selected_key_) {
+        recover_device_before_play();
         post(audio::transport::Play{});
         return;
     }
-    open_selected(true);
+    resolve_selected(PathUse::Play);
 }
 
 void PreviewPanel::stop() {
     post(audio::transport::Stop{});
 }
 
-void PreviewPanel::open_selected(bool autoplay) {
+void PreviewPanel::resolve_selected(PathUse use) {
     if (!selected_key_ || !session_.is_ready()) return;
     const SampleKey key = *selected_key_;
     const std::uint64_t request = ++open_request_;
-    status_label_->setText(tr("Opening…"));
+    if (use == PathUse::Play) status_label_->setText(tr("Opening…"));
     session_.run(
         this,
         [key](app::Application& application) { return application.resolve_playable_path(key.library, key.sample_id); },
-        [this, key, request, autoplay](Result<std::filesystem::path> path) {
+        [this, key, request, use](Result<std::filesystem::path> path) {
             if (request != open_request_ || key != selected_key_) return;  // selection moved on
             if (!path) {
                 status_label_->setText(tr("Cannot preview: %1").arg(DisplayFormat::error(path.error())));
                 emit statusMessage(status_label_->text());
                 return;
             }
-            on_path_resolved(key, *path, autoplay);
+            if (use == PathUse::WaveformOnly) {
+                selected_path_ = *path;
+                start_waveform(key, *path);
+                return;
+            }
+            on_path_resolved(key, *path, true);
         });
 }
 
@@ -250,7 +295,8 @@ void PreviewPanel::on_path_resolved(const SampleKey& key, const std::filesystem:
     // Previewing authorizes bounded decoding of this one file for its waveform.
     if (waveform_view_->state() != WaveformView::State::Ready && waveform_key_ != key) start_waveform(key, path);
     if (!engine_) {
-        // The device is still being opened in the background: play as soon as it is ready.
+        // The device is still being opened in the background (or failed before: try again now),
+        // and the file plays as soon as it is ready.
         pending_open_ = PendingOpen{key, path, autoplay};
         request_engine();
         return;
@@ -261,6 +307,7 @@ void PreviewPanel::on_path_resolved(const SampleKey& key, const std::filesystem:
     }
     loaded_key_ = key;
     loaded_generation_ = engine_->snapshot().generation;
+    if (autoplay) recover_device_before_play();
     status_label_->clear();
     post(audio::transport::SetSpeed{speed_spin_->value()});
     if (autoplay) post(audio::transport::Play{});
@@ -268,27 +315,32 @@ void PreviewPanel::on_path_resolved(const SampleKey& key, const std::filesystem:
 }
 
 void PreviewPanel::request_engine() {
-    if (engine_ || engine_requested_ || engine_unavailable_) return;
+    if (engine_ || engine_requested_) return;
     engine_requested_ = true;
     using Creation = Result<std::unique_ptr<audio::PreviewEngine>>;
+    audio::PreviewOptions options;
+    options.backend = backend_from_environment();
+    if (const auto device = session_.preference(UiPreferenceKeys::kPreviewOutputDevice); device.is_string())
+        options.device = audio::OutputDeviceId{device.get<std::string>()};
+    if (!engine_failure_.isEmpty()) status_label_->setText(tr("Opening the audio output again…"));
     // Opening the output device can take hundreds of milliseconds: never on the UI thread.
     run_in_background(
-        engine_pool_, this,
-        []() -> Creation {
-            audio::PreviewOptions options;
-            options.backend = backend_from_environment();
-            return audio::PreviewEngine::create(options);
-        },
+        engine_pool_, this, [options]() -> Creation { return audio::PreviewEngine::create(options); },
         [this](Creation created) {
             engine_requested_ = false;
             if (!created) {
-                engine_unavailable_ = true;
+                // The next Play tries again.
+                engine_failure_ = DisplayFormat::error(created.error());
                 pending_open_.reset();
-                status_label_->setText(tr("Audio output unavailable: %1").arg(DisplayFormat::error(created.error())));
+                status_label_->setText(tr("Audio output unavailable: %1").arg(engine_failure_));
                 update_controls_enabled();
                 return;
             }
+            engine_failure_.clear();
+            status_label_->clear();
             engine_ = std::move(*created);
+            device_timer_.start();
+            update_device_notice(engine_->snapshot());
             const int decibels = volume_slider_->value();
             if (decibels <= kMinimumVolumeDecibels)
                 engine_->post(audio::transport::SetVolumeLinear{0.0});
@@ -341,12 +393,10 @@ void PreviewPanel::poll_engine() {
     seek_slider_->setEnabled(showing_loaded && known_length);
     waveform_view_->set_seekable(showing_loaded && known_length);
 
-    if (snapshot.last_error) {
-        const QString error = DisplayFormat::from_utf8(mso::to_string(*snapshot.last_error));
-        status_label_->setText(*snapshot.last_error == ErrorCode::DeviceLost
-                                   ? tr("Audio device lost (%1); playback paused.").arg(error)
-                                   : tr("Playback error: %1").arg(error));
-    }
+    update_device_notice(snapshot);
+    if (snapshot.last_error && *snapshot.last_error != ErrorCode::DeviceLost)
+        status_label_->setText(
+            tr("Playback error: %1").arg(DisplayFormat::from_utf8(mso::to_string(*snapshot.last_error))));
     // Show what the engine actually loops (clamped to the source, at least kMinimumLoopMilliseconds)
     // and whether seam fades are on, as reported rather than as requested.
     if (snapshot.loop && snapshot.source_sample_rate > 0) {
@@ -364,7 +414,87 @@ void PreviewPanel::poll_engine() {
         apply_loop();
 
     const bool active = playing || snapshot.state == audio::PreviewState::Loading;
-    if (!active) poll_timer_.stop();
+    if (!active) poll_timer_.stop();  // device_timer_ keeps watching the device meanwhile
+}
+
+void PreviewPanel::update_device_notice(const audio::PreviewSnapshot& snapshot) {
+    const bool lost = snapshot.output_device_lost;
+    if (lost)
+        device_notice_label_->setText(
+            tr("The audio device is unavailable (unplugged or in use); previews are "
+               "silent. It is retried automatically."));
+    if (device_notice_->isHidden() == lost) device_notice_->setVisible(lost);
+    const QString name = DisplayFormat::from_utf8(snapshot.output_device_name.view());
+    device_button_->setToolTip(lost || name.isEmpty() ? tr("Audio output device for previews")
+                                                      : tr("Previews play on %1").arg(name));
+}
+
+void PreviewPanel::retry_output_device() {
+    if (!engine_) {
+        request_engine();  // no engine yet (creation failed): create it again
+        return;
+    }
+    if (auto restarted = engine_->restart_output_device(); !restarted) {
+        status_label_->setText(
+            tr("The audio device is still unavailable: %1").arg(DisplayFormat::error(restarted.error())));
+        emit statusMessage(status_label_->text());
+    } else {
+        status_label_->clear();
+    }
+    update_device_notice(engine_->snapshot());
+    if (!poll_timer_.isActive()) poll_timer_.start();  // a resumed preview shows its progress
+}
+
+void PreviewPanel::recover_device_before_play() {
+    if (!engine_ || !engine_->snapshot().output_device_lost) return;
+    // Play is a good moment to try the device again (the user may just have plugged it in).
+    if (auto restarted = engine_->restart_output_device(); !restarted)
+        status_label_->setText(
+            tr("The audio device is still unavailable: %1").arg(DisplayFormat::error(restarted.error())));
+    update_device_notice(engine_->snapshot());
+}
+
+bool PreviewPanel::device_notice_visible() const {
+    return !device_notice_->isHidden();
+}
+
+void PreviewPanel::fill_device_menu() {
+    device_menu_->clear();
+    if (!engine_) {
+        device_menu_->addAction(tr("(audio output not open yet)"))->setEnabled(false);
+        return;
+    }
+    const auto stored = session_.preference(UiPreferenceKeys::kPreviewOutputDevice);
+    const audio::OutputDeviceId chosen{stored.is_string() ? stored.get<std::string>() : std::string()};
+    QAction* follow_default =
+        device_menu_->addAction(tr("System default"), this, [this] { choose_output_device(audio::OutputDeviceId{}); });
+    follow_default->setCheckable(true);
+    follow_default->setChecked(chosen.is_system_default());
+    device_menu_->addSeparator();
+    auto devices = engine_->list_output_devices();
+    if (!devices) {
+        device_menu_->addAction(tr("Devices unavailable: %1").arg(DisplayFormat::error(devices.error())))
+            ->setEnabled(false);
+        return;
+    }
+    for (const auto& device : *devices) {
+        QAction* action = device_menu_->addAction(DisplayFormat::from_utf8(device.name), this,
+                                                  [this, id = device.id] { choose_output_device(id); });
+        action->setCheckable(true);
+        action->setChecked(!chosen.is_system_default() && device.id == chosen);
+    }
+}
+
+void PreviewPanel::choose_output_device(const audio::OutputDeviceId& device) {
+    if (!engine_) return;
+    if (auto selected = engine_->select_output_device(device); !selected) {
+        status_label_->setText(tr("Could not switch the audio device: %1").arg(DisplayFormat::error(selected.error())));
+        emit statusMessage(status_label_->text());
+        return;
+    }
+    session_.set_preference(UiPreferenceKeys::kPreviewOutputDevice, device.value);
+    status_label_->clear();
+    update_device_notice(engine_->snapshot());
 }
 
 void PreviewPanel::apply_loop() {
@@ -443,7 +573,8 @@ void PreviewPanel::show_cached_waveform_or_placeholder() {
 }
 
 void PreviewPanel::update_controls_enabled() {
-    const bool has_selection = selected_key_.has_value() && !engine_unavailable_;
+    // Play stays enabled after a failed engine creation: pressing it tries again.
+    const bool has_selection = selected_key_.has_value();
     play_button_->setEnabled(has_selection);
     stop_button_->setEnabled(engine_ != nullptr);
     generate_button_->setEnabled(selected_key_.has_value() && waveform_view_->state() != WaveformView::State::Ready);

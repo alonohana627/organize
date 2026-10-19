@@ -24,17 +24,17 @@ class CommentByteSource {
 public:
     virtual ~CommentByteSource() = default;
     /// Reads up to `count` bytes; fewer (possibly none) only when the block ends first.
-    virtual Result<std::vector<std::uint8_t>> read(std::size_t count) = 0;
+    [[nodiscard]] virtual Result<std::vector<std::uint8_t>> read(std::size_t count) = 0;
     /// Skips up to `count` bytes without reading them; false when the block ended first.
-    virtual Result<bool> skip(std::uint64_t count) = 0;
+    [[nodiscard]] virtual Result<bool> skip(std::uint64_t count) = 0;
 };
 
 /// A comment block that is already in memory.
 class MemoryCommentSource final : public CommentByteSource {
 public:
     explicit MemoryCommentSource(Bytes block) noexcept : cursor_(block) {}
-    Result<std::vector<std::uint8_t>> read(std::size_t count) override;
-    Result<bool> skip(std::uint64_t count) override;
+    [[nodiscard]] Result<std::vector<std::uint8_t>> read(std::size_t count) override;
+    [[nodiscard]] Result<bool> skip(std::uint64_t count) override;
 
 private:
     ByteCursor cursor_;
@@ -46,8 +46,8 @@ public:
     /// The block occupies `length` bytes at `offset`.
     FileRangeCommentSource(BoundedFileReader& reader, std::uint64_t offset, std::uint64_t length) noexcept
         : reader_(reader), position_(offset), end_(checked_add(offset, length).value_or(~0ull)) {}
-    Result<std::vector<std::uint8_t>> read(std::size_t count) override;
-    Result<bool> skip(std::uint64_t count) override;
+    [[nodiscard]] Result<std::vector<std::uint8_t>> read(std::size_t count) override;
+    [[nodiscard]] Result<bool> skip(std::uint64_t count) override;
 
 private:
     BoundedFileReader& reader_;
@@ -58,7 +58,7 @@ private:
 /// Reads a Vorbis comment block (vendor string, count, "NAME=value" entries) without any
 /// codec-specific packet prefix. Entries longer than kMaxCommentEntryBytes are skipped unread;
 /// a truncated block is parsed as far as it goes. Errors: only the source's own (ProbeLimit).
-Result<void> read_vorbis_comment(CommentByteSource& source, EmbeddedTags& tags);
+[[nodiscard]] Result<void> read_vorbis_comment(CommentByteSource& source, EmbeddedTags& tags);
 
 /// read_vorbis_comment() over a block already in memory.
 void parse_vorbis_comment(Bytes block, EmbeddedTags& tags);

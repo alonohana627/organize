@@ -41,9 +41,11 @@ public:
     void add(std::span<const float> mono_samples);
 
     /// The profile of every frame accumulated so far.
-    ChromaProfile profile() const;
+    [[nodiscard]] ChromaProfile profile() const;
 
+    /// Resolution of the fine chroma, which tuning estimation needs: 10 cents per bin.
     static constexpr std::size_t kFineBinsPerSemitone = 10;
+    /// Bins of the fine chroma: one octave.
     static constexpr std::size_t kFineBinCount = 12 * kFineBinsPerSemitone;
 
 private:
@@ -52,15 +54,15 @@ private:
     /// Adds the pending frame's spectral peaks to the fine chroma, weighted by tonality x stationarity.
     void accumulate_pending_frame(double stationarity);
 
-    SpectrogramStream spectrogram_;
-    double bin_frequency_hz_;
-    std::size_t first_bin_;
-    std::size_t last_bin_;                   ///< exclusive
-    std::vector<float> pending_magnitudes_;  ///< the frame waiting for its successor
-    double pending_similarity_to_previous_ = 0.0;
-    bool has_pending_frame_ = false;
-    std::array<double, kFineBinCount> fine_chroma_{};
-    double tonal_frame_weight_ = 0.0;
+    SpectrogramStream spectrogram_;                    ///< frames of the mono input
+    double bin_frequency_hz_;                          ///< width of one spectrum bin
+    std::size_t first_bin_;                            ///< first bin at or above kLowestFrequencyHz
+    std::size_t last_bin_;                             ///< exclusive
+    std::vector<float> pending_magnitudes_;            ///< the frame waiting for its successor
+    double pending_similarity_to_previous_ = 0.0;      ///< stationarity against the frame before it
+    bool has_pending_frame_ = false;                   ///< pending_magnitudes_ holds a frame
+    std::array<double, kFineBinCount> fine_chroma_{};  ///< accumulated weighted partial energy
+    double tonal_frame_weight_ = 0.0;                  ///< sum of the frames' tonality weights
 };
 
 }  // namespace mso::analysis

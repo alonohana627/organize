@@ -33,7 +33,7 @@ public:
     /// Applies a captured layout. Returns false for missing or foreign data, or when Qt rejects a
     /// part of it (what could be applied stays applied). Windows and floating docks that would land
     /// off every current screen are moved back.
-    static bool restore(QMainWindow& window, QHeaderView& header, const nlohmann::json& layout);
+    [[nodiscard]] static bool restore(QMainWindow& window, QHeaderView& header, const nlohmann::json& layout);
     /// Moves a top-level window (or floating dock) fully onto the nearest available screen.
     static void clamp_to_screens(QWidget& window);
 };

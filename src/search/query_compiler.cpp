@@ -1,6 +1,9 @@
 #include "mso/search/query_compiler.hpp"
 
+#include <algorithm>
 #include <format>
+#include <map>
+#include <optional>
 
 #include "mso/catalog/taxonomy_lookup.hpp"
 #include "mso/domain/taxonomy.hpp"
@@ -29,17 +32,41 @@ std::string escape_like(std::string_view text) {
 
 /// The facts of a root that `folder:` needs.
 struct RootFacts {
-    std::int64_t id = 0;
-    std::string name;
-    bool case_sensitive = false;
+    std::int64_t id = 0;          ///< root id
+    std::string name;             ///< display name
+    bool case_sensitive = false;  ///< whether its path keys keep case
 };
 
-/// Compiles one query (and, recursively, the smart collections it references) for one library.
+/// The facts of a live collection that `collection:` and the collection scope need.
+struct CollectionFacts {
+    std::int64_t id = 0;       ///< collection id
+    std::string name;          ///< display name (for error messages)
+    std::string folded_name;   ///< fold_key(name), what `collection:<name>` compares
+    bool smart = false;        ///< smart (stored query) rather than manual membership
+    std::string stored_query;  ///< smart collections: the stored query_json
+};
+
+/// Counts one more level of smart-collection nesting for as long as it lives.
+class NestingLevel {
+public:
+    /// Increments `level`; the destructor decrements it again.
+    explicit NestingLevel(int& level) : level_(level) { ++level_; }
+    ~NestingLevel() { --level_; }
+    NestingLevel(const NestingLevel&) = delete;
+    NestingLevel& operator=(const NestingLevel&) = delete;
+
+private:
+    int& level_;
+};
+
+/// Compiles one query, and every smart collection it references, for one library. One instance
+/// serves a whole expansion, so roots, collections, folder fragments and tag redirects are read or
+/// built once however many smart collections repeat them, and every nested query shares the
+/// kMaxCompiledNodes budget.
 class QueryCompiler {
 public:
-    /// `compiled_nodes` is shared by the whole expansion so nested smart collections share one budget.
-    QueryCompiler(sqlite::Connection& connection, int nesting, std::size_t& compiled_nodes)
-        : connection_(connection), nesting_(nesting), compiled_nodes_(compiled_nodes) {}
+    /// Compiles against the read connection `connection` (one snapshot).
+    explicit QueryCompiler(sqlite::Connection& connection) : connection_(connection) {}
 
     /// Compiles a whole query; the empty query compiles to "1".
     Result<SqlPredicate> compile(const Query& query) {
@@ -51,46 +78,65 @@ public:
         return predicate;
     }
 
-    /// Appends collection `id`: manual membership, or the stored query of a smart collection.
-    Result<void> compile_collection_id(std::int64_t id, SqlPredicate& out) {
-        auto lookup = connection_.prepare("SELECT name, kind, query_json FROM collections WHERE id=?1 AND deleted=0");
-        if (!lookup) return std::unexpected(lookup.error());
-        lookup->bind(1, id);
-        auto has_row = lookup->next_row();
-        if (!has_row) return std::unexpected(has_row.error());
-        if (!*has_row) {
+    /// Compiles collection `id` on its own (the collection scope).
+    Result<SqlPredicate> compile_collection(std::int64_t id) {
+        SqlPredicate predicate;
+        predicate.sql.clear();
+        if (auto compiled = append_collection(id, predicate); !compiled) return std::unexpected(compiled.error());
+        return predicate;
+    }
+
+private:
+    /// Appends collection `id`: manual membership, or the stored query of a smart collection
+    /// (compiled inline with this compiler's caches and node budget). A missing or deleted
+    /// collection matches nothing. Problems of the stored query are this library's problems
+    /// (DB_CORRUPT, RESOURCE_LIMIT), never request errors (see compile_query).
+    Result<void> append_collection(std::int64_t id, SqlPredicate& out) {
+        auto all = collections();
+        if (!all) return std::unexpected(all.error());
+        const auto found = std::ranges::find(**all, id, &CollectionFacts::id);
+        if (found == (*all)->end()) {
             out.sql += "0";
             return {};
         }
-        const std::string name = lookup->column_text(0);
-        const std::string kind = lookup->column_text(1);
-        const std::string stored_query = lookup->column_optional_text(2).value_or("");
-        lookup->reset();
-        if (kind == "manual") {
+        if (!found->smart) {
             out.sql += "EXISTS(SELECT 1 FROM collection_items ci WHERE ci.collection_id=? AND ci.sample_id=s.id)";
             out.parameters.emplace_back(id);
             return {};
         }
         if (nesting_ >= kMaxSmartCollectionNesting)
-            return fail(ErrorCode::InvalidArgument, "smart collections are nested too deeply");
-        const auto text = detail::smart_collection_text(stored_query);
-        auto parsed = text ? parse_query(*text) : Result<Query>(fail(ErrorCode::ParseError));
+            return fail(ErrorCode::ResourceLimit,
+                        std::format("smart collection '{}' nests smart collections too deeply", found->name));
+        const auto text = detail::smart_collection_text(found->stored_query);
+        auto parsed = text ? parse_query(*text) : Result<Query>(fail(ErrorCode::ParseError, "no query text"));
         if (!parsed)
-            return fail(ErrorCode::InvalidArgument, std::format("smart collection '{}' has an invalid query", name));
-        auto compiled = QueryCompiler(connection_, nesting_ + 1, compiled_nodes_).compile(*parsed);
-        if (!compiled) return std::unexpected(compiled.error());
-        out.sql += '(' + compiled->sql + ')';
-        out.parameters.insert(out.parameters.end(), compiled->parameters.begin(), compiled->parameters.end());
+            return fail(ErrorCode::DbCorrupt, std::format("smart collection '{}' has an invalid query: {}", found->name,
+                                                          parsed.error().safe_detail));
+        if (parsed->empty()) {
+            out.sql += "1";
+            return {};
+        }
+        const NestingLevel level(nesting_);
+        out.sql += '(';
+        if (auto compiled = compile_node(*parsed->root, out, false); !compiled) {
+            const Error& error = compiled.error();
+            if (error.code == ErrorCode::InvalidArgument || error.code == ErrorCode::ParseError)
+                return fail(ErrorCode::DbCorrupt, std::format("smart collection '{}' has an invalid query: {}",
+                                                              found->name, error.safe_detail));
+            return compiled;
+        }
+        out.sql += ')';
         return {};
     }
 
-private:
     /// Appends the SQL of one node. Predicates under a NOT are wrapped in COALESCE(…,0) so a
     /// predicate on an unknown (NULL) value is false and its negation true (query.hpp). Outside a
     /// NOT a NULL already rejects the row exactly like false, so those stay index-friendly.
     Result<void> compile_node(const QueryNode& node, SqlPredicate& out, bool negated) {
+        // Only smart collections can push an expansion past the budget: typed text has at most
+        // kMaxQueryNodes (256) nodes.
         if (++compiled_nodes_ > kMaxCompiledNodes)
-            return fail(ErrorCode::InvalidArgument, "the query and its smart collections expand to too many terms");
+            return fail(ErrorCode::ResourceLimit, "the query and its smart collections expand to too many terms");
         switch (node.kind) {
             case QueryNode::Kind::And:
             case QueryNode::Kind::Or: {
@@ -216,16 +262,51 @@ private:
         return fail(ErrorCode::Internal, "field is not a predicate");
     }
 
+    /// The live tags that merged tags named `name_key` redirect to: the end of each alias chain
+    /// (bounded like the catalog's canonical_tag()), cached per name. Mirrors load_tag_aliases().
+    Result<const std::vector<std::int64_t>*> redirected_tags(const std::string& name_key) {
+        if (const auto cached = redirects_.find(name_key); cached != redirects_.end()) return &cached->second;
+        auto statement = connection_.prepare(std::format(
+            "WITH RECURSIVE redirect(id,hops) AS ("
+            "SELECT a.canonical_tag_id, 1 FROM tag_aliases a JOIN tags t ON t.id=a.source_tag_id WHERE t.name_key=?1 "
+            "UNION SELECT a.canonical_tag_id, redirect.hops+1 FROM redirect "
+            "JOIN tag_aliases a ON a.source_tag_id=redirect.id WHERE redirect.hops<={0}) "
+            "SELECT DISTINCT redirect.id FROM redirect JOIN tags canonical ON canonical.id=redirect.id "
+            "WHERE canonical.deleted=0 AND redirect.id NOT IN (SELECT source_tag_id FROM tag_aliases) "
+            "ORDER BY redirect.id",
+            kMaxTaxonomyDepth));
+        if (!statement) return std::unexpected(statement.error());
+        statement->bind(1, name_key);
+        std::vector<std::int64_t> ids;
+        while (true) {
+            auto has_row = statement->next_row();
+            if (!has_row) return std::unexpected(has_row.error());
+            if (!*has_row) break;
+            ids.push_back(statement->column_int64(0));
+        }
+        return &redirects_.emplace(name_key, std::move(ids)).first->second;
+    }
+
     /// tag:/category: match the whole subtree. A single-segment value matches every live node
-    /// with that name at any depth ("tag:Kick" finds "Drums/Kick"); a path resolves from the top
-    /// (following merged tags to their canonical tag).
+    /// with that name at any depth ("tag:Kick" finds "Drums/Kick") and, for tags, every tag a
+    /// merged tag of that name redirects to; a path resolves from the top (following merged tags
+    /// to their canonical tag).
     Result<void> compile_taxonomy(const std::string& value, catalog::TaxonomyKind kind, SqlPredicate& out) {
         const bool tags = kind == catalog::TaxonomyKind::Tags;
         const std::string_view table = tags ? "tags" : "categories";
         std::string seed;
         if (value.find('/') == std::string::npos) {
+            const std::string name_key = fold_key(value);
             seed = std::format("SELECT id FROM {} WHERE deleted=0 AND name_key=?", table);
-            out.parameters.emplace_back(fold_key(value));
+            out.parameters.emplace_back(name_key);
+            if (tags) {
+                auto redirected = redirected_tags(name_key);
+                if (!redirected) return std::unexpected(redirected.error());
+                if (!(*redirected)->empty()) {
+                    seed += " UNION SELECT value FROM json_each(?)";
+                    out.parameters.emplace_back(detail::id_array_json(**redirected));
+                }
+            }
         } else {
             auto node = catalog::find_taxonomy_node(connection_, kind, value);
             if (!node) return std::unexpected(node.error());
@@ -241,7 +322,7 @@ private:
             "SELECT t.id,subtree.depth+1 FROM {1} t JOIN subtree ON t.parent_id=subtree.id WHERE subtree.depth<{2}) "
             "SELECT id FROM subtree",
             seed, table, kMaxTaxonomyDepth);
-        // The seed parameter was pushed before this text; it is the only '?' in this fragment.
+        // The seed parameters were pushed before this text; they are the only '?' in this fragment.
         out.sql +=
             tags ? std::format("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag_id IN ({}))",
                                subtree)
@@ -265,68 +346,134 @@ private:
         return &*roots_;
     }
 
+    /// Every live collection in id order, read once per compilation.
+    Result<const std::vector<CollectionFacts>*> collections() {
+        if (collections_) return &*collections_;
+        auto statement =
+            connection_.prepare("SELECT id, name, kind, query_json FROM collections WHERE deleted=0 ORDER BY id");
+        if (!statement) return std::unexpected(statement.error());
+        std::vector<CollectionFacts> facts;
+        while (true) {
+            auto has_row = statement->next_row();
+            if (!has_row) return std::unexpected(has_row.error());
+            if (!*has_row) break;
+            CollectionFacts collection;
+            collection.id = statement->column_int64(0);
+            collection.name = statement->column_text(1);
+            collection.folded_name = fold_key(collection.name);
+            collection.smart = statement->column_text(2) == "smart";
+            collection.stored_query = statement->column_optional_text(3).value_or("");
+            facts.push_back(std::move(collection));
+        }
+        collections_ = std::move(facts);
+        return &*collections_;
+    }
+
     /// folder:"Packs/Goa" matches a sample whose primary location lies under that folder of any
     /// root, under "<root name>/<folder>", or anywhere in a root of that name
-    /// (detail::match_folder_in_root, shared with the in-memory matcher).
+    /// (detail::match_folder_in_root, shared with the in-memory matcher). The location ranges are
+    /// path-key ranges of the live (root_id, path_key) index; primary_location_filter picks the
+    /// index-driven or the streaming shape by selectivity. Fragments are cached per value.
     Result<void> compile_folder(const std::string& value, SqlPredicate& out) {
+        if (const auto cached = folder_fragments_.find(value); cached != folder_fragments_.end()) {
+            out.sql += cached->second.sql;
+            out.parameters.insert(out.parameters.end(), cached->second.parameters.begin(),
+                                  cached->second.parameters.end());
+            return {};
+        }
         auto all_roots = roots();
         if (!all_roots) return std::unexpected(all_roots.error());
+        SqlPredicate fragment;
         std::string alternatives;
         for (const auto& root : **all_roots) {
             const auto match = detail::match_folder_in_root(value, root.name, root.case_sensitive);
             if (!match.whole_root && match.prefixes.empty()) continue;
             if (!alternatives.empty()) alternatives += " OR ";
             alternatives += "(fl.root_id=?";
-            out.parameters.emplace_back(root.id);
+            fragment.parameters.emplace_back(root.id);
             if (!match.whole_root) {
                 alternatives += " AND (";
                 for (std::size_t index = 0; index < match.prefixes.size(); ++index) {
                     if (index) alternatives += " OR ";
                     alternatives += "(fl.path_key>=? AND fl.path_key<?)";
-                    out.parameters.emplace_back(match.prefixes[index]);
-                    out.parameters.emplace_back(detail::prefix_upper_bound(match.prefixes[index]));
+                    fragment.parameters.emplace_back(match.prefixes[index]);
+                    fragment.parameters.emplace_back(detail::prefix_upper_bound(match.prefixes[index]));
                 }
                 alternatives += ')';
             }
             alternatives += ')';
         }
         if (alternatives.empty()) {
-            out.sql += "0";
-            return {};
+            fragment.sql = "0";
+        } else {
+            fragment.sql = std::move(alternatives);
+            auto filtered = primary_location_filter(connection_, fragment);
+            if (!filtered) return std::unexpected(filtered.error());
+            fragment = std::move(*filtered);
         }
-        out.sql += std::format("EXISTS(SELECT 1 FROM locations fl WHERE fl.id={} AND ({}))",
-                               detail::kPrimaryLocationIdSql, alternatives);
+        out.sql += fragment.sql;
+        out.parameters.insert(out.parameters.end(), fragment.parameters.begin(), fragment.parameters.end());
+        folder_fragments_.emplace(value, std::move(fragment));
         return {};
     }
 
     /// collection:Name compares folded names (Unicode case-insensitive); the oldest live
     /// collection of that name wins.
     Result<void> compile_collection_name(const std::string& value, SqlPredicate& out) {
-        auto lookup = connection_.prepare("SELECT id, name FROM collections WHERE deleted=0 ORDER BY id");
-        if (!lookup) return std::unexpected(lookup.error());
-        const std::string wanted = fold_key(value);
-        std::optional<std::int64_t> found;
-        while (!found) {
-            auto has_row = lookup->next_row();
-            if (!has_row) return std::unexpected(has_row.error());
-            if (!*has_row) break;
-            if (fold_key(lookup->column_text(1)) == wanted) found = lookup->column_int64(0);
-        }
-        lookup->reset();
-        if (!found) {
+        auto all = collections();
+        if (!all) return std::unexpected(all.error());
+        const auto found = std::ranges::find(**all, fold_key(value), &CollectionFacts::folded_name);
+        if (found == (*all)->end()) {
             out.sql += "0";
             return {};
         }
-        return compile_collection_id(*found, out);
+        return append_collection(found->id, out);
     }
 
     sqlite::Connection& connection_;
-    int nesting_;
-    std::size_t& compiled_nodes_;
+    int nesting_ = 0;                 ///< smart collections currently being expanded
+    std::size_t compiled_nodes_ = 0;  ///< nodes compiled so far, shared by the whole expansion
     std::optional<std::vector<RootFacts>> roots_;
+    std::optional<std::vector<CollectionFacts>> collections_;
+    std::map<std::string, SqlPredicate> folder_fragments_;        ///< by folder: value
+    std::map<std::string, std::vector<std::int64_t>> redirects_;  ///< by folded tag name
 };
 
 }  // namespace
+
+Result<SqlPredicate> primary_location_filter(sqlite::Connection& connection, const SqlPredicate& location_condition) {
+    // The largest sample id bounds the library size in O(log n) (ids are never reused).
+    auto largest = connection.prepare("SELECT COALESCE(max(id),0) FROM samples");
+    if (!largest) return std::unexpected(largest.error());
+    auto has_largest = largest->next_row();
+    if (!has_largest) return std::unexpected(has_largest.error());
+    const std::int64_t library_size = *has_largest ? largest->column_int64(0) : 0;
+    largest->reset();
+    const std::int64_t threshold = std::max<std::int64_t>(1, library_size / kIndexDrivenLocationShare);
+
+    // Candidate locations, counted index-only and never past the threshold.
+    auto counted = connection.prepare(
+        std::format("SELECT count(*) FROM (SELECT 1 FROM locations fl WHERE fl.state<>'retired' AND ({}) LIMIT ?)",
+                    location_condition.sql));
+    if (!counted) return std::unexpected(counted.error());
+    counted->bind(bind_parameters(*counted, location_condition.parameters, 1), threshold);
+    auto has_count = counted->next_row();
+    if (!has_count) return std::unexpected(has_count.error());
+    const std::int64_t candidates = *has_count ? counted->column_int64(0) : 0;
+    counted->reset();
+
+    SqlPredicate filter;
+    filter.parameters = location_condition.parameters;
+    if (candidates < threshold)
+        filter.sql = std::format(
+            "s.id IN (SELECT fl.sample_id FROM locations fl WHERE fl.state<>'retired' AND ({}) "
+            "AND fl.id={})",
+            location_condition.sql, detail::primary_location_id_sql("fl.sample_id"));
+    else
+        filter.sql = std::format("EXISTS(SELECT 1 FROM locations fl WHERE fl.id={} AND ({}))",
+                                 detail::primary_location_id_sql("s.id"), location_condition.sql);
+    return filter;
+}
 
 int bind_parameters(sqlite::PreparedStatement& statement, const std::vector<SqlValue>& parameters, int first) {
     int index = first;
@@ -350,18 +497,11 @@ std::string fts_expression(const TextTerm& term) {
 }
 
 Result<SqlPredicate> compile_query(const Query& query, sqlite::Connection& connection) {
-    std::size_t compiled_nodes = 0;
-    return QueryCompiler(connection, 0, compiled_nodes).compile(query);
+    return QueryCompiler(connection).compile(query);
 }
 
 Result<SqlPredicate> compile_collection(std::int64_t collection_id, sqlite::Connection& connection) {
-    std::size_t compiled_nodes = 0;
-    SqlPredicate predicate;
-    predicate.sql.clear();
-    if (auto compiled = QueryCompiler(connection, 0, compiled_nodes).compile_collection_id(collection_id, predicate);
-        !compiled)
-        return std::unexpected(compiled.error());
-    return predicate;
+    return QueryCompiler(connection).compile_collection(collection_id);
 }
 
 std::string_view availability_sql() {

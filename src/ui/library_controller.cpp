@@ -27,26 +27,28 @@ std::optional<uuids::uuid> LibraryController::choose_library(QWidget* parent,
                                                              const std::vector<app::OpenLibraryInfo>& libraries,
                                                              const QString& purpose, bool writable_only,
                                                              const std::optional<uuids::uuid>& preferred) {
-    std::vector<const app::OpenLibraryInfo*> candidates;
+    // Copies, not pointers into `libraries`: the dialog's event loop may deliver a new library list
+    // (ApplicationSession::refresh_libraries) and replace the vector the caller passed.
+    std::vector<app::OpenLibraryInfo> candidates;
     for (const auto& info : libraries)
-        if (!writable_only || !info.read_only) candidates.push_back(&info);
+        if (!writable_only || !info.read_only) candidates.push_back(info);
     if (candidates.empty()) return std::nullopt;
-    if (candidates.size() == 1) return candidates.front()->uuid;
+    if (candidates.size() == 1) return candidates.front().uuid;
 
     std::map<std::string, int> name_uses;
-    for (const auto* info : candidates)
-        ++name_uses[info->name];
+    for (const auto& info : candidates)
+        ++name_uses[info.name];
     QDialog dialog(parent);
     dialog.setWindowTitle(tr("Choose library"));
     auto* combo = new QComboBox(&dialog);
     combo->setAccessibleName(tr("Library"));
     for (std::size_t index = 0; index < candidates.size(); ++index) {
-        const auto* info = candidates[index];
-        const QString name = DisplayFormat::from_utf8(info->name);
+        const app::OpenLibraryInfo& info = candidates[index];
+        const QString name = DisplayFormat::from_utf8(info.name);
         // Two libraries may share a name; their folders tell them apart.
-        combo->addItem(name_uses[info->name] > 1 ? tr("%1 (%2)").arg(name, DisplayFormat::from_path(info->directory))
-                                                 : name);
-        if (preferred && info->uuid == *preferred) combo->setCurrentIndex(static_cast<int>(index));
+        combo->addItem(name_uses[info.name] > 1 ? tr("%1 (%2)").arg(name, DisplayFormat::from_path(info.directory))
+                                                : name);
+        if (preferred && info.uuid == *preferred) combo->setCurrentIndex(static_cast<int>(index));
     }
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
@@ -56,7 +58,7 @@ std::optional<uuids::uuid> LibraryController::choose_library(QWidget* parent,
     layout->addWidget(combo);
     layout->addWidget(buttons);
     if (dialog.exec() != QDialog::Accepted || combo->currentIndex() < 0) return std::nullopt;
-    return candidates[static_cast<std::size_t>(combo->currentIndex())]->uuid;  // by position, never by name
+    return candidates[static_cast<std::size_t>(combo->currentIndex())].uuid;  // by position, never by name
 }
 
 void LibraryController::new_library() {

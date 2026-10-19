@@ -16,6 +16,7 @@
 
 namespace mso::app {
 
+/// An exclusive advisory lock on one file, held until the object is destroyed (see the file comment).
 class FileLock {
 public:
     /// File name of the per-library lock inside a library folder.
@@ -23,10 +24,10 @@ public:
 
     /// Creates `file` when absent and locks it without waiting. DB_BUSY (retryable) when another
     /// handle holds the lock; ACCESS_DENIED or FILE_MISSING when the file cannot be opened.
-    static Result<FileLock> try_acquire(const std::filesystem::path& file);
+    [[nodiscard]] static Result<FileLock> try_acquire(const std::filesystem::path& file);
 
     /// Like try_acquire(), retrying every few milliseconds until `timeout` has elapsed.
-    static Result<FileLock> acquire(const std::filesystem::path& file, std::chrono::milliseconds timeout);
+    [[nodiscard]] static Result<FileLock> acquire(const std::filesystem::path& file, std::chrono::milliseconds timeout);
 
     FileLock() = default;
     FileLock(FileLock&&) noexcept = default;

@@ -17,19 +17,19 @@ namespace {
 
 constexpr double kLocalMeanSeconds = 0.4;          ///< moving-average window removed from the envelope
 constexpr double kMaximumLagFraction = 2.0 / 3.0;  ///< longer lags have too few overlapping frames
-constexpr double kCoarseStepBpm = 0.25;
-constexpr int kCoarseHarmonics = 4;           ///< beat lags averaged by the coarse beat comb
-constexpr int kMinimumHarmonics = 2;          ///< a tempo needs at least two beat lags, i.e. three beats
-constexpr double kRefineSpanFraction = 0.03;  ///< fine search within +-3% of the coarse winner
-constexpr double kRefineStepBpm = 0.005;
-constexpr int kRefineHarmonics = 32;
-constexpr double kPriorCenterBpm = 120.0;
-constexpr double kPriorWidthOctaves = 1.5;  ///< weak: only breaks near-ties between metrical levels
+constexpr double kCoarseStepBpm = 0.25;            ///< tempo grid of the coarse beat-comb search
+constexpr int kCoarseHarmonics = 4;                ///< beat lags averaged by the coarse beat comb
+constexpr int kMinimumHarmonics = 2;               ///< a tempo needs at least two beat lags, i.e. three beats
+constexpr double kRefineSpanFraction = 0.03;       ///< fine search within +-3% of the coarse winner
+constexpr double kRefineStepBpm = 0.005;           ///< tempo grid of the fine search
+constexpr int kRefineHarmonics = 32;               ///< beat lags averaged by the fine beat comb
+constexpr double kPriorCenterBpm = 120.0;          ///< centre of the log-normal tempo prior
+constexpr double kPriorWidthOctaves = 1.5;         ///< weak: only breaks near-ties between metrical levels
 /// Comb peaks scoring at least this fraction of the best prior-weighted comb are candidate beat
 /// levels. A dense groove (16th-note hats) makes every multiple of its tatum score almost equally,
 /// including musically implausible ones such as 4/3 or 5/4 of the beat.
 constexpr double kCandidateFraction = 0.85;
-constexpr double kOctaveFactors[] = {2.0, 3.0};
+constexpr double kOctaveFactors[] = {2.0, 3.0};  ///< faster metrical levels tried against the winner
 /// The faster tempo wins at >= 85% of the slower one's prior-weighted comb...
 constexpr double kOctaveAcceptance = 0.85;
 /// ...and only when its prior-weighted beat salience reaches 79% of the slower one's: its grid
@@ -37,11 +37,11 @@ constexpr double kOctaveAcceptance = 0.85;
 /// the accents (the 8th or 16th hats of a groove) fails, unless the prior pulls towards it, as for
 /// a half-time backbeat at 70 BPM whose 140 BPM pulse is the musically conventional reading.
 constexpr double kSalienceAcceptance = 0.79;
-constexpr double kOctaveSearchFraction = 0.02;  ///< faster tempo searched within +-2% of factor x bpm
-constexpr double kMinimumPeriodicity = 0.25;    ///< beat-comb score below which tempo is unknown
-constexpr double kTransientPeakFraction = 0.2;  ///< transient = local maximum above 20% of the largest
-constexpr double kTransientMinimumSpacingSeconds = 0.1;
-constexpr std::size_t kMinimumTransients = 3;
+constexpr double kOctaveSearchFraction = 0.02;           ///< faster tempo searched within +-2% of factor x bpm
+constexpr double kMinimumPeriodicity = 0.25;             ///< beat-comb score below which tempo is unknown
+constexpr double kTransientPeakFraction = 0.2;           ///< transient = local maximum above 20% of the largest
+constexpr double kTransientMinimumSpacingSeconds = 0.1;  ///< closer peaks count as one transient
+constexpr std::size_t kMinimumTransients = 3;            ///< fewer transients means no tempo (one-shots)
 /// Beat-grid points snap to the strongest novelty within this many frames, absorbing the drift of a
 /// coarse-grid tempo over the analysis window.
 constexpr std::size_t kGridSnapFrames = 1;
@@ -123,8 +123,8 @@ public:
     }
 
 private:
-    std::vector<double> correlation_;
-    double max_lag_ = 0.0;
+    std::vector<double> correlation_;  ///< autocorrelation by integer lag
+    double max_lag_ = 0.0;             ///< longest lag considered (kMaximumLagFraction of the envelope)
 };
 
 /// Length of one beat at `bpm`, in envelope frames.

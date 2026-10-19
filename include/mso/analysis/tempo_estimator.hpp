@@ -9,8 +9,8 @@ namespace mso::analysis {
 
 /// Tempo range reported by the estimator. A pulse outside it is reported at the octave
 /// (half or double tempo) that falls inside, never clamped.
-inline constexpr double kMinimumReportedBpm = 60.0;
-inline constexpr double kMaximumReportedBpm = 200.0;
+inline constexpr double kMinimumReportedBpm = 60.0;   ///< slowest reported tempo
+inline constexpr double kMaximumReportedBpm = 200.0;  ///< fastest reported tempo
 
 /// Estimates the tempo of an onset envelope sampled at `frame_rate` values per second.
 ///
@@ -27,6 +27,6 @@ inline constexpr double kMaximumReportedBpm = 200.0;
 /// Returns an unknown tempo (nullopt) when the envelope covers fewer than three beats, holds
 /// fewer than three distinct transients (one-shots), or when the periodicity score is below the
 /// reliability threshold (noise, ambience, sustained tones). Deterministic for a given input.
-TempoResult estimate_tempo(std::span<const float> onset_envelope, double frame_rate);
+[[nodiscard]] TempoResult estimate_tempo(std::span<const float> onset_envelope, double frame_rate);
 
 }  // namespace mso::analysis

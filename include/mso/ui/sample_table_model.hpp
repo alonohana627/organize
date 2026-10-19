@@ -10,27 +10,38 @@
 ///    page beyond that keeps only its start cursor; its rows show "Loading…" and are re-read when
 ///    they become visible again (with exponential back-off after a failure);
 ///  - every result is tagged with the query generation it was requested for; results of an
-///    obsolete generation are discarded. A new query keeps the previous rows on screen until its
+///    obsolete generation are discarded, and requests of an obsolete generation that have not
+///    started yet are skipped (stop token). A new query keeps the previous rows on screen until its
 ///    first page replaces them in one model reset (no flash of empty rows); if that first page
 ///    fails, the rows are cleared and queryFailed() says why;
+///  - every page keeps the keys of its rows (also when its row data is evicted): a re-read page
+///    must hold exactly those samples, else the result changed and the table is refreshed;
+///  - keyset cursors may return a row again on a later page when its own sort value changed
+///    across the cursor: appended and refreshed pages skip samples the table already has;
 ///  - sorting re-queries the whole result with the server-side sort;
 ///  - edits are optimistic: patch_rows()/remove_rows() change the visible copies immediately and
-///    begin_pending_edit()/end_pending_edit() keep in-place refreshes from overwriting them until
-///    the background write has been reconciled.
+///    begin_pending_edit()/end_pending_edit() keep every later read (in-place refresh, appended,
+///    re-read or refreshed page) from showing the old value until the background write has been
+///    reconciled.
 ///
-/// Catalog changes refresh only the affected rows (refresh_rows). Only a full reload re-reads the
-/// result from its start up to the anchor row (refresh), capped at 2,000 rows: a view scrolled
-/// deeper returns to that window.
+/// Catalog changes refresh only the affected rows (refresh_rows). A full reload, and any
+/// STALE_CURSOR (the result's structure changed under a cursor), runs an anchored refresh: the
+/// result is re-read from its start with fresh cursors for as many pages as the table has loaded
+/// (at least through the anchor row), keeping row data only around the anchor. The new pages
+/// replace the old ones as a layout change, so the row count, the scroll position and the
+/// selection (by key) are kept; nothing is cut back to the first pages.
 #include <QAbstractTableModel>
 #include <QDeadlineTimer>
 #include <QString>
 #include <QTimer>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <set>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -83,12 +94,18 @@ public:
     static constexpr int kPageSize = 200;
     /// Pages whose row data stays in memory (2,000 rows).
     static constexpr int kMaxHydratedPages = 10;
+    /// Pages an anchored refresh re-reads at most (500,000 rows; only their cursors are kept
+    /// outside the anchor's window). A table scrolled deeper keeps this many rows after a refresh.
+    static constexpr int kMaxRefreshPages = 2'500;
     /// First and last delay before re-reading a page whose last read failed.
     static constexpr int kMinimumRetryMilliseconds = 1'000;
     static constexpr int kMaximumRetryMilliseconds = 30'000;
+    /// Longest wait before an anchored refresh that met another structure change starts again.
+    static constexpr int kMaximumStaleRetryMilliseconds = 1'000;
 
     /// A model fed by `source`, which must outlive it.
     explicit SampleTableModel(SamplePageSource& source, QObject* parent = nullptr);
+    ~SampleTableModel() override;
 
     // ------------------------------------------------------------ QAbstractItemModel
     int rowCount(const QModelIndex& parent = {}) const override;
@@ -111,12 +128,15 @@ public:
     void run_query(const std::string& text, const NavigationScope& scope);
     /// Clears the result (no library open). No requests are made until set_query().
     void clear();
-    /// Re-reads the result after a full catalog reload. Rows stay visible until the new pages
-    /// arrive; `anchor_row` is the first row the view shows, and rows up to it are restored.
+    /// Anchored refresh (see the file comment). Rows stay visible until the new pages arrive;
+    /// `anchor_row` is the first row the view shows, and the rows around it are read first-hand.
     void refresh(int anchor_row);
     /// Re-reads the given samples in place (catalog change events); samples that no longer exist
-    /// are removed. Keys that are not loaded or have a pending optimistic edit are skipped.
-    void refresh_rows(const std::vector<SampleKey>& keys);
+    /// are removed, and a failed read is reported (queryFailed) without removing anything. Keys
+    /// that are not loaded or have a pending optimistic edit are skipped. Returns how many of
+    /// `keys` are loaded rows (the others may be new or may now match: the caller decides whether
+    /// the result window needs a re-read).
+    std::size_t refresh_rows(const std::vector<SampleKey>& keys);
 
     /// Current query text.
     const std::string& query_text() const { return text_; }
@@ -124,6 +144,7 @@ public:
     const NavigationScope& scope() const { return scope_; }
     /// Current server-side sort.
     search::SortField sort_field() const { return sort_field_; }
+    /// True when the current sort is descending.
     bool sort_descending() const { return sort_descending_; }
     /// Column showing the current sort, for the header's sort indicator.
     int sort_column() const;
@@ -140,7 +161,8 @@ public:
     void apply_rows(const std::vector<SampleKey>& requested, const std::vector<search::SampleRow>& current);
     /// Removes the loaded rows of `keys` (optimistic "remove from library").
     void remove_rows(const std::vector<SampleKey>& keys);
-    /// Marks `keys` as having an edit in flight; refresh_rows() leaves their rows alone meanwhile.
+    /// Marks `keys` as having an edit in flight. Their loaded rows (already patched) are what the
+    /// table shows until the edit ends: every later read of those samples is overlaid with them.
     void begin_pending_edit(const std::vector<SampleKey>& keys);
     /// Ends one in-flight edit of each key.
     void end_pending_edit(const std::vector<SampleKey>& keys);
@@ -156,13 +178,15 @@ public:
     std::map<SampleKey, int> rows_of(const std::vector<SampleKey>& keys) const;
     /// True while any page or count request of the current generation is outstanding.
     bool is_loading() const;
+    /// True while an anchored refresh is reading its pages.
+    bool is_refreshing() const { return refreshing_; }
 
 signals:
     /// The result size is being recounted (shown as "updating").
     void countUpdating();
     /// Exact total of the current generation; `complete` is false when a library was skipped.
     void countChanged(qint64 total, bool complete);
-    /// A page or count request failed.
+    /// A page, count or row request failed.
     void queryFailed(const QString& message);
     /// Some libraries could not be searched; empty text means every library answered.
     void coverageChanged(const QString& message);
@@ -181,14 +205,24 @@ private:
         int first_row = 0;                    ///< model row of the page's first row
         int row_count = 0;                    ///< rows the page covers, loaded or not
         std::vector<search::SampleRow> rows;  ///< empty when evicted
+        std::vector<SampleKey> keys;          ///< keys of all row_count rows, kept when evicted
         bool hydrating = false;               ///< a re-read is in flight
         int failed_reads = 0;                 ///< consecutive failed re-reads (drives the back-off)
         QDeadlineTimer retry_after;           ///< no re-read before this deadline
         std::uint64_t last_used = 0;          ///< LRU clock value of the last data() access
     };
 
+    /// One optimistic edit in flight for a sample.
+    struct PendingEdit {
+        int count = 0;                         ///< edits of the sample still in flight
+        std::optional<search::SampleRow> row;  ///< the patched row the table shows meanwhile
+    };
+
     /// Builds the search request for the current query starting at `cursor`.
     search::SearchRequest make_request(const std::optional<search::Cursor>& cursor) const;
+    /// Moves to a new result generation: deliveries of older ones are dropped and their requests
+    /// that have not started are skipped.
+    void advance_generation();
     /// Starts a new generation (query, scope or sort changed). The previous rows stay on screen
     /// until the first page of the new generation replaces them in one model reset.
     void restart();
@@ -201,6 +235,8 @@ private:
     /// Swaps the staged pages in: tail rows removed or inserted, the rest replaced as a layout change
     /// that moves persistent indexes with their samples. Announces refreshed().
     void commit_staged_pages();
+    /// Restarts an anchored refresh that met another structure change, after a short back-off.
+    void retry_stale_refresh();
     /// Cuts `pages` down to their first `rows` rows.
     static void truncate_pages(std::vector<Page>& pages, int rows);
     /// Re-reads every page data() asked for since the last call (queued, outside data()).
@@ -215,10 +251,18 @@ private:
     void evict_least_recently_used();
     /// Counts the whole result (after the first page of a generation).
     void request_count();
-    /// Reports a failed request; a stale cursor re-reads the result instead.
-    void report_failure(const Error& error);
+    /// Reports a failed request. A stale cursor runs an anchored refresh at `anchor_row` instead.
+    void report_failure(const Error& error, int anchor_row);
     /// Reports libraries that could not be searched.
     void report_coverage(const std::vector<search::LibraryCoverage>& coverage);
+    /// Removes rows whose sample is already in `seen` (adding the others to it) and fills
+    /// `page.keys`; returns the rows kept.
+    static std::vector<search::SampleRow> drop_seen_rows(std::vector<search::SampleRow> rows, std::set<SampleKey>& seen,
+                                                         std::vector<SampleKey>& keys);
+    /// Key of a row, loaded or not.
+    std::optional<SampleKey> key_at(int row) const;
+    /// Replaces rows of samples with an edit in flight by the edit's patched row.
+    void overlay_pending_edits(std::vector<search::SampleRow>& rows) const;
     /// Adjusts the outstanding-request count and emits loadingChanged() on transitions.
     void set_pending(int delta);
     /// Forgets every outstanding request (new generation).
@@ -244,32 +288,46 @@ private:
     NavigationScope scope_;
     /// Current server-side sort.
     search::SortField sort_field_ = search::SortField::Name;
+    /// True when the current sort is descending.
     bool sort_descending_ = false;
     /// A query has been set (clear() resets it).
     bool active_ = false;
 
     /// Tags every request; deliveries of older generations are dropped.
     std::uint64_t generation_ = 0;
+    /// Stopped when the generation advances (skips its requests that have not started).
+    std::stop_source generation_stop_;
     // Pages are a cache: data() (const by Qt's API) updates LRU clocks and asks for re-reads.
-    mutable std::vector<Page> pages_;
-    mutable std::set<int> wanted_pages_;  ///< evicted pages data() wants re-read
-    mutable QTimer hydration_timer_;      ///< zero-delay: re-reads start outside data()
-    mutable std::uint64_t lru_clock_ = 0;
+    mutable std::vector<Page> pages_;      ///< the result, page by page (rows of evicted pages dropped)
+    mutable std::set<int> wanted_pages_;   ///< evicted pages data() wants re-read
+    mutable QTimer hydration_timer_;       ///< zero-delay: re-reads start outside data()
+    mutable std::uint64_t lru_clock_ = 0;  ///< increments on every data() access of a page
     /// A fetchMore() page is in flight.
     bool append_pending_ = false;
     /// A new query's first page is pending; the previous rows stay visible until it arrives.
     bool replacing_ = false;
 
-    /// A full refresh is reading staged pages.
+    /// An anchored refresh is reading staged pages.
     bool refreshing_ = false;
-    /// Pages the running refresh re-reads.
-    int refresh_target_pages_ = 0;
+    /// The running refresh reads until its staged pages cover this many rows (or the result ends).
+    int refresh_target_rows_ = 0;
+    /// Staged rows in [first, last) keep their data; the others keep only their cursors.
+    int refresh_window_first_row_ = 0;
+    int refresh_window_end_row_ = 0;  ///< end (exclusive) of the hydrated window of the refresh
+    /// Anchor of the running refresh (restarted with it after a structure change).
+    int refresh_anchor_row_ = 0;
+    /// Consecutive refreshes that met a structure change before committing (drives the back-off).
+    int stale_refresh_retries_ = 0;
     /// Pages of the running refresh, swapped in at the end.
     std::vector<Page> staged_pages_;
+    /// Every sample in pages_ (de-duplicates appended pages); bounded by the rows the table covers.
+    std::set<SampleKey> seen_keys_;
+    /// Every sample in staged_pages_.
+    std::set<SampleKey> staged_keys_;
 
     /// Outstanding page and count requests of this generation.
     int pending_requests_ = 0;
-    std::map<SampleKey, int> pending_edits_;  ///< key → in-flight optimistic edits
+    std::map<SampleKey, PendingEdit> pending_edits_;  ///< samples with optimistic edits in flight
 };
 
 }  // namespace mso::ui

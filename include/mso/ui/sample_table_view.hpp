@@ -25,6 +25,7 @@ class SampleTableView final : public QTableView {
     Q_OBJECT
 
 public:
+    /// An empty table; set_sample_model() connects it.
     explicit SampleTableView(QWidget* parent = nullptr);
 
     /// Sets the model; must be a SampleTableModel.

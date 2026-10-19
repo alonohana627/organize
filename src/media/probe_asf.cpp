@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <string>
+#include <utility>
 
 #include "mso/media/detail/probe_formats.hpp"
 #include "mso/media/detail/tag_mapping.hpp"
@@ -48,8 +50,9 @@ bool guid_equals(Bytes bytes, const Guid& guid) {
     return bytes.size() == guid.size() && std::ranges::equal(bytes, guid);
 }
 
-/// Codec name for the WAVEFORMATEX tag of an ASF audio stream.
-std::string codec_for_wave_format_tag(std::uint16_t format_tag) {
+/// Codec name for the WAVEFORMATEX tag of an ASF audio stream. Linear PCM is named by its sample
+/// size (pcm_u8, pcm_s16, ...) like every other container's.
+std::string codec_for_wave_format_tag(std::uint16_t format_tag, std::int64_t bits_per_sample) {
     switch (format_tag) {
         case 0x0160:
         case 0x0161:
@@ -63,10 +66,12 @@ std::string codec_for_wave_format_tag(std::uint16_t format_tag) {
         case 0x0055:
             return "mp3";
         case 0x0001:
-            return "pcm";
+            if (auto pcm = pcm_codec_name(bits_per_sample, false, bits_per_sample <= 8)) return std::move(*pcm);
+            break;  // a PCM sample size that does not exist: an unknown codec
         default:
-            return std::format("wave_format_0x{:04x}", format_tag);  // recognised container, unknown codec
+            break;
     }
+    return std::format("wave_format_0x{:04x}", format_tag);  // recognised container, unknown codec
 }
 
 /// File Properties: play duration (100 ns units) minus the preroll (milliseconds).
@@ -100,8 +105,8 @@ Result<bool> parse_stream_properties(Bytes payload, ProbeResult& result) {
     const std::int64_t bits_per_sample = format.u16_le();
     if (!format.ok()) return fail(ErrorCode::CorruptAudio, "ASF audio stream properties are too short");
     if (auto layout = set_stream_layout(result, channels, sample_rate); !layout) return std::unexpected(layout.error());
-    result.codec = codec_for_wave_format_tag(format_tag);
-    if (result.codec == "wmalossless" || result.codec == "pcm") result.bit_depth = bits_per_sample;
+    result.codec = codec_for_wave_format_tag(format_tag, bits_per_sample);
+    if (result.codec == "wmalossless" || result.codec.starts_with("pcm_")) result.bit_depth = bits_per_sample;
     return true;
 }
 

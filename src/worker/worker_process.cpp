@@ -155,9 +155,9 @@ private:
 
 /// Whether the stages a task requested and the parts a result carries correspond: each result
 /// part is present exactly when its stage was requested, and the waveform segment names the
-/// task's output path.
+/// task's output path and holds no more bins than the task asked for.
 Result<void> validate_result_for_task(const TaskResult& result, const std::vector<analysis::Stage>& stages,
-                                      const std::string& waveform_output_path) {
+                                      const std::string& waveform_output_path, int waveform_bins) {
     const auto requested = [&](analysis::Stage stage) { return std::ranges::contains(stages, stage); };
     const auto& report = result.report;
     const bool matches = report.loudness.has_value() == requested(analysis::Stage::Loudness) &&
@@ -169,6 +169,8 @@ Result<void> validate_result_for_task(const TaskResult& result, const std::vecto
     if (!matches) return fail(ErrorCode::ParseError, "result parts do not match the requested stages");
     if (result.waveform_segment && result.waveform_segment->path != waveform_output_path)
         return fail(ErrorCode::ParseError, "waveform segment names a path the task did not ask for");
+    if (result.waveform_segment && result.waveform_segment->bins > waveform_bins)
+        return fail(ErrorCode::ParseError, "waveform segment holds more bins than the task asked for");
     return {};
 }
 
@@ -266,10 +268,11 @@ private:
     /// The task the worker currently owns, as the supervisor sent it.
     struct TaskInFlight {
         TaskFence fence;
-        std::uint64_t request_sequence = 0;  ///< sequence of the AnalyzeTask frame; outcomes echo it
-        std::vector<analysis::Stage> stages;
-        std::string waveform_output_path;
-        std::uint64_t work_units = 0;  ///< last work counter the worker reported
+        std::uint64_t request_sequence = 0;   ///< sequence of the AnalyzeTask frame; outcomes echo it
+        std::vector<analysis::Stage> stages;  ///< the stages requested, which the result must match
+        std::string waveform_output_path;     ///< the only path a waveform segment may name
+        int waveform_bins = 0;                ///< upper bound of the segment's bin count
+        std::uint64_t work_units = 0;         ///< last work counter the worker reported
         Clock::time_point last_progress_at;
         std::optional<Clock::time_point> cancel_deadline;  ///< set once a cancel was sent
         std::optional<Error> stall_failure;                ///< set when the watchdog cancelled a stall
@@ -415,8 +418,9 @@ Result<void> WorkerProcess::Session::submit(const AnalyzeTask& task) {
     // Registered before the frame can reach the worker, so an instant outcome finds its task.
     const auto sequence = send_locked(task);
     if (!sequence) return std::unexpected(sequence.error());
-    task_ = TaskInFlight{TaskFence::of(task), *sequence,    task.stages, task.waveform_output_path, 0,
-                         Clock::now(),        std::nullopt, std::nullopt};
+    task_ =
+        TaskInFlight{TaskFence::of(task), *sequence,    task.stages, task.waveform_output_path, task.waveform_bins, 0,
+                     Clock::now(),        std::nullopt, std::nullopt};
     return {};
 }
 
@@ -555,6 +559,14 @@ Result<void> WorkerProcess::Session::accept_handshake(Handshake handshake) {
         return fail(ErrorCode::ParseError, "worker heartbeat interval does not fit the supervisor's deadlines");
     }
     if (handshake.limits.concurrent_tasks < 1) return fail(ErrorCode::ParseError, "worker accepts no tasks");
+    // The supervisor sizes frames and validates tasks and results with its own constants; a worker
+    // that enforces other bounds would refuse valid tasks or produce results the supervisor rejects.
+    const WorkerLimits expected;
+    if (handshake.limits.maximum_payload_bytes != expected.maximum_payload_bytes ||
+        handshake.limits.maximum_waveform_bins != expected.maximum_waveform_bins ||
+        handshake.limits.maximum_musical_seconds != expected.maximum_musical_seconds) {
+        return fail(ErrorCode::ParseError, "worker resource limits differ from the supervisor's");
+    }
     handshake_ = std::move(handshake);
     state_changed_.notify_all();
     return {};
@@ -578,7 +590,9 @@ void WorkerProcess::Session::accept_progress(const Progress& progress) {
 Result<void> WorkerProcess::Session::accept_outcome(WorkerEvent outcome, const TaskFence& fence) {
     if (!task_ || task_->fence != fence) return {};  // stale or foreign outcome: the fence discards it
     if (const auto* result = std::get_if<TaskResult>(&outcome)) {
-        if (auto valid = validate_result_for_task(*result, task_->stages, task_->waveform_output_path); !valid)
+        if (auto valid =
+                validate_result_for_task(*result, task_->stages, task_->waveform_output_path, task_->waveform_bins);
+            !valid)
             return valid;
     }
     if (task_->stall_failure) {

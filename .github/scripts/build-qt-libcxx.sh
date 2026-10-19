@@ -10,8 +10,8 @@
 # libstdc++'s at link time. The Qt API is almost entirely Qt types, but QtConcurrent::run (used by the
 # UI) instantiates QUnhandledException(std::exception_ptr) and QFutureInterfaceBase::reportException(
 # const std::exception_ptr&), exported from libQt6Core: against a libstdc++ Qt those symbols are
-# undefined at link time. The GUI therefore needs a Qt built with the same standard library. Used by
-# CI (cached) and documented in docs/BUILDING.md for Linux developers.
+# undefined at link time. The GUI therefore needs a Qt built with the same standard library. For Linux
+# developers (docs/BUILDING.md); CI does not run it: the Linux CI job builds without the desktop app.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then

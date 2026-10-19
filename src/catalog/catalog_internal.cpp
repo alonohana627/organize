@@ -77,28 +77,6 @@ Result<void> run_statement(sqlite::Connection& connection, std::string_view sql)
     return statement->run();
 }
 
-/// Prunes the outbox to the backlog cap and flags consumers that lost envelopes as baseline-required.
-Result<void> enforce_outbox_cap(sqlite::Connection& connection) {
-    auto cutoff = connection.prepare(
-        "SELECT revision FROM (SELECT revision, sum(length(payload_json)) OVER (ORDER BY revision DESC) AS newer_bytes "
-        "FROM catalog_outbox) WHERE newer_bytes>?1 ORDER BY revision DESC LIMIT 1");
-    if (!cutoff) return std::unexpected(cutoff.error());
-    cutoff->bind(1, kMaximumOutboxBytes);
-    auto has_row = cutoff->next_row();
-    if (!has_row) return std::unexpected(has_row.error());
-    if (!*has_row) return {};
-    const std::int64_t oldest_dropped_through = cutoff->column_int64(0);
-    cutoff->reset();
-    auto prune = connection.prepare("DELETE FROM catalog_outbox WHERE revision<=?1");
-    if (!prune) return std::unexpected(prune.error());
-    prune->bind(1, oldest_dropped_through);
-    if (auto pruned = prune->run(); !pruned) return pruned;
-    auto flag = connection.prepare("UPDATE consumer_cursors SET baseline_required=1 WHERE revision<?1");
-    if (!flag) return std::unexpected(flag.error());
-    flag->bind(1, oldest_dropped_through);
-    return flag->run();
-}
-
 /// Latest valid observation of `field` for the sample's current content revision, preferring the
 /// highest-precedence source (accepted suggestion > container > analysis > filename).
 struct Candidate {
@@ -120,7 +98,7 @@ Result<std::optional<Candidate>> best_observation(sqlite::Connection& connection
     auto has_row = statement->next_row();
     if (!has_row) return std::unexpected(has_row.error());
     if (!*has_row) return std::optional<Candidate>{};
-    auto value = parse_json(statement->column_text(0));
+    auto value = json_fields::parse_json(statement->column_text(0));
     auto candidate = Candidate{std::move(value), statement->column_text(1), statement->column_optional_double(2)};
     statement->reset();
     if (candidate.value.is_discarded() || candidate.value.is_null()) return std::optional<Candidate>{};
@@ -153,6 +131,23 @@ Result<uuids::uuid> parse_stored_uuid(std::string_view text, std::string_view wh
 
 // ---------------------------------------------------------------- change tracking and outbox
 
+Result<void> enforce_outbox_cap(sqlite::Connection& connection, std::int64_t maximum_bytes) {
+    auto cutoff = connection.prepare(
+        "SELECT revision FROM (SELECT revision, sum(length(payload_json)) OVER (ORDER BY revision DESC) AS newer_bytes "
+        "FROM catalog_outbox) WHERE newer_bytes>?1 ORDER BY revision DESC LIMIT 1");
+    if (!cutoff) return std::unexpected(cutoff.error());
+    cutoff->bind(1, maximum_bytes);
+    auto has_row = cutoff->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    if (!*has_row) return {};
+    const std::int64_t oldest_dropped_through = cutoff->column_int64(0);
+    cutoff->reset();
+    auto prune = connection.prepare("DELETE FROM catalog_outbox WHERE revision<=?1");
+    if (!prune) return std::unexpected(prune.error());
+    prune->bind(1, oldest_dropped_through);
+    return prune->run();
+}
+
 Result<void> prepare_change_tracking(sqlite::Connection& connection) {
     return connection.execute_script(kChangeTrackingTables);
 }
@@ -173,7 +168,8 @@ Result<void> mark_sample_list_changed(sqlite::Connection& connection, std::span<
         "INSERT INTO temp.changed_samples(sample_id, search_text) SELECT DISTINCT value, ?2 FROM json_each(?1) "
         "WHERE type='integer' ON CONFLICT(sample_id) DO UPDATE SET search_text=max(search_text, excluded.search_text)");
     if (!mark) return std::unexpected(mark.error());
-    mark->bind(1, to_json_text(nlohmann::json(std::vector<std::int64_t>(sample_ids.begin(), sample_ids.end()))));
+    mark->bind(1,
+               json_fields::dump_json(nlohmann::json(std::vector<std::int64_t>(sample_ids.begin(), sample_ids.end()))));
     mark->bind(2, search_text_changed ? 1 : 0);
     return mark->run();
 }
@@ -239,7 +235,10 @@ Result<std::int64_t> advance_revision(sqlite::Connection& connection, const Chan
     auto insert = connection.prepare(
         "INSERT INTO catalog_outbox(revision,envelope_version,payload_json,created_at) VALUES(?1,?2,?3,?4)");
     if (!insert) return std::unexpected(insert.error());
-    insert->bind(1, revision).bind(2, kOutboxEnvelopeVersion).bind(3, to_json_text(payload)).bind(4, now_unix_ms());
+    insert->bind(1, revision)
+        .bind(2, kOutboxEnvelopeVersion)
+        .bind(3, json_fields::dump_json(payload))
+        .bind(4, now_unix_ms());
     if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
     if (auto cleared = run_statement(connection, "DELETE FROM temp.changed_samples"); !cleared)
         return std::unexpected(cleared.error());
@@ -341,7 +340,7 @@ Result<void> add_review_item(sqlite::Connection& connection, std::string_view ki
         "INSERT INTO review_items(uuid,kind,sample_id,evidence_json,state,created_at) "
         "VALUES(new_uuid(),?1,?2,?3,'open',?4)");
     if (!insert) return std::unexpected(insert.error());
-    insert->bind(1, kind).bind(2, sample_id).bind(3, to_json_text(evidence)).bind(4, now_unix_ms());
+    insert->bind(1, kind).bind(2, sample_id).bind(3, json_fields::dump_json(evidence)).bind(4, now_unix_ms());
     return insert->run();
 }
 
@@ -388,7 +387,7 @@ Result<void> recompute_effective_musical_facts(sqlite::Connection& connection, s
         auto candidate = best_observation(connection, sample_id, "bpm_milli");
         if (!candidate) return std::unexpected(candidate.error());
         if (*candidate) {
-            const auto value = json_integer((*candidate)->value);
+            const auto value = json_fields::integer_value((*candidate)->value);
             if (value && *value >= kMinimumMilliBpm && *value <= kMaximumMilliBpm &&
                 valid_confidence((*candidate)->confidence)) {
                 bpm = *value;
@@ -401,8 +400,8 @@ Result<void> recompute_effective_musical_facts(sqlite::Connection& connection, s
         auto candidate = best_observation(connection, sample_id, "key");
         if (!candidate) return std::unexpected(candidate.error());
         if (*candidate) {
-            const auto pitch_class = json_integer_member((*candidate)->value, "pitch_class");
-            const auto mode = json_string_member((*candidate)->value, "mode");
+            const auto pitch_class = json_fields::integer_field((*candidate)->value, "pitch_class");
+            const auto mode = json_fields::string_field((*candidate)->value, "mode");
             if (pitch_class && *pitch_class >= 0 && *pitch_class <= 11 && mode && parse_key_mode(*mode) &&
                 valid_confidence((*candidate)->confidence)) {
                 key_class = *pitch_class;
@@ -427,7 +426,8 @@ Result<void> recompute_effective_musical_facts(sqlite::Connection& connection, s
 Result<void> block_unreachable_jobs(sqlite::Connection& connection, std::int64_t root_id) {
     auto block = connection.prepare(std::format(
         "UPDATE jobs SET state='blocked', error_code='SOURCE_OFFLINE', lease_expires_at=NULL "
-        "WHERE state='queued' AND sample_id IN (SELECT sample_id FROM locations WHERE root_id=?1) AND NOT {}",
+        "WHERE state IN ('queued','interrupted') AND sample_id IN (SELECT sample_id FROM locations WHERE root_id=?1) "
+        "AND NOT {}",
         kJobSampleReachableSql));
     if (!block) return std::unexpected(block.error());
     block->bind(1, root_id);
@@ -435,10 +435,12 @@ Result<void> block_unreachable_jobs(sqlite::Connection& connection, std::int64_t
 }
 
 Result<void> unblock_reachable_jobs(sqlite::Connection& connection, std::int64_t root_id) {
-    auto unblock = connection.prepare(
-        std::format("UPDATE jobs SET state='queued', error_code=NULL, lease_expires_at=NULL WHERE state='blocked' "
-                    "AND sample_id IN (SELECT sample_id FROM locations WHERE root_id=?1 AND state='present') AND {}",
-                    kJobSampleReachableSql));
+    // A job of a paused run returns as `paused` (Resume queues it), never into the lease index.
+    auto unblock = connection.prepare(std::format(
+        "UPDATE jobs SET state=CASE WHEN (SELECT run.state FROM analysis_runs run WHERE run.id=jobs.run_id)='paused' "
+        "THEN 'paused' ELSE 'queued' END, error_code=NULL, lease_expires_at=NULL WHERE state='blocked' "
+        "AND sample_id IN (SELECT sample_id FROM locations WHERE root_id=?1 AND state='present') AND {}",
+        kJobSampleReachableSql));
     if (!unblock) return std::unexpected(unblock.error());
     unblock->bind(1, root_id);
     return unblock->run();

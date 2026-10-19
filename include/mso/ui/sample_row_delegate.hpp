@@ -19,6 +19,7 @@ class SampleRowDelegate final : public QStyledItemDelegate {
     Q_OBJECT
 
 public:
+    /// Paints the rows of `view`, which owns it.
     explicit SampleRowDelegate(SampleTableView& view);
 
     void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override;

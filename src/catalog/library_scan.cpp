@@ -61,11 +61,11 @@ Result<bool> root_case_sensitivity(sqlite::Connection& connection, std::int64_t 
     return case_sensitive;
 }
 
-/// Reads, on a reader connection, the old paths of every possible same-volume rename in the batch
-/// and asks `path_exists` about each one, so no filesystem probe runs while the writer is held.
-Result<ProbedPaths> probe_relink_candidates(sqlite::Connection& reader, std::int64_t root_id, bool case_sensitive,
-                                            std::span<const ScannedFile> files,
-                                            const Library::PathExistsProbe& path_exists) {
+/// Reads, on a reader connection, the old paths of every possible same-volume rename in the batch.
+/// The caller probes them after returning the reader (probe_paths), so no filesystem probe runs while
+/// a reader snapshot or the writer is held.
+Result<std::vector<std::string>> relink_candidate_paths(sqlite::Connection& reader, std::int64_t root_id,
+                                                        bool case_sensitive, std::span<const ScannedFile> files) {
     sqlite::ReadTransaction snapshot(reader);
     if (auto began = snapshot.begin(); !began) return std::unexpected(began.error());
     auto statement = reader.prepare(
@@ -80,12 +80,14 @@ Result<ProbedPaths> probe_relink_candidates(sqlite::Connection& reader, std::int
         auto walked = detail::for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
             old_paths.push_back(row.column_text(0));
             return {};
-        });
+        });  // for_each_row resets the statement, so the next file rebinds it
         if (!walked) return std::unexpected(walked.error());
-        // for_each_row leaves a finished statement un-reset; binding the next file's values to it
-        // would fail with SQLITE_MISUSE ("bind parameter 1").
-        statement->reset();
     }
+    return old_paths;
+}
+
+/// Asks `path_exists` once about each distinct old path.
+ProbedPaths probe_paths(std::vector<std::string> old_paths, const Library::PathExistsProbe& path_exists) {
     ProbedPaths probed;
     for (auto& old_path : old_paths) {
         if (probed.contains(old_path)) continue;
@@ -125,6 +127,7 @@ private:
         std::optional<std::int64_t> mtime_ns;
         std::optional<std::string> file_id;
         std::string state;
+        std::string relative_path;  ///< stored spelling (may differ in case on a case-insensitive root)
     };
 
     std::string key_of(std::string_view relative_path) const { return mso::path_key(relative_path, case_sensitive_); }
@@ -143,16 +146,20 @@ private:
 
     Result<std::optional<ExistingLocation>> find_location_by_path(const std::string& path_key) {
         auto statement = connection_.prepare(
-            "SELECT id, sample_id, byte_size, mtime_ns, file_id, state FROM locations "
+            "SELECT id, sample_id, byte_size, mtime_ns, file_id, state, relative_path FROM locations "
             "WHERE root_id=?1 AND path_key=?2 AND state<>'retired'");
         if (!statement) return std::unexpected(statement.error());
         statement->bind(1, session_.root_id).bind(2, path_key);
         auto has_row = statement->next_row();
         if (!has_row) return std::unexpected(has_row.error());
         if (!*has_row) return std::optional<ExistingLocation>{};
-        ExistingLocation location{statement->column_int64(0),          statement->column_int64(1),
-                                  statement->column_optional_int64(2), statement->column_optional_int64(3),
-                                  file_id_text(*statement, 4),         statement->column_text(5)};
+        ExistingLocation location{statement->column_int64(0),
+                                  statement->column_int64(1),
+                                  statement->column_optional_int64(2),
+                                  statement->column_optional_int64(3),
+                                  file_id_text(*statement, 4),
+                                  statement->column_text(5),
+                                  statement->column_text(6)};
         statement->reset();
         return std::optional<ExistingLocation>(std::move(location));
     }
@@ -164,9 +171,13 @@ private:
     }
 
     /// Same path seen again: unchanged, or content possibly changed (revision bump + invalidation).
+    /// On a case-insensitive root the same key may arrive in a new spelling (a case-only rename):
+    /// the stored path and its folder follow the spelling on disk.
     Result<void> update_existing(const ExistingLocation& existing, const ScannedFile& file) {
         const bool identity_changed = existing.file_id && file.file_id && *existing.file_id != *file.file_id;
         const bool stat_changed = existing.byte_size != file.byte_size || existing.mtime_ns != file.mtime_ns;
+        if (existing.relative_path != file.relative_path)
+            if (auto respelled = respell_location(existing, file.relative_path); !respelled) return respelled;
         if (auto updated = write_location_observation(existing.id, file, std::nullopt); !updated) return updated;
         if (existing.state != "present")  // a missing/unknown file is back: its row's availability changed
             if (auto marked = detail::mark_sample_changed(connection_, existing.sample_id, false); !marked)
@@ -178,6 +189,17 @@ private:
         if (auto changed = record_content_change(existing.sample_id, file, identity_changed); !changed) return changed;
         ++outcome_.updated;
         return {};
+    }
+
+    /// Stores a case-only rename of a location on a case-insensitive root (same path key).
+    Result<void> respell_location(const ExistingLocation& existing, const std::string& relative_path) {
+        auto folder_id = ensure_folder(directory_of(relative_path));
+        if (!folder_id) return std::unexpected(folder_id.error());
+        auto respell = connection_.prepare("UPDATE locations SET relative_path=?2, folder_id=?3 WHERE id=?1");
+        if (!respell) return std::unexpected(respell.error());
+        respell->bind(1, existing.id).bind(2, relative_path).bind(3, *folder_id);
+        if (auto updated = respell->run(); !updated) return updated;
+        return detail::mark_sample_changed(connection_, existing.sample_id, /*search_text_changed=*/true);
     }
 
     /// A same-volume rename: exactly one location with this volume + file ID whose old path is gone.
@@ -307,14 +329,18 @@ private:
         auto folder_id = ensure_folder(directory_of(file.relative_path));
         if (!folder_id) return std::unexpected(folder_id.error());
         auto location = connection_.prepare(
-            "INSERT INTO locations(sample_id,root_id,folder_id,relative_path,path_key,state,observed_content_revision) "
-            "VALUES(?1,?2,?3,?4,?5,'present',1)");
+            "INSERT INTO locations(sample_id,root_id,folder_id,relative_path,path_key,state,observed_content_revision,"
+            "byte_size,mtime_ns,observed_volume_id,file_id,seen_scan_generation,last_seen_at) "
+            "VALUES(?1,?2,?3,?4,?5,'present',1,?6,?7,?8,?9,?10,?11)");
         if (!location) return std::unexpected(location.error());
         location->bind(1, sample_id).bind(2, session_.root_id).bind(3, *folder_id).bind(4, file.relative_path);
-        location->bind(5, path_key);
+        location->bind(5, path_key).bind(6, file.byte_size).bind(7, file.mtime_ns).bind(8, file.volume_id);
+        if (file.file_id)
+            location->bind_blob(9, file.file_id->data(), file.file_id->size());
+        else
+            location->bind_null(9);
+        location->bind(10, session_.generation).bind(11, now);
         if (auto inserted = location->run(); !inserted) return inserted;
-        if (auto observed = write_location_observation(connection_.last_insert_rowid(), file, 1); !observed)
-            return observed;
 
         if (auto technical = write_effective_metadata(sample_id, 1, file, /*insert=*/true); !technical)
             return technical;
@@ -389,7 +415,7 @@ private:
         if (!insert) return std::unexpected(insert.error());
         auto observe = [&](std::string_view field, const nlohmann::json& value,
                            std::string_view source) -> Result<void> {
-            insert->bind(1, sample_id).bind(2, revision).bind(3, field).bind(4, detail::to_json_text(value));
+            insert->bind(1, sample_id).bind(2, revision).bind(3, field).bind(4, json_fields::dump_json(value));
             insert->bind(5, source).bind(6, now_unix_ms());
             return insert->run();
         };
@@ -415,23 +441,44 @@ private:
         return {};
     }
 
-    /// Ensures folder rows exist for a directory and all its ancestors; returns the leaf id.
+    /// Ensures folder rows exist for a directory and all its ancestors; returns the leaf id (nullopt
+    /// for the root itself). Iterative: walks up to the nearest known ancestor, then creates or
+    /// respells downwards, so a very deep tree cannot exhaust the importer thread's stack.
     Result<std::optional<std::int64_t>> ensure_folder(std::string_view relative_directory) {
-        if (relative_directory.empty()) return std::optional<std::int64_t>{};
-        const std::string key = key_of(relative_directory);
-        if (const auto cached = folder_cache_.find(key); cached != folder_cache_.end())
-            return std::optional<std::int64_t>(cached->second);
+        struct PendingFolder {
+            std::string_view relative_directory;
+            std::string key;
+        };
+        std::vector<PendingFolder> pending;  // leaf first
+        std::optional<std::int64_t> parent;
+        for (auto directory = relative_directory; !directory.empty(); directory = directory_of(directory)) {
+            std::string key = key_of(directory);
+            if (const auto cached = folder_cache_.find(key); cached != folder_cache_.end()) {
+                parent = cached->second;
+                break;
+            }
+            pending.push_back({directory, std::move(key)});
+        }
+        for (auto folder = pending.rbegin(); folder != pending.rend(); ++folder) {
+            auto id = find_or_create_folder(folder->relative_directory, folder->key, parent);
+            if (!id) return std::unexpected(id.error());
+            folder_cache_.emplace(std::move(folder->key), *id);
+            parent = *id;
+        }
+        return parent;
+    }
 
-        auto parent = ensure_folder(directory_of(relative_directory));
-        if (!parent) return std::unexpected(parent.error());
+    /// The folder row of one directory whose parent row is `parent_id`: found (and respelled when
+    /// its case changed on a case-insensitive root) or created.
+    Result<std::int64_t> find_or_create_folder(std::string_view relative_directory, const std::string& key,
+                                               std::optional<std::int64_t> parent_id) {
         auto find = connection_.prepare("SELECT id, relative_path FROM folders WHERE root_id=?1 AND path_key=?2");
         if (!find) return std::unexpected(find.error());
         find->bind(1, session_.root_id).bind(2, key);
         auto found = find->next_row();
         if (!found) return std::unexpected(found.error());
-        std::int64_t id = 0;
         if (*found) {
-            id = find->column_int64(0);
+            const std::int64_t id = find->column_int64(0);
             const bool respelled = find->column_text(1) != relative_directory;  // case change on a folded root
             find->reset();
             if (respelled) {
@@ -441,18 +488,16 @@ private:
                 if (auto renamed = rename->run(); !renamed) return std::unexpected(renamed.error());
                 structure_changed_ = true;
             }
-        } else {
-            find->reset();
-            auto insert = connection_.prepare(
-                "INSERT INTO folders(root_id,parent_id,relative_path,path_key) VALUES(?1,?2,?3,?4)");
-            if (!insert) return std::unexpected(insert.error());
-            insert->bind(1, session_.root_id).bind(2, *parent).bind(3, relative_directory).bind(4, key);
-            if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
-            id = connection_.last_insert_rowid();
-            structure_changed_ = true;
+            return id;
         }
-        folder_cache_.emplace(key, id);
-        return std::optional<std::int64_t>(id);
+        find->reset();
+        auto insert =
+            connection_.prepare("INSERT INTO folders(root_id,parent_id,relative_path,path_key) VALUES(?1,?2,?3,?4)");
+        if (!insert) return std::unexpected(insert.error());
+        insert->bind(1, session_.root_id).bind(2, parent_id).bind(3, relative_directory).bind(4, key);
+        if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
+        structure_changed_ = true;
+        return connection_.last_insert_rowid();
     }
 
     sqlite::Connection& connection_;
@@ -597,7 +642,16 @@ Result<ScanSession> Library::begin_scan(std::int64_t root_id) {
     if (auto began = transaction.begin(); !began) return std::unexpected(began.error());
     if (auto exists = root_case_sensitivity(writer_, root_id); !exists) return std::unexpected(exists.error());
 
-    // Resume an interrupted scan of this root so its completed directories are not redone.
+    // An interrupted scan that is too old to trust is abandoned: the directories it completed may
+    // have changed since, so a fresh scan visits everything again.
+    auto abandon = writer_.prepare(
+        "UPDATE scan_sessions SET state='cancelled' WHERE root_id=?1 AND state IN ('paused','running') "
+        "AND started_at<?2");
+    if (!abandon) return std::unexpected(abandon.error());
+    abandon->bind(1, root_id).bind(2, now_unix_ms() - std::chrono::milliseconds(kMaximumScanResumeAge).count());
+    if (auto abandoned = abandon->run(); !abandoned) return std::unexpected(abandoned.error());
+
+    // Resume a recently interrupted scan of this root so its completed directories are not redone.
     auto paused = writer_.prepare(
         "SELECT id, generation FROM scan_sessions WHERE root_id=?1 AND state IN ('paused','running') "
         "ORDER BY generation DESC LIMIT 1");
@@ -660,8 +714,9 @@ Result<ScanBatchOutcome> Library::commit_scan_batch(const ScanSession& session, 
         return fail(ErrorCode::InvalidArgument,
                     std::format("a scan batch holds at most {} files (got {})", kMaximumScanBatchFiles, files.size()));
 
-    // Filesystem probes for possible renames run first, on a reader, without the writer held.
-    ProbedPaths probed_paths;
+    // Old paths of possible renames are read on a reader, then probed on disk with neither the
+    // reader nor the writer held.
+    std::vector<std::string> old_paths;
     bool case_sensitive = false;
     {
         auto reader = acquire_reader();
@@ -669,11 +724,11 @@ Result<ScanBatchOutcome> Library::commit_scan_batch(const ScanSession& session, 
         auto sensitivity = root_case_sensitivity(reader->connection(), session.root_id);
         if (!sensitivity) return std::unexpected(sensitivity.error());
         case_sensitive = *sensitivity;
-        auto probed =
-            probe_relink_candidates(reader->connection(), session.root_id, case_sensitive, files, path_exists);
-        if (!probed) return std::unexpected(probed.error());
-        probed_paths = std::move(*probed);
+        auto candidates = relink_candidate_paths(reader->connection(), session.root_id, case_sensitive, files);
+        if (!candidates) return std::unexpected(candidates.error());
+        old_paths = std::move(*candidates);
     }
+    const ProbedPaths probed_paths = probe_paths(std::move(old_paths), path_exists);
 
     const std::lock_guard lock(writer_mutex_);
     sqlite::WriteTransaction transaction(writer_);
@@ -700,14 +755,64 @@ Result<ScanBatchOutcome> Library::commit_scan_batch(const ScanSession& session, 
     return outcome;
 }
 
+Result<void> Library::mark_scan_entries_seen(const ScanSession& session, std::span<const std::string> relative_paths) {
+    if (auto writable = ensure_writable(); !writable) return writable;
+    if (relative_paths.size() > kMaximumScanBatchFiles)
+        return fail(ErrorCode::InvalidArgument, std::format("at most {} skipped entries per call (got {})",
+                                                            kMaximumScanBatchFiles, relative_paths.size()));
+    if (relative_paths.empty()) return {};
+    const std::lock_guard lock(writer_mutex_);
+    sqlite::WriteTransaction transaction(writer_);
+    if (auto began = transaction.begin(); !began) return began;
+    auto case_sensitive = root_case_sensitivity(writer_, session.root_id);
+    if (!case_sensitive) return std::unexpected(case_sensitive.error());
+
+    // Only the scan bookkeeping changes (stats stay as they were). A location that an earlier scan
+    // marked missing exists again, but nothing about its bytes was verified: it becomes `unknown`.
+    auto revive = writer_.prepare(
+        "UPDATE locations SET state='unknown', seen_scan_generation=?3, last_seen_at=?4 "
+        "WHERE root_id=?1 AND path_key=?2 AND state='missing' RETURNING sample_id");
+    auto mark = writer_.prepare(
+        "UPDATE locations SET seen_scan_generation=?3, last_seen_at=?4 "
+        "WHERE root_id=?1 AND path_key=?2 AND state<>'retired'");
+    if (!revive) return std::unexpected(revive.error());
+    if (!mark) return std::unexpected(mark.error());
+    std::vector<std::int64_t> revived_samples;
+    const auto now = now_unix_ms();
+    for (const auto& relative_path : relative_paths) {
+        const std::string path_key = mso::path_key(relative_path, *case_sensitive);
+        revive->bind(1, session.root_id).bind(2, path_key).bind(3, session.generation).bind(4, now);
+        auto walked = detail::for_each_row(*revive, [&](sqlite::PreparedStatement& row) -> Result<void> {
+            revived_samples.push_back(row.column_int64(0));
+            return {};
+        });
+        if (!walked) return walked;
+        mark->bind(1, session.root_id).bind(2, path_key).bind(3, session.generation).bind(4, now);
+        if (auto marked = mark->run(); !marked) return marked;
+    }
+    if (revived_samples.empty()) return transaction.commit();  // bookkeeping only: no catalog revision
+
+    if (auto marked = detail::mark_sample_list_changed(writer_, revived_samples, false); !marked) return marked;
+    auto revision = detail::advance_revision(
+        writer_, {.kind = "scan_seen", .structure_changed = true, .details = {{"root_id", session.root_id}}});
+    if (!revision) return std::unexpected(revision.error());
+    return commit_revision(transaction, *revision);
+}
+
 Result<void> Library::record_scan_gap(const ScanSession& session, std::string_view relative_directory, bool denied) {
     if (auto writable = ensure_writable(); !writable) return writable;
     const std::lock_guard lock(writer_mutex_);
+    auto case_sensitive = root_case_sensitivity(writer_, session.root_id);
+    if (!case_sensitive) return std::unexpected(case_sensitive.error());
+    // The key lets finish_scan match the subtree by path key, so on a case-insensitive root a gap
+    // spelled in another case still protects the locations below it.
     auto statement = writer_.prepare(
-        "INSERT INTO scan_frontier(scan_id,relative_directory,state) VALUES(?1,?2,?3) "
-        "ON CONFLICT(scan_id,relative_directory) DO UPDATE SET state=excluded.state");
+        "INSERT INTO scan_frontier(scan_id,relative_directory,state,directory_key) VALUES(?1,?2,?3,?4) "
+        "ON CONFLICT(scan_id,relative_directory) DO UPDATE SET state=excluded.state, "
+        "directory_key=excluded.directory_key");
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, session.id).bind(2, relative_directory).bind(3, denied ? "denied" : "failed");
+    statement->bind(4, mso::path_key(relative_directory, *case_sensitive));
     return statement->run();
 }
 
@@ -726,8 +831,9 @@ Result<ScanFinishOutcome> Library::finish_scan(const ScanSession& session, bool 
         pause->bind(1, session.id);
         if (auto paused = pause->run(); !paused) return std::unexpected(paused.error());
     } else {
-        auto gaps =
-            writer_.prepare("SELECT count(*) FROM scan_frontier WHERE scan_id=?1 AND state IN ('denied','failed')");
+        auto gaps = writer_.prepare(
+            "SELECT count(*) FROM scan_frontier INDEXED BY scan_frontier_state WHERE scan_id=?1 "
+            "AND state IN ('denied','failed')");
         if (!gaps) return std::unexpected(gaps.error());
         gaps->bind(1, session.id);
         auto has_gaps = gaps->next_row();
@@ -736,28 +842,53 @@ Result<ScanFinishOutcome> Library::finish_scan(const ScanSession& session, bool 
         gaps->reset();
 
         // Unseen locations become missing, except inside subtrees that could not be enumerated:
-        // those are unknown, not empty. Prefixes are compared exactly (no LIKE: '_' and '%' are
-        // common in sample names).
+        // those are unknown, not empty. Prefixes are compared exactly on path keys (no LIKE: '_' and
+        // '%' are common in sample names); gap rows from before migration 6 have no key and compare
+        // their spelling. Without gaps the subquery is left out, and with gaps it finds them through
+        // scan_frontier_state instead of reading every frontier row per unseen location.
         constexpr std::string_view kUnseenCondition =
             "location.root_id=?1 AND location.state IN ('present','changed','unknown') "
-            "AND location.seen_scan_generation<?2 AND NOT EXISTS (SELECT 1 FROM scan_frontier gap "
+            "AND location.seen_scan_generation<?2";
+        constexpr std::string_view kOutsideGapsCondition =
+            " AND NOT EXISTS (SELECT 1 FROM scan_frontier gap INDEXED BY scan_frontier_state "
             "WHERE gap.scan_id=?3 AND gap.state IN ('denied','failed') AND (gap.relative_directory='' OR "
-            "substr(location.relative_path, 1, length(gap.relative_directory)+1)=gap.relative_directory || '/'))";
-        const std::int64_t parameters[] = {session.root_id, session.generation, session.id};
+            "(gap.directory_key IS NOT NULL AND substr(location.path_key, 1, length(gap.directory_key)+1)="
+            "gap.directory_key || '/') OR (gap.directory_key IS NULL AND "
+            "substr(location.relative_path, 1, length(gap.relative_directory)+1)=gap.relative_directory || '/')))";
+        const std::string condition = outcome.complete_coverage
+                                          ? std::string(kUnseenCondition)
+                                          : std::format("{}{}", kUnseenCondition, kOutsideGapsCondition);
+        const std::int64_t all_parameters[] = {session.root_id, session.generation, session.id};
+        const auto parameters = std::span<const std::int64_t>(all_parameters).first(outcome.complete_coverage ? 2 : 3);
         if (auto marked = detail::mark_samples_changed(
                 writer_,
-                std::format("SELECT location.sample_id AS sample_id FROM locations location WHERE {}",
-                            kUnseenCondition),
+                std::format("SELECT location.sample_id AS sample_id FROM locations location WHERE {}", condition),
                 parameters, false);
             !marked)
             return std::unexpected(marked.error());
         auto mark =
-            writer_.prepare(std::format("UPDATE locations AS location SET state='missing' WHERE {}", kUnseenCondition));
+            writer_.prepare(std::format("UPDATE locations AS location SET state='missing' WHERE {}", condition));
         if (!mark) return std::unexpected(mark.error());
-        mark->bind(1, session.root_id).bind(2, session.generation).bind(3, session.id);
+        for (std::size_t index = 0; index < parameters.size(); ++index)
+            mark->bind(static_cast<int>(index) + 1, parameters[index]);
         if (auto marked = mark->run(); !marked) return std::unexpected(marked.error());
         outcome.marked_missing = writer_.changed_row_count();
         structure_changed = outcome.marked_missing > 0;
+
+        // Folders left without any location (every file moved away by a rename) and without
+        // subfolders are removed, innermost first; a folder that still holds missing files stays.
+        auto prune = writer_.prepare(
+            "DELETE FROM folders WHERE root_id=?1 "
+            "AND NOT EXISTS(SELECT 1 FROM locations location WHERE location.folder_id=folders.id) "
+            "AND NOT EXISTS(SELECT 1 FROM folders child WHERE child.root_id=?1 AND child.parent_id=folders.id)");
+        if (!prune) return std::unexpected(prune.error());
+        while (true) {
+            prune->bind(1, session.root_id);
+            if (auto pruned = prune->run(); !pruned) return std::unexpected(pruned.error());
+            if (writer_.changed_row_count() == 0) break;
+            outcome.removed_empty_folders += writer_.changed_row_count();
+            structure_changed = true;
+        }
 
         auto complete = writer_.prepare("UPDATE scan_sessions SET state='completed', complete_coverage=?2 WHERE id=?1");
         if (!complete) return std::unexpected(complete.error());

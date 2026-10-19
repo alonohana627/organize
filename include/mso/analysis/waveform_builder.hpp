@@ -35,7 +35,7 @@ public:
     /// Snapshot of the overview. `complete` marks a fully decoded stream, in which case
     /// total_frames equals frames_covered; otherwise total_frames is the exact count when it is
     /// not below the covered count, or 0 (unknown).
-    WaveformOverview overview(bool complete) const;
+    [[nodiscard]] WaveformOverview overview(bool complete) const;
 
 private:
     /// Running statistics of one bin.

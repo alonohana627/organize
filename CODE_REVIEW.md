@@ -1,1073 +1,786 @@
-# Code review: Music Sample Organizer
+# Code review: Music Sample Organizer (third review)
 
-**Reviewed:** 2026-10-19, working tree of branch `phase/p1-browser` (the code is almost entirely uncommitted;
-another session was editing it during the review, so line numbers can drift by a few lines).
-**Scope:** every file under `include/`, `src/`, `tests/`, plus `CMakeLists.txt`, `CMakePresets.json`,
-`cmake/`, `deps/` (manifest, `update_deps.py`, CMake), `patches/`, `.github/workflows/ci.yml`, and the docs
-(`README.md`, `docs/BUILDING.md`, `deps/README.md`, `IMPLEMENTATION_STATUS.md`, `SKILLS/`). About 35,000
-lines of project code and tests.
-**Method:** read-only. Nothing was built or run. Each module was read in full by a dedicated reviewer.
-Findings were checked against the code, and every Critical and High finding marked ✔ was re-checked by
-hand against the source before it went into this report. "Possible" means the reasoning is sound but the
-behaviour was not reproduced.
-**Yardstick:** the owner's binding rules in `AGENTS.md` (libraries over hand-rolled code, patches for
-vendored changes, clear names, `///` docs, header layout, tests for every component, Linux-ready platform
-isolation, docs kept current) and the product invariants 9–16, plus general correctness, concurrency, error
-handling, SQLite usage, performance, CMake/CI quality and UI code.
+**Reviewed:** 2026-10-19, the **working tree** of `phase/p1-browser`: the uncommitted fix round for
+the second review, on top of commit `6b5f1d4`. Another session was still finishing the round
+(`tests/test_support_tests.cpp` changed during the review), so a few line numbers may drift.
+
+**Scope:** every file changed since `6b5f1d4` and every new file, read in full together with the
+callers and tests of each changed function. That is about 12,200 lines added and 5,250 removed in
+240 files once line-ending-only changes are ignored. It includes the new `tests/fuzz/`,
+`tools/run_fuzzers.py`, `patches/miniaudio/`, `cmake/InstallThirdPartyLicenses.cmake`, the output
+supervisor, the new UI controllers, `domain/json_fields` and `media/native_file`.
+
+**Method:**
+- Read-only. Nine reviewers each took one slice. Every Critical, High and Medium from the second review
+  was re-checked and given a status. Every new High was re-opened and traced by hand before it went
+  into this report ("verified").
+- "Possible" means the reasoning is sound but the behaviour was not reproduced.
+- Measured in a scratch copy, not in the repo:
+  - catalog query plans: a schema built from the working-tree migrations, run in Python's SQLite 3.50.4
+    with 100k rows;
+  - one libc++ `exists()` probe;
+  - the stb_vorbis patch, applied to the `6b5f1d4` file.
+- Read from existing logs:
+  - `build/integ-asan/Testing/Temporary/LastTest.log` (Windows ASan + UBSan, Debug, GUI on: 17/17
+    CTest entries passed);
+  - `build/agent-infra-fuzz/run3.log` (11/11 fuzz targets clean).
+
+**Scope rules from the owner (2026-10-19):**
+- Windows only. Linux and POSIX items are listed once in §8 as deferred.
+- The app runs on heavy workstations, so stability (no crashes on bad files, no hangs, no data loss),
+  bug catching and **performance** come first.
+- Security hardening is not a priority. Findings that only matter against an attacker are dropped,
+  for example lock-file tampering. A crash on a malformed file is still a stability finding.
+
+**Yardstick:** the rules in `AGENTS.md` and the deviations documented in `IMPLEMENTATION_STATUS.md`,
+plus memory safety, performance (a hot-path finding is rated one level higher), standard conformance,
+readability and ease of change.
 
 ---
 
 ## 1. Summary
 
-**Overall: 6.5 / 10.** The architecture is good and in places excellent: a clean `Result<>`-based error
-model, bound parameters everywhere (no SQL or FTS5 injection path found), an RAII SQLite layer with a
-statement cache and `BEGIN IMMEDIATE` retry, a real-time-safe audio callback, a hardened worker process
-(job object, `close_range`, strict protocol), bounded probes with checked arithmetic, and a properly paged
-Qt table model. The codebase-wide hygiene scan is close to spotless: no TODOs, no C-style casts, no
-`catch (...)`, no `sprintf`, no `std::regex`, every header has `#pragma once`, and the header layout rule
-holds everywhere.
+**Overall: 8.5 / 10.** That is up from 7.5 in the second review and 6.5 in the first.
 
-What keeps it from 10/10 is a set of real bugs on the paths users hit most (closing a library, refreshing
-the table during import and analysis, an offline drive, re-opening a library), a Linux build that cannot
-compile today, CI that has never run and would fail on both platforms, and uneven doc comments and tests
-(the CLI has no tests at all, and about 12 UI components have none).
+### What the fix round achieved
 
-### Fix first (the ten that matter most)
+- **Every second-review Critical and High is fixed, with a test.** That covers the CLI use-after-free,
+  the stb_vorbis overflow (a recorded, digest-pinned patch), the navigator menu use-after-free, skipped
+  entries becoming missing, the lease query, keyset index cursors, anchored refresh, `folder:` matching
+  cost and the false Linux CI claims. Almost every Medium is fixed too.
+- **Bug catching is now real on Windows:**
+  - the `sanitize` preset passes 17/17 under ASan + UBSan, and its first run caught the CLI bug;
+  - eleven libFuzzer targets cover every untrusted-input parser, and they already found and fixed four
+    stb_vorbis defects;
+  - CI has Windows `ci-debug`, `ci-sanitize` and a time-boxed fuzz job;
+  - 250 of 252 header Result APIs are `[[nodiscard]]`.
+- **The SampleIndex is bounded and correct:** a 1M-row cap with fallback to SQLite, a recorded memory
+  deviation, compact rows, and keyset cursors resumed per stream.
+- **Analysis, worker, search, domain and dependencies** are at 9 or above.
+
+### What keeps it from 9
+
+- **Two new Highs, both performance or stability on common Windows paths:**
+  - **Scans of OneDrive or link-heavy folders:** the new skip handling reads every location in the
+    root once per skipped file (measured at 3.5 ms per path at 100k locations, under the writer lock).
+  - **The table during long analysis:** the new anchored refresh can restart itself before it finishes,
+    so paging freezes (possible).
+- **One crash on a crafted Vorbis file** that the patch does not cover: stb_vorbis writes one byte past
+  the `submap` arrays.
+- **A handful of Medium regressions in new code:**
+  - a Windows default-device change is reported as a lost device;
+  - index reload storms and index patch cost;
+  - the UI thread waits on audio device enumeration;
+  - WOF-compressed sample folders are skipped.
+- **None of the new CI legs has run on GitHub yet**, because the tree is uncommitted.
+
+### Fix first
 
 | # | Severity | Where | Problem |
 |---|---|---|---|
-| 1 | Critical ✔ | `src/app/application.cpp:294-296`, UI pool lambdas | `Application::library()` returns a raw pointer from a temporary `shared_ptr`; UI background tasks use it while `close_library` can destroy the library. Use-after-free. |
-| 2 | High ✔ | `src/files/importer.cpp:254-255` | A `known_stats` error returns from `commit_batch` while submitted probe tasks still reference `scanned` and `stop` (BS futures do not wait). Use-after-free. |
-| 3 | High ✔ | `src/media/decoder_ffmpeg.cpp:113-116, 219` | A mid-stream channel-count change rewrites `channels_`, and `read()` then `memcpy`s more floats than the caller's buffer holds. Heap overflow from an untrusted file. |
-| 4 | High ✔ | `src/catalog/library_analysis.cpp:356-373` | `lease_next_job` takes `LIMIT 32` including `blocked` jobs, so one offline drive starves the whole analysis queue. |
-| 5 | High ✔ | `src/app/application.cpp:257-262` | `open_library` runs `Library::open` (with crash recovery) before checking that the library is already open; re-opening resets the live session's jobs, scans and history. |
-| 6 | High ✔ | `src/app/application.cpp:139-152` | `~Application` destroys the supervisor before joining import threads that call `supervisor->notify()`. Shutdown race. |
-| 7 | High | `src/worker/main.cpp:303-318`, `src/app/analysis_supervisor.cpp:147-209` | Heartbeats come from an independent thread and a job has no deadline, so one file that hangs a decoder stalls analysis forever. |
-| 8 | High ✔ | `src/worker/main.cpp:13-15, 115` | `<picosha2.h>` is included only under `#ifdef _WIN32` but used unconditionally: **mso-worker does not compile on Linux**. |
-| 9 | High ✔ | `src/ui/sample_table_model.cpp:307-322` | `refresh()` during a pending `restart()` never clears `replacing_`, so paging stops at about 400 rows. Very likely during import (refresh every 750 ms). |
-| 10 | High ✔ | `.github/workflows/ci.yml:17-29, 44-45` | Windows CI calls `python3` but installs no Python; Linux installs Qt 6.4.2 while CMake needs 6.5 and silently drops the GUI. README claims CI runs every suite on both platforms. |
+| 1 | High (verified, measured) | `src/catalog/library_scan.cpp:772-775` | The revive `UPDATE … WHERE root_id=? AND path_key=? AND state='missing'` cannot use the partial unique index `locations_live_path` (SQLite does not infer `state<>'retired'`), so it scans every location in the root per skipped path: 3.5 ms each at 100k, about 1.75 s of writer time per 500-path batch, about 6 min per scan of a OneDrive root with 100k online-only files. → Add `AND state<>'retired'` (measured plan: `SEARCH … USING INDEX locations_live_path`). |
+| 2 | High (verified code, livelock possible) | `src/ui/sample_table_model.cpp:326-353` with `src/ui/main_window.cpp:506-510, 522-524` | `refresh()` has no guard against a refresh already running. The 500 ms window timer fires whenever an event names a sample that is not hydrated (evicted pages count). Each call restarts the walk of every loaded page, and while `refreshing_` is set, evicted rows do not re-hydrate and `canFetchMore` is false. During long analysis of a deep view the walk may never commit, so paging freezes. → When a refresh is running, set a "dirty again" flag and refresh once after the commit; count keys present in any page's `keys` as known. |
+| 3 | Medium (verified, crafted file) | `deps/miniaudio/extras/stb_vorbis.c:758-759, 4188-4193` | `submap_floor[15]` and `submap_residue[15]` take up to 16 submaps (`get_bits(f,4)+1`). `j == 15` writes one byte past the struct and later indexes `residue_config` out of range, so a crafted or damaged `.ogg` crashes the desktop app on preview or waveform. The fuzzer did not reach this. → In the recorded patch, make both arrays `[16]` or reject `submaps > 15`; add a seed and a test. |
+| 4 | Medium (verified by reading miniaudio) | `src/audio/output_device.cpp:184-189`, `output_supervisor.cpp:181-183` | When Windows changes the default device (a headset is plugged in), miniaudio reroutes and fires "stopped". The engine treats that as DEVICE_LOST, flushes, tears the rerouted device down after 500 ms and resumes Paused. A failed stop (unplug of a chosen endpoint) fires nothing, so the loss is possibly missed and the engine plays silently. → Check `ma_device_get_state` before closing, handle `rerouted`, and add a stalled-callback watchdog. |
+| 5 | Medium (verified by reading) | `src/app/application.cpp:300-306, 382-385, 454-457, 472-503` | Index reloads are queued with no dedup. Every poll and `request_update` during a running reload queues another full load: after one large tag rename during analysis, tens of seconds of back-to-back 1M-row reloads, each doubling memory and each forcing a full UI refresh. → A `load_pending` flag, and skip synchronize while `loading()`. |
+| 6 | Medium | `src/app/sample_index.cpp:743-772` | `patch_orders` copies and re-merges every cached sort order on every synchronize, under the exclusive lock, even for one changed row (the owner measured 79 ms per rating edit at 1M rows). During analysis, searches and paging stall several times a second. → Insert or erase changed slots in place with `lower_bound`; skip orders whose key did not change; coalesce. |
+| 7 | Medium (verified) | `src/ui/preview_panel.cpp:249, 258, 310, 437, 451, 474, 490` | Space/Play while the device is lost, Retry, opening the Output menu and choosing a device all block the UI thread on `outcome.get()` (`output_supervisor.cpp:63`) while WASAPI enumerates or re-opens endpoints (hundreds of ms to seconds). → Run them on `engine_pool_` and deliver results asynchronously. |
+| 8 | Medium | `src/files/file_identity.cpp:45-51, 120-130` | `IO_REPARSE_TAG_WOF` (files compressed with `compact /EXE` or CompactGUI, common on big sample drives) is classified "unsupported" and skipped, so such folders never import. → Treat WOF like a deduplicated file (an ordinary file); add a test. |
 
 ### Findings by severity
 
-| Severity | Count |
-|---|---|
-| Critical | 1 |
-| High | 22 |
-| Medium | ~85 |
-| Low / Nit | ~150 |
+| Severity | New in this review | Still open from the second review |
+|---|---|---|
+| Critical | 0 | 0 |
+| High | 2 | 0 |
+| Medium | 16 | 2 partly fixed (§3) |
+| Low / Nit | about 70 | a few, listed per module |
 
 ---
 
 ## 2. Scorecard
 
-| Module / area | Score | One-line verdict |
+| Module / area | Score (2nd, 1st) | One-line verdict |
 |---|---|---|
-| domain | 7 | Sound utilities on utf8proc and stduuid; path keys always fold case and `\` (wrong on POSIX); `error.hpp` undocumented. |
-| catalog | 6.5 | Excellent SQLite and history design; analysis-queue starvation, partial chunked edits replayed as success, exceptions escaping `Result<>`. |
-| search | 7 | No injection paths, keyset paging done right; relevance sort drops valid OR matches, exact BPM equality useless. |
-| media | 7 | Bounded, overflow-checked parsers with correct format details; FFmpeg heap overflow, MP4 `moov` budget, files locked during preview. |
-| files | 6 | Right structure (bounded queue, pool, gaps); use-after-free on catalog error, POSIX identity has no inode, reparse/symlink handling fragile. |
-| analysis (DSP) | 8 | Careful and well commented; pocketfft rebuilds its plan every frame, possible double-tempo bias, building blocks untested. |
-| worker | 7 | Mature supervision and confinement; Linux compile break, hung-task blind spot, relative-path spawn bug on POSIX. |
-| audio | 7 | Real-time path is clean; three ordering races, and unconditional declick fades that the spec forbids. |
-| app | 5 | Clean facade, but re-open recovery, shutdown race, wrong-encoding workspace path, workspace lost updates, unbounded threads. |
-| cli | 5 | CLI11 used well; `analyze` can hang forever, exceptions uncaught, silent usage errors, `std::stod`, no tests. |
-| ui | 6 | Good async gateway and paged model; use-after-free, paging stall, global single-key shortcuts, refresh storm, 1,200-line MainWindow. |
-| Build & CMake | 7 | Target-based, per-module libraries, SYSTEM includes, sound SQLite options; AUTOMOC leaks, hard-coded test list, no sanitizers or install. |
-| CI | 4 | Right platforms and `-Werror`, but never run, and both jobs would fail or skip the GUI. |
-| Dependencies & patches | 7 | Manifest, README and `deps/` agree (14/14), patch applied; tags not commit-pinned, `--check` cannot see hand edits, About box misses MIT notices. |
-| Layout | 9 | Rule holds everywhere; internal headers sit in the public tree. |
-| Tests & coverage | 6 | Core well covered with honest tolerances; CLI untested, half the UI untested, ffmpeg-dependent tests silently pass, sleep-based timing. |
-| Documentation | 7 | Paths and symbols check out; CI claim false, stale test count. |
-| **Overall** | **6.5** | |
+| domain | **9** (9, 7) | NTFS-style simple uppercase keys, key version checked on open, shared `json_fields`. |
+| catalog | **8** (7.5, 6.5) | Every High/Medium fixed and plan-checked; migration 6 correct and pinned; one new hot-path High (skip revive); a key-collision path can duplicate a library. |
+| search | **9** (8, 7) | RowMatcher per-row cost fixed (stored `path_key`, memo per root and taxonomy id); aliases resolved; SQL/memory parity re-checked field by field. |
+| media | **8.5** (8, 7) | stb_vorbis patched properly with tests and a fuzz target; the `submap` overflow remains; read-ahead and exact-length contracts fixed. |
+| files | **8.5** (7.5, 6) | Skips no longer become missing; flat-folder stat cache; duplicate-link detection; WOF files are skipped. |
+| analysis | **9.5** (9, 8) | Hot path clean; duplicate stages refused; only pocketfft's documented scratch allocation is left. |
+| worker | **9** (8.5, 7) | Exits on its own with a stuck task; bins and limits cross-checked; 36/36 under ASan on Windows. |
+| audio | **8** (8, 7) | Every second-review finding fixed, and callback re-traced clean; the new output supervisor is sound but its loss detection misreads default-device changes. |
+| app | **8** (7, 5) | SampleIndex capped, keyset cursors, close and reopen, read-only upgrade; reload storms and patch cost remain. |
+| cli | **8.5** (7, 5) | Use-after-free fixed at the root (all option storage in `CommandContext`), every binding audited, ASan-clean. |
+| ui (core) | **7.5** (7, 6) | Anchored refresh, ordered writes, error channel, refusal of partial selections; the refresh can livelock, and row reads are dropped across generations. |
+| ui (panels) | **8.5** (7, 6) | Navigator use-after-free fixed by value capture, reads coalesced, history on demand, device recovery UI; device calls block the UI thread. |
+| Build & CMake | **9** (8, 7) | WiX per machine, third-party licenses shipped, fuzz and sanitizer plumbing; a literal CR in one CMake file. |
+| CI | **7.5** (6, 4) | Windows `ci`, `ci-debug`, `ci-sanitize`, fuzz and MSI legs designed well; none has run yet; `update: false` may pin an old toolchain. |
+| Fuzzing & sanitizers | **8** (new) | 11 real targets, Windows-aware build, reproducible crashes; the decoders used for preview are not fuzzed. |
+| Dependencies & patches | **9** (9, 7) | Patch recorded and re-applied; 55/55 digests match; the line-ending refresh should be its own commit. |
+| Layout | **9.5** (9, 9) | No cross-module `detail/` include, now enforced by the graph check; the test accessor left the production tree. |
+| Tests & coverage | **8** (7, 6) | Four UI controllers and every new component tested; ASan 17/17; the analysis supervisor and drag resolver are still only covered end to end. |
+| Documentation | **8.5** (6, 7) | Linux, MSI and status claims now honest and cited; a few present-tense CI and fuzz claims are not yet observed. |
+| Codebase-wide scans | **9.5** (9, 9) | `[[nodiscard]]` on 250/252 Result APIs; `catch (...)` only as commented thread barriers. |
+| **Overall** | **8.5** (7.5, 6.5) | |
 
-### Owner-rule compliance
+### Owner-rule compliance (`AGENTS.md`)
 
 | Rule | domain | catalog | search | media | files | analysis | worker | audio | app | cli | ui |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 Libraries, never hand-roll | Pass | Pass | Pass | Partial | Pass | Pass | Partial | Partial | Partial | Pass | Partial |
-| 2 Clear names | Partial | Partial | Pass | Pass | Pass | Partial | Partial | Pass | Pass | Pass | Pass |
-| 3 `///` docs | Fail | Partial | Partial | Partial | Partial | Partial | Partial | Partial | Partial | Partial | Partial |
-| 4 Layout | Pass | Pass | Pass | Pass | Pass | Pass | Pass* | Pass | Pass | Pass | Pass |
-| 5 Tests | Partial | Partial | Partial | Partial | Partial | Partial | Partial | Partial | Partial | **Fail** | Partial |
-| 7 Windows + Linux | Partial | Partial | Pass | Partial | Partial | Pass | **Fail** | Pass | Partial | Partial | Partial |
+| 1 Libraries | Pass | Pass | Pass | Pass* | Pass | Pass | Pass* | Pass* | Pass | Pass | Pass |
+| 2 Vendored only via patches | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| 3 Names, `///` | Pass | Pass | Partial | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| 4 Layout | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| 5 Tests | Pass | Partial | Pass | Partial | Pass | Pass | Pass | Pass | Partial | Pass | Partial |
+| 6 Docs move with code | Pass | Pass | Partial | Pass | Pass | Pass | Pass | Pass | Partial | Pass | Partial |
+| 7 Windows first | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 
-\* Worker headers (`mso::worker` namespace) live in `include/mso/analysis/`.
-Rule 2 (vendored code via patches only): **Pass**: the one patch (`patches/csv_parser/0001-crlf-record-terminator.patch`)
-is listed in the manifest and applied by `update_deps.py`; `.gitattributes` keeps `deps/**` byte-exact.
-`update_deps.py --check` cannot detect a hand edit, though (see §5.3).
-Rule 6 (docs move with code): **Partial**: see §5.6.
+\* Documented deviations whose stated reasons hold: hand-written container and tag parsers, the
+worker's mutex-plus-deque queues, and the audio Seqlock, playhead history and mailbox coalescing
+(now listed in `IMPLEMENTATION_STATUS.md:69-81`).
+
+Search, rule 3 (Partial): a few internal helpers lack `///`. Rule 13 (bounded queues and caches):
+Partial in catalog (`scan_frontier`) and app (reload queue, id map). Rule 16 (real results): Pass,
+apart from three present-tense claims (§5.6).
 
 ---
 
-## 3. Cross-cutting themes
+## 3. Status of the second review
 
-These recur across modules; fixing each once removes a dozen findings.
+### Its fix-first table
 
-1. **Borrowed raw pointers across threads.** `Application::library()` and `open_libraries()` hand out
-   `catalog::Library*` that dies on `close_library`. `~ReaderLease` calls back through a raw `Library*`.
-   Fix once: a `with_library(uuid, function)` that holds the `shared_ptr` for the call, and leases that hold
-   shared ownership of the pool.
-2. **Hang detection is missing end to end.** The worker's heartbeat thread proves the process is alive,
-   not that the task is progressing (`src/worker/main.cpp:303-318`). The supervisor renews leases forever
-   (`analysis_supervisor.cpp:147-209`). The CLI `analyze` waits forever (`src/cli/media_commands.cpp:18-35`).
-   docs/04_CONTRACTS.md:111 requires "cooperative cancel, then worker termination". Fix once: a task
-   progress counter in the heartbeat, plus a per-job no-progress deadline that cancels, then kills.
-3. **Event storms instead of coalescing.** Every analysis tick emits two progress and two catalog-changed
-   events (`application.cpp:174-179`, `analysis_supervisor.cpp:89,139`). The UI then re-reads up to 10
-   pages, rebuilds the navigator, re-reads the inspector detail and re-checks 1,000 files on disk, and the
-   inspector overwrites what the user is typing. Fix once: throttle and coalesce per library at the
-   Application layer, and make each UI consumer diff before writing.
-4. **Exceptions escaping a `Result<>` API.** Throwing `nlohmann::json::parse`, const `operator[]` (UB on a
-   missing key), `.get<T>()`, `value()` on wrong types, `std::filesystem` throwing overloads, and jthreads
-   without a try barrier. Seen in catalog (history, observations, checkpoints), search (cursor decode),
-   app (workspace load, export `dump()`), audio (`PlaybackController::run`), files (`is_symlink`), ui
-   (`takeResult()`), cli (`main` catches only `CLI::ParseError`). Fix once: a project helper for
-   non-throwing JSON field reads, `error_code` overloads everywhere, and a `catch (const std::exception&)`
-   barrier at the top of every thread body.
-5. **Discarded errors.** 32 `(void)` casts on `Result`s; about 16 of them drop catalog job-state
-   transitions (`analysis_supervisor.cpp:106,114,123,141,150,165,171,203,206`;
-   `application.cpp:167,188,193,273,323,468,488`). SQLite `bind*` return codes are ignored
-   (`sqlite.cpp:115-138`). Fix: log or surface them; keep `(void)` only with a comment saying why.
-6. **POSIX correctness has never been exercised.** Case-folded path keys, `\`→`/` on POSIX, missing inode
-   identity, `is_symlink` that throws, `RLIMIT_AS` against sanitizers, a relative-path spawn bug,
-   `__clang_major__`, a SIGINT handler that is not async-signal-safe, and the worker compile break. Linux
-   is "prepared" but would not build or behave correctly.
-7. **Unbounded growth despite invariant 13.** `catalog_outbox` never pruned, backups never pruned, history
-   never pruned, operations map and finished jthreads kept until exit, one jthread plus one probe pool per
-   import, sample-id vectors for whole roots, jobs panel rows, the event bridge's queued lambdas.
-8. **Duplicated constants and helpers.** Analysis flag bits in three places (catalog, search parser, UI),
-   `kMaximum*` vs `kMax*` limits duplicated between analysis and worker, three little-endian serializers,
-   two `Overloaded` helpers, two `escape_like`, two Win32 handle RAII classes, four test temp-directory
-   and four WAV-writer helpers.
-9. **Internal headers in the public tree.** `catalog_internal.hpp`, `patch_operations.hpp`,
-   `worker_platform.hpp` and four audio headers that include PRIVATE deps (`<miniaudio.h>`,
-   readerwriterqueue) sit next to the public API. Adopt `include/mso/<module>/detail/`.
-10. **Doc comments are strong on file headers and public classes, thin on internals.** The worst gaps are
-    the most-read headers: `include/mso/domain/error.hpp`, `include/mso/catalog/sqlite.hpp`,
-    `migrations.hpp`, the `Library` class with ~25 public methods, and the whole of
-    `include/mso/media/media.hpp`, all of which use `//` or nothing.
+| # | Second-review finding | Status | Evidence |
+|---|---|---|---|
+| 1 | `collection --delete` use-after-free (Critical) | Fixed | `--delete` unbound and read through `count()` (`src/cli/edit_commands.cpp:180, 198`). All option storage lives in `CommandContext::command_options` (`command_context.hpp:65-76`), and every binding in `src/cli` was audited. Test `cli_tests.cpp:287-311`. ASan-clean in `build/integ-asan`. |
+| 2 | stb_vorbis setup overflow | Fixed (one gap: Fix first #3) | `patches/miniaudio/0001-…patch`, listed in `deps/manifest.json:128-130`, re-applied by `update_deps.py:181-189`. It reproduces the recorded digest. Tests `media_tests.cpp:2015-2097`, fuzz target `fuzz_stb_vorbis.cpp`. |
+| 3 | Navigator menu use-after-free | Fixed | `navigator_panel.cpp:465-469` reads a `NodeInfo` by value before `exec()`. No `QTreeWidgetItem*` survives a nested loop. Test `ui_application_tests.cpp:157-226`. |
+| 4 | Skipped entries become missing | Fixed (cost: Fix first #1) | `importer.cpp:485-492, 520-530`, `library_scan.cpp:758-800`. Tests `import_tests.cpp:469-516`. |
+| 5 | Lease query O(N²) | Fixed (measured) | Migration 6 `jobs_ready` plus `INDEXED BY` (`library_analysis.cpp:557-561`). Plan has no temp B-tree: 0.002-0.027 ms per lease at 100k jobs. |
+| 6 | Index offset cursors | Fixed | Keyset `CursorKey`, `partition_point`, per-stream resume (`sample_index.cpp:1133-1143, 1368-1384, 1484-1498`). Tests under rating and BPM edits (`app_tests.cpp:700-770`). |
+| 7 | STALE_CURSOR truncated the view to 400 rows | Fixed (new High: Fix first #2) | Anchored refresh over every loaded row (`sample_table_model.cpp:326-353, 933-940`). Tests `ui_tests.cpp:1061, 1103, 1128`. |
+| 8 | SampleIndex memory unbounded | Fixed (estimate caveat below) | 1M-row cap with SQLite fallback (`application.cpp:345-365`), compact rows (`sample_index.cpp:58-216`), deviation recorded (`IMPLEMENTATION_STATUS.md:29-41`). |
+| 9 | RowMatcher per-row `path_key` | Fixed | Stored `l.path_key` in `SampleRow` (`sample_rows.cpp:172, 262`), rules memoized per root and per taxonomy id (`row_matcher.cpp:164-224`). Benchmark asserts under 15 ms at 100k when run by hand. |
+| 10 | Linux CI parked, docs say it passed | Fixed (Windows legs added, Linux deferred) | Windows `ci-debug` and `ci-sanitize` legs (`ci.yml:55-58`); every statement corrected (`DEVELOPING.md:33-36`, `IMPLEMENTATION_STATUS.md:89, 241-242, 487-490`). |
+
+### Second-review Mediums
+
+All fixed except these two:
+- **Index memory measured with best-case names (§4.9).** The 248-265 B/row figure comes from synthetic
+  names short enough for libc++'s small-string buffer. Real pack names allocate.
+- **Backups still cannot be cancelled (§4.11).** Exports now run on their own pool and observe
+  shutdown, but exit waits for a running backup.
+
+The Mediums fixed in this round include:
+- `finish_scan` frontier index (14 ms vs 62 s), paused-run settling, artifact algorithm versions,
+  corrupt-job skipping;
+- alias resolution for merged tags;
+- partial-selection refusal, per-library write ordering, the `rows()` error channel, the removed
+  re-select;
+- history reloaded on demand, navigator reads coalesced and ordered;
+- inspector Format line and drafts, preview device recovery and the engine thread contract;
+- declick on every epoch change, re-anchor at the consumed position, the federated merge resume;
+- reload no longer holding the sync lock, close and reopen with a job running, read-only upgrade
+  after a CLI run;
+- the stuck `play` loop, WiX per-machine scope, shipped third-party licenses;
+- sanitizer-aware worker tests on Windows (not needed: the job cap coexists with ASan), the four
+  untested UI controllers, `[[nodiscard]]`.
+
+One security-only Low was dropped under the owner's priorities: the lock file can be deleted while
+it is held (`file_lock.cpp`). The Linux-only items are in §8.
 
 ---
 
 ## 4. Findings by module
 
-Format: **[Severity]** `file:line`: problem. *Why it matters.* → suggested fix.
+Format: **[Severity]** `file:line`: defect. *Why it matters.* → Fix. Each module opens with what
+remains open from the second review, if anything.
 
-### 4.1 domain (`include/mso/domain`, `src/domain`): 7/10
+### 4.1 domain: 9/10
 
-Strengths: `fold_key` and `fold_path_key` on utf8proc (NFC plus simple lowercase, so "ﬁ" and "fi" never
-merge); UUIDs from stduuid with `random_device`; `path_to_utf8`/`path_from_utf8` centralise conversions.
+All second-review findings fixed: simple-uppercase keys without normalization on case-insensitive roots
+(`core.cpp:115-135`), `kFoldVersion` bumped and checked on open (`library_lifecycle.cpp:409-474`), domain
+links trimmed, `format_duration` boundary.
 
-- **[High] ✔** `src/domain/core.cpp:62-93` with `src/catalog/library_scan.cpp:65-68, 370`: location identity
-  is always the case-folded `path_key`, and `roots.case_sensitive` is always written as 0 and never read.
-  `fold_path_key` also turns `\` into `/`. *On a case-sensitive Linux volume, `Kick.wav` and `kick.wav`
-  become one location; every scan then reports a content change, bumps the revision and invalidates
-  analysis. `a\b.wav` collides with `a/b.wav` (legal on POSIX).* → Detect case sensitivity per root, store
-  it, use an exact key on case-sensitive roots; convert separators only under `#ifdef _WIN32`.
-- **[Medium]** `include/mso/domain/error.hpp` (whole file): `ErrorCode`, `Error`, `Error::message` and
-  `fail` use `//` or nothing. *Rule 3, on the most-included header in the project.* → `///` on each.
-- **[Low]** `src/domain/core.cpp:129-144`: `is_safe_relative_path` does not reject `:` (alternate data
-  streams), reserved device names (`CON`, `NUL`, `COM1`) or segments with trailing dots or spaces.
-  *Possible path confusion on Windows.* → Reject them.
-- **[Low]** `src/domain/core.cpp:37-41`: on malformed UTF-8, `fold_key` keeps raw bytes without folding,
-  so `"KICK\xFF"` and `"kick\xFF"` differ. `parse_key` (191-218) does not accept `♯`/`♭`.
-- **[Low]** `tests/domain_tests.cpp`: no tests for `error.cpp`, `count_code_points`, `is_valid_utf8`, the
-  `path_to_utf8`/`path_from_utf8` round-trip, `trim`, `parse_key_mode`.
-- **[Nit]** Empty leftover directory `src/domain/cli/`. `trim`, `to_lower_ascii` and `parse_key_mode` lack
-  `///`.
+- **[Low] (possible)** `src/domain/core.cpp:115-135`: simple uppercase maps ſ→S, ı→I, µ→Μ and ς→Σ. If
+  NTFS's `$UpCase` table keeps any of those pairs apart, two real files get one key (and the rekey
+  collision path in §4.2 then applies). → Confirm against Windows ordinal ignore-case comparison and pin
+  the pairs in a test.
+- **[Nit]** `format_duration` truncates 9.995-9.999 s to "0:09" but rounds 10.0 s to "0:10".
 
-### 4.2 catalog (`include/mso/catalog`, `src/catalog`): 6.5/10
+### 4.2 catalog: 8/10
 
-Strengths: per-connection statement cache with `SQLITE_PREPARE_PERSISTENT`; `WriteTransaction` rolls back
-by default; `BEGIN IMMEDIATE` with jittered bounded retry; WAL plus `synchronous=FULL`; reversible,
-compare-and-set history patches that record only real changes; chunked bulk edits with a durable cursor;
-lease tokens, cancel epochs and content-revision fences on analysis; invariant 14 honoured (one writer
-mutex, one transaction, revision plus outbox plus projection together).
+Every second-review High and Medium is fixed and was plan-checked:
+- the lease walks `jobs_ready` with no sort;
+- the `finish_scan` gap subquery uses `scan_frontier_state` and is dropped when there are no gaps;
+- paused runs settle and their waiting jobs park as `paused`, with migration 6 converting old ones;
+- algorithm versions travel with their facts;
+- corrupt jobs fail and the walk continues;
+- conflicting undos store a receipt and no-op edits create no action;
+- case-only renames are re-spelled; `ensure_folder` is iterative; probes run without a snapshot;
+- old paused sessions are not resumed; integrity checks run on a reader; empty folders are pruned;
+- `prepare` no longer allocates.
 
-**High**
-- **[High] ✔** `src/catalog/library_analysis.cpp:356-373`: `lease_next_job` selects
-  `state IN ('queued','interrupted','blocked') … LIMIT 32`, then skips unreachable rows in C++. *If the first
-  32 candidates are on an offline root, every call returns nothing and every later job, in every run,
-  starves. The desktop queues analysis automatically, so one unplugged drive stops the whole queue.* →
-  Move the reachability `EXISTS` into the `WHERE`, exclude `blocked`, and unblock jobs in
-  `set_root_availability`/`finish_scan`.
-- **[High] ✔** `src/catalog/library_history.cpp:580-583, 627-631` with `find_receipt` (78-92): each chunk
-  commits a receipt in state `running`. If chunk N>1 fails, earlier chunks stay committed, the action stays
-  `applying` (so `undo()` refuses it until a restart), and a retry with the same operation UUID gets the
-  partial receipt back with `replayed=true`. *The caller is told the edit succeeded; the remaining samples
-  are never edited.* → When the stored receipt is `running`/`partial`, resume from the next chunk or report
-  `partial`; mark the action `partial` on error, not only after a crash.
+Migrations 1-5 are byte-identical and all six SHA-256s match the pinned values. Partly fixed: the FTS5
+`integrity-check` still runs on the writer.
 
-**Medium**
-- `src/catalog/library_history.cpp:753-761, 719-726`: an undo that hits `HISTORY_CONFLICT` leaves the action
-  `applied` at the cursor. *Nothing older can ever be undone, and each retry adds another identical review
-  item.* The schema's `'conflict'` state (`migrations.cpp:532`) is never set. → Mark the action `conflict`,
-  move the cursor past it, add the review item once.
-- `src/catalog/patch_operations.cpp:173, 314, 334-335`; `library_history.cpp:690`;
-  `catalog_internal.cpp:325-326`; `library_analysis.cpp:382`; `library_queries.cpp:121`: stored JSON is
-  read with const `operator[]` (UB on a missing key), throwing `.get<T>()` and throwing `json::parse`.
-  `kHistoryCommandVersion` is stored but never checked. *A corrupt or older row throws out of a `Result<>`
-  API or invokes UB.* → `contains`/`value()`, `parse(text, nullptr, false)`, check the version, return
-  `DB_CORRUPT`.
-- `src/catalog/library_analysis.cpp:28-101, 347-352, 383`: analysis facts are not range-checked (BPM,
-  confidence 0..1, pitch class 0..11, sha256 length and hex, waveform segment path). *A bad value fails a
-  `CHECK`, the job stays `running` until reclaimed, and reclaim never applies `kMaxAttempts`, so it can loop
-  forever (possible).* → Validate facts, fail permanently on a bad value, cap attempts on reclaim.
-- `src/catalog/library_analysis.cpp:427-428`: `complete_job` writes `facts.sample_id` and
-  `facts.content_revision` from the caller instead of checking them against the lease, contrary to the
-  header. → Reject a mismatch with `INPUT_CHANGED`, or take them from the lease.
-- `src/catalog/library_analysis.cpp:451`: in `fail_job`, `if (!fenced) return {};` turns every
-  `verify_lease` error (busy, I/O, not found) into success. → Swallow only `CANCELLED`.
-- `include/mso/catalog/library.hpp:217-219`: `writer_connection()` and `writer_mutex()` are public. *Anyone
-  can write without the mutex, revision or outbox, which breaks invariant 14.* Only tests use them. → Make
-  them private with a test-only friend.
-- `src/catalog/library_lifecycle.cpp:156-158, 300-303`: `~ReaderLease` calls `owner_->release_reader`
-  through a raw pointer; nothing stops a lease outliving the `Library`. → Shared ownership of the pool, or
-  assert in `~Library`.
-- `src/catalog/library_queries.cpp:150-285`: `sample_detail` runs five statements with no read transaction.
-  *Under WAL each gets its own snapshot, so a concurrent commit gives a torn view.* → A `ReadTransaction`
-  RAII (`BEGIN`/`COMMIT`) for multi-statement reads.
-- `src/catalog/catalog_internal.cpp:124-169`; `library_scan.cpp:453-462`; `patch_operations.cpp:356-360`:
-  `refresh_search_projection` is ~6 statements per sample plus a recursive CTE per tag, run inside the
-  writer transaction for a whole root or subtree rename, unchunked. `merge_tag` (`library_history.cpp:490-507`)
-  builds one unbounded chunk. *At 100k samples, around a million statements while holding the only
-  writer.* → Set-based SQL (`group_concat` over joins), and chunk taxonomy actions like edits.
-- `src/catalog/sqlite.cpp:115-138`: every `bind*` ignores SQLite's return code. *A wrong index silently runs
-  with NULL.* → Record the first bind error and return it from `next_row`/`run`.
-- `include/mso/catalog/library.hpp:118-120` vs `src/catalog/library_scan.cpp:590-605`: the header says
-  unseen locations are marked missing only with complete coverage; the code marks them missing without it,
-  excluding only gap subtrees. → Decide which is intended; fix code or doc.
-- `src/catalog/migrations.cpp:667-680` with `tests/catalog_tests.cpp:71-83`: checksums are computed from the
-  current source, and the only test tampers with the database. *An accidental edit to a released migration
-  passes every test and only breaks users' existing libraries (invariant 15).* → A doctest that pins the
-  released SHA-256 values.
-- `src/catalog/catalog_internal.cpp:109-122`: `catalog_outbox` is written on every mutation but never read
-  or pruned; `consumer_cursors` is unused. → Prune below the minimum cursor, or cap.
-- `src/catalog/library_lifecycle.cpp:24-40`: `write_file_atomically` never fsyncs the temp file or the
-  directory before `rename`, and leaves `.tmp` behind on failure. *After a power loss `library.json` can be
-  empty and the library unopenable.* → `FlushFileBuffers`/`fsync` behind `#ifdef _WIN32` with a POSIX
-  branch.
-- Tests: no direct tests for the SQLite wrapper (cache, moves, busy path, `backup_to`), the reader pool,
-  upgrading an older schema, opening a newer schema read-only, `finish_scan` with gaps, `rename_root`,
-  `set_root_availability`, lease expiry and reclaim, blocked jobs, `fail_job` backoff, `renew_lease`,
-  category-rename undo. The bulk-edit test assumes sample IDs are `1..N`.
+- **[High] (verified, measured)** `src/catalog/library_scan.cpp:772-775`: see Fix first #1. *Every scan of
+  a root with cloud-only files or links pays O(skipped × locations) under the writer lock.*
+- **[Medium] (possible; traced by reading)** `src/catalog/library_lifecycle.cpp:449-474`: when rebuilt path
+  keys collide, the rekey rolls back and the library opens writable with old-scheme keys, while runtime
+  code produces new-scheme keys (`library_scan.cpp:133`). The next scan of a case-insensitive root:
+  - `find_location_by_path` misses every file;
+  - `try_relink` drops each candidate because its old path still exists;
+  - every file is therefore inserted as a new sample;
+  - `finish_scan` marks the originals, with their tags, ratings and notes, missing.
 
-**Low**
-- `library_history.cpp:439-464`: `move_tag` does not check that the new parent exists or is live, and the
-  depth check ignores the moved subtree's own depth (the depth-16 CTEs then truncate paths silently).
-  `patch_operations.cpp:281-284` maps every `InvalidArgument` to `HISTORY_CONFLICT`. `merge_tag`, `rename`
-  and `rename_collection` do not check the target is live.
-- `patch_operations.cpp:217-220`: `write_collection_link` reports `DB_BUSY`/`DISK_FULL` as
-  `HISTORY_CONFLICT`. → Map only `SQLITE_CONSTRAINT_UNIQUE`.
-- `library_scan.cpp:600-601, 251-252`: `LIKE … || '/%'` without escaping `_` and `%` (common in sample
-  names); possible-move search ignores the root. → Prefix compare with `substr()` or `ESCAPE`.
-- `library_scan.cpp:134`: `try_relink` probes the filesystem while holding the writer inside
-  `BEGIN IMMEDIATE`; an offline network volume blocks all writers.
-- `library_scan.cpp:43-44, 533`; `types.hpp:109`: unsafe or invalid-UTF-8 paths are dropped without a count;
-  the 500-file batch limit is not enforced; `probe_error` is never persisted.
-- `library_lifecycle.cpp:162-205`: library creation is not atomic (each migration commits separately; DB
-  created before `library.json`); subdirectory creation errors are ignored.
-- `library_lifecycle.cpp:249`: a read-only open of an older schema does not migrate, so later queries can
-  fail at prepare time (possible). `verify_migration_checksums` (100-112) does not detect version gaps.
-- `library_analysis.cpp:269-303`: `control_run` splits SQL on `;` by hand, never returns `NOT_FOUND`, bumps
-  the revision when nothing changed.
-- `library_analysis.cpp:226, 246-249, 312, 329`: duplicate sample IDs count as queued; `skipped` means two
-  different things in two calls; stage list stored under a dummy `'bundle'` stage.
-- `library_history.cpp:734, 788`: `undo`/`redo` mint a fresh operation UUID and store no receipt, so a
-  retried undo reverts two actions; redo marks a `partial` action `applied`.
-- `library_history.cpp:719-726, 745-746`; `library_lifecycle.cpp:305-317`; `library_scan.cpp:123-129`:
-  swallowed errors (`record_history_conflict` returns `void`; a SQLite error becomes `NOT_FOUND`;
-  `identity()` returns an empty name; `uuid::from_string(…).value_or(nil)` hides corrupt UUIDs).
-- `library_queries.cpp:64-91`: `ensure_tag`/`ensure_category` bump the revision when the node already
-  existed; implicit creations in `apply_edit` (`library_history.cpp:183-201`) are not undone.
-- `sqlite.cpp:379-383`: `backup_to` retries `BUSY` forever. `sqlite.cpp:248, 310-323`: `busy_timeout` (2 s)
-  inside a 2 s retry loop doubles the real wait.
-- `library_lifecycle.cpp:326-344`: `acquire_reader` waits without a timeout; a thread that already holds a
-  lease and asks for another deadlocks when the pool is exhausted. → `wait_for` plus `RESOURCE_LIMIT`.
-- `library_lifecycle.cpp:355-372`: backups never pruned; `reason` unsanitized in the file name; two backups
-  in the same millisecond collide.
-- `edit_command.cpp:476-481`: add/remove overlap compares whole-path fold keys, missing `"Drums / Kick"`
-  vs `"Drums/Kick"`.
-- `library_history.cpp:117-120`: every new action runs an unindexed `UPDATE … WHERE state='undone'`;
-  history is never pruned.
+  *One colliding pair duplicates the library.* → Resolve collisions inside the rekey (commit the rest,
+  disambiguate the colliding rows, add a review item), or open read-only and refuse scans until resolved.
+- **[Low]** `library_history.cpp:765-775, 797-803`: regression from the no-op fix. A chunked edit whose
+  first chunks change nothing commits a `running` receipt without an action. A retry after a crash in
+  that window replays it as partial and never edits the rest. → Resume from `next_offset` when the
+  receipt has no action.
+- **[Low]** `library_analysis.cpp:537-540, 695, 708`: jobs of a paused run go back to `queued` or
+  `interrupted` on lease reclaim, transient failure and release. → Use the same
+  `CASE run.state WHEN 'paused'` as `unblock_reachable_jobs`.
+- **[Low]** `library_scan.cpp` (`finish_scan`, `begin_scan:645-651`): `scan_frontier` rows are never
+  deleted, so the table grows one row per directory per scan (invariant 13). → Delete them for completed
+  and cancelled sessions.
+- **[Low]** `library_lifecycle.cpp:422-441`: the first open after upgrade rekeys every folder and location
+  twice in one transaction, with no progress and no backup (seconds at 1M rows; start-up looks hung). →
+  Report progress or chunk.
+- **[Nit]** `library.hpp:347-348` wedges a doc comment inside `friend`; the `AnalysisFacts` doc overstates
+  invalidation (flags stay set); `dump_json(...).substr(0, 200)` can split UTF-8 (`patch_operations.cpp:79-87`).
 
-**Nit**
-- Performance: `StatementCache::take` allocates a `std::string` per lookup (`sqlite.cpp:56-62`; use
-  transparent hashing); `load_tree` folds keys inside the sort comparator (`library_queries.cpp:57-58`);
-  `advance_revision` re-prepares via `execute_script` (`catalog_internal.cpp:110-115`; use a cached
-  `UPDATE … RETURNING`); integers formatted into SQL with `std::format` bypass the cache
-  (`library_scan.cpp:192-196, 590-591`).
-- Dead or odd code: `inverse_json` stored but never read (`library_history.cpp:138-151`); unused
-  `std::string sql;` (`patch_operations.cpp:114`); `Connection` move constructor calls `make_shared` inside
-  `noexcept` (`sqlite.hpp:107-110`); `describe()` names only the first tag and does not match its
-  documented example (`edit_command.cpp:502-527`).
-- Rule 3 gaps: `sqlite.hpp` (`PreparedStatement`, `ConnectionOptions`, `Connection`, `WriteTransaction`,
-  `make_sqlite_error`), all of `migrations.hpp`, the `Library` class and ~25 public methods in
-  `library.hpp`, `types.hpp` `to_string`/`parse_*`, `patch::` builders, `ActionRecorder::finish/attach`.
-- Rule 2: `v`, `m` (`migrations.cpp:262-268, 669, 675`), `c` (`library_history.cpp:263`), `a`/`b`
-  (`library_queries.cpp:58`); one-letter SQL aliases throughout.
+### 4.3 search: 9/10
 
-### 4.3 search (`include/mso/search`, `src/search`): 7/10
+All second-review findings fixed:
+- RowMatcher per-row cost;
+- merged-tag aliases in SQL and memory, with chain tests;
+- `ceiling_divide`;
+- taxonomy validation, with stored-query errors counted as library errors;
+- relevance retry of failed hydration;
+- one evaluability rule;
+- one compiler per expansion;
+- an index-driven `folder:` filter;
+- bounded `matching_ids`;
+- three new parity tests.
 
-Strengths: every value bound; sort columns and FTS columns from whitelisted enums; FTS5 terms always
-emitted as quoted strings with doubled quotes (`query_compiler.cpp:262-272`), so `NEAR`, `^`, `*`, `:` are
-literal; LIKE escaped with `ESCAPE '\'`; locale-free `std::from_chars`; bounded parser (4,096 code points,
-depth 16, 256 nodes); `(value, id)` keyset paging with a null partition, federated merge; cursor
-fingerprinted with picosha2.
+Parity was re-checked field by field (numbers, flags, codec, key, available, folder, NOT, unknowns).
+There is still no injection path.
 
-- **[High] ✔** `src/search/search_service.cpp:446-470`: relevance sort ranks only rows matching the OR of the
-  positive text terms, then applies the full filter. *`kick OR tag:Drums` drops every row matching only
-  `tag:Drums`; `kick OR NOT snare` drops every non-snare row without "kick"; `relevance_window_limited`
-  stays false.* → LEFT JOIN the bm25 subquery over the filtered set (NULL score ranks last) when the query
-  has a non-text OR branch, or fall back to the metadata sort and say so.
-- **[Medium]** `query_compiler.cpp:72-74`, `query_parser.cpp:483-485`: `bpm:120` compiles to
-  `bpm_milli = 120000` and `duration:2s` to exact microseconds. *Analyzed values like 120.18 never match.*
-  → Equal means "within the precision typed" (BETWEEN).
-- **[Medium]** `search_service.cpp:478-490, 325-385, 525`: rows are hydrated (location, tags, category per
-  row) before they are discarded: up to 1,000 rows × libraries per relevance page, `page_size` × libraries
-  per metadata page. → Fetch base columns, merge or slice, hydrate the final page once.
-- **[Medium]** `query_compiler.cpp:204-205, 215`: `lower(fr.name)` and `lower(name)=lower(?1)` are
-  ASCII-only, while the user value goes through utf8proc. *`folder:` and `collection:` with non-ASCII case
-  differences do not match.* → Compare stored folded keys.
-- **[Medium]** `query_compiler.cpp:55-59, 70-94, 146-153`: SQL three-valued logic leaks; `NOT bpm:>120`
-  excludes unknown BPM, so `X` and `NOT X` do not cover the library. → `COALESCE(pred, 0)` or document it.
-- **[Medium]** `search_service.cpp:118-131, 516-524`: the cursor fingerprint omits the set of libraries; a
-  library opened mid-scroll starts from its first row. → Include sorted library UUIDs.
-- **[Medium]** `tests/search_tests.cpp`: the injection test (95-100) accepts "error or empty"; untested are
-  key/rating/format/added/sample-rate sorts, cross-page ordering (only uniqueness checked), relevance
-  pagination, stale and malformed cursors, every `Scope` field, smart collections, column searches,
-  embedded quotes, LIKE `_`/`%`, unit suffixes, and the OR-plus-relevance case.
-- **[Low]** `search_service.cpp:405-418`: `decode_cursor` uses const `operator[]` and throwing `get`; a
-  malformed token can crash instead of returning `STALE_CURSOR`.
-- **[Low]** `search_service.cpp:472, 593-595` vs 526-531: inconsistent error policy between relevance,
-  metadata and count paths.
-- **[Low]** `search_service.cpp:137-156`: `Scope::folder` silently ignored without `root_id`.
-- **[Low]** `search_service.cpp:143-148`: duplicate of `escape_like` (`query_compiler.cpp:20-27`).
-- **[Low]** `query_compiler.cpp:233-244`: smart-collection expansion depth-capped but not size-capped
-  (exponential SQL growth possible).
-- **[Low]** `query_compiler.cpp:235-236`, `search_service.cpp:170-171`: `value("text", …)` throws on a
-  non-string; parsing duplicated.
-- **[Low]** `query_parser.cpp:320-321`: a quoted phrase containing `*` is rejected.
-- **[Low]** `query_parser.cpp:503`: integer fields round fractions (`rating:3.5` → 4). → Reject.
-- **[Low]** `query_parser.cpp:433-436`: `analyzed:false` is an error; flag constants (60-64) duplicate the
-  catalog's bits.
-- **[Low]** `query_parser.cpp:276-288`: depth limit not applied to `NOT` chains (~2,000-frame recursion
-  possible in debug).
-- **[Low]** `search_service.cpp:395-397, 495-496`: `uuids::to_string` twice per comparison inside
-  `stable_sort`; compare UUIDs directly.
-- **[Nit]** `kick AND AND snare` accepted; lone `)` gives a vague error; `"!!!"` gives an empty phrase;
-  `relevance_window_limited` set at exactly 1,000 rows; unused `<variant>` in `query.hpp:21`; misplaced
-  trailing comments at `query.hpp:33/38/49`.
-- **[Nit]** Missing `///`: `query.hpp:52, 94-96`; `search_service.hpp:20-21, 74, 91, 111-112`; the
-  `Parser` and `QueryCompiler` internals; `query_fingerprint`, `decode_cursor`.
+- **[Medium] (possible)** `src/search/search_service.cpp:489-503, 553-563`: if one library's hydration
+  keeps failing (key fetch succeeds, `load_rows` fails, e.g. a damaged page), every page returns a
+  `next` cursor retrying the same rows. `mso search` loops forever (`cli/search_commands.cpp:115-129`), and
+  export spins until cancelled. → Count retries per library in the cursor and give up after one, or stop
+  when a page hydrated nothing and only failed libraries remain.
+- **[Low]** `query_compiler.cpp:444-463`: `primary_location_filter` probes up to library/16 index entries
+  on every compile of a `folder:` value or folder scope, so a broad folder pays it on every page. →
+  Cache the plan choice per (library, revision, condition).
+- **[Low] (cross-slice)** `src/app/sample_index.cpp:412-430`: the index copies `tag_paths` and recomputes
+  `path_key` for verbatim-path rows per row before matching. → A matcher entry point over ids and stored
+  keys.
+- **[Low] (possible)** `src/ui/main_window.cpp:710-721`: the UI saves smart-collection text without
+  `SearchService::validate` (only the CLI validates), so an unparsable query later shows as DB_CORRUPT.
+- **[Nit]** `folder:"/ Drums"` keeps the leading space; category text without an id re-folds per row;
+  missing `///` on `compile_filter`, `LibraryFilter`, `clamp_page_size`, `TaxonomyPaths::Node`;
+  `IMPLEMENTATION_STATUS.md:300` still calls `folder:Loops` an 86 ms known follow-up.
 
-### 4.4 media (`include/mso/media`, `src/media`): 7/10
+### 4.4 media: 8.5/10
 
-Strengths: `ByteCursor` with a sticky failure flag, `checked_add`/`checked_multiply`, 128-bit
-`units_to_microseconds`, and `BoundedFileReader` that charges the budget before allocating; every chunk walk
-is monotonic and capped, with no recursion. Format details checked and correct: RIFF pad byte, RF64 ds64,
-Wave64 alignment, AIFF 80-bit rate, ID3v2 syncsafe and unsynchronisation (v2.3 and v2.4), extended header,
-footer, UTF-16 BOMs and surrogates, MP4 64-bit and size-0 boxes, QuickTime v1/v2 entries. FFmpeg locked
-down: custom AVIO, `io_open` refused, audio-only demuxers, correct cleanup on every path. Source files are
-opened read-only.
+All second-review findings fixed:
+- the stb_vorbis patch: `size_t` setup sizes with a 128 MiB cap, lengths checked against bytes left,
+  codebook bounds, a leak, `lookup1_values` in double;
+- FFmpeg EOF versus read error;
+- exact-length contracts (FFmpeg Vorbis is an estimate; MP3 trim matches dr_mp3);
+- a CPU deadline for `find_stream_info`;
+- a 16 KiB read-ahead window;
+- WavPack tags, rates and channels;
+- `native_path` from the absolute path;
+- the nits.
 
-- **[High] ✔** `src/media/decoder_ffmpeg.cpp:104-122, 219-220`: `read()` recomputes the channel count from
-  `channels_` on every pass, and `configure_resampler()` overwrites `channels_`/`sample_rate_` when a frame's
-  layout changes. *A stream whose channel count rises mid-stream (AAC PCE change, joined streams, crafted
-  file) makes `memcpy` write past the caller's buffer: a heap overflow from untrusted input.* → Fix the
-  output layout and rate after the first frame and let swr remix to it, or fail with `CorruptAudio`.
-- **[Medium]** `probe_ogg.cpp:106-110`: the tail scan accepts any `OggS\0` without a CRC or size check, so a
-  stray pattern in packet data yields a bogus granule reported as an exact duration. → Verify CRC32 and
-  that the page fits.
-- **[Medium]** `probe_mp4.cpp:353-357`: the whole `moov` (up to 16 MiB) is read in one call against a 4 MiB
-  budget. *Any M4A with large cover art in `udta` gets `ProbeLimit`, no codec, and then cannot be
-  previewed.* → Walk `moov` children with header reads; load only `trak/mdia/…/stsd` and `ilst`; skip `covr`.
-- **[Medium]** `decoder_miniaudio.cpp:64`, `decoder_vorbis.cpp:27`: preview opens files via
-  `_wfopen`/`_wfsopen`, without `FILE_SHARE_DELETE`. *While a file previews, Explorer or a DAW cannot rename,
-  move or delete it, which contradicts `file_handle.hpp`; the comment at `decoder_vorbis.cpp:24` is wrong.*
-  → `ma_decoder_init` with callbacks over `FileHandle`; for stb_vorbis, `CreateFileW` →
-  `_open_osfhandle` → `_fdopen`.
-- **[Medium]** `probe_wav.cpp`, `probe_aiff.cpp`, `probe_flac.cpp`, `probe_mpeg.cpp`, `id3.cpp`,
-  `probe_mp4.cpp`, `probe_asf.cpp`, `probe_caf.cpp`: rule 1 judgement call. All container and tag parsing is
-  hand-rolled, while vendored miniaudio already has dr_wav metadata (smpl, acid, inst, LIST/INFO), dr_flac
-  metadata and dr_mp3 Xing/LAME parsing, and TagLib (LGPL/MPL, GPL-compatible) could cover ID3, MP4, ASF,
-  APE and Vorbis tags through a custom stream over `BoundedFileReader`. Keeping probes bounded is a
-  defensible reason, but it is undocumented. → Record the decision in `IMPLEMENTATION_STATUS.md` and the
-  `add-audio-format` skill, or adopt TagLib.
-- **[Medium]** `include/mso/media/media.hpp:19-86`: the whole public API (`ProbeLimits`, `EmbeddedTags`,
-  `LoopPoint`, `ProbeResult`, `probe_file`, `Decoder` and its virtuals, `open_decoder`, `filename_hints`, …)
-  uses `//` or nothing. → `///` with contracts (`read` buffer size, seek past end, thread affinity).
-- **[Medium]** `probe.cpp:70`, `probe_wav.cpp:267`, `probe_aiff.cpp:104`, `probe_mp4.cpp:93`: tags are read
-  in full up to 1 MiB, so cover art is read just to get a few text frames (tens of GB over 100k files); MP4
-  text-decodes binary `covr` items. → Walk frame headers with small reads; skip APIC/GEOB/PRIV; decode only
-  `ilst` types 1 and 2.
-- **[Medium]** `tests/media_tests.cpp:734-876`: every FLAC/MP3/Vorbis/Opus/AAC/ALAC/WMA/WavPack/CAF test
-  `return`s with a MESSAGE when `ffmpeg` is not on PATH and still passes. No tests for Wave64, Ogg
-  FLAC/Speex, ADTS, VBRI, ID3v2.2, v2.4 extended header/footer, UTF-16BE, ID3v1, ASF DRM, MP4 v1/v2 and
-  64-bit boxes, or hostile inputs outside WAV; helpers tested only indirectly; nothing asserts invariant 11
-  (source bytes and mtime unchanged).
-- **[Low]** `ffmpeg_input.cpp:103-112`, `probe_ffmpeg.cpp:40-60`: the read-callback error is checked only
-  when open fails, so a starved probe returns as complete; no `avformat_find_stream_info`, so duration is
-  never filled (the else branch is dead); FFmpeg metadata tags ignored.
-- **[Low]** `decoder_ffmpeg.cpp:245-257` vs 278-283: `AVERROR_INVALIDDATA` skipped on send but fatal on
-  receive; one corrupt frame ends preview.
-- **[Low]** `decoder_ffmpeg.cpp:308`: a frame without a timestamp after seek is assumed to start exactly at
-  the target.
-- **[Low]** `id3.cpp:123`: v2.4 frame sizes always read as syncsafe; old iTunes files use plain sizes. → The
-  TagLib/mutagen fallback heuristic.
-- **[Low]** `probe_wavpack.cpp:45`: possibly wrong total for files over 2^32 samples (WavPack's
-  `low + (high << 32) - high`).
-- **[Low]** `probe_mp4.cpp:203`: rate from the 16.16 sample-entry field cannot exceed 65535 and shows the
-  core rate for HE-AAC (possible). → Read `esds`/`srat`.
-- **[Low]** `probe_asf.cpp:58, 132`: unknown format tags labelled `"wma"`; DWORD `WM/BeatsPerMinute`
-  ignored. APEv2 tags not parsed anywhere. `probe_wav.cpp:221` misses Wave64 LIST/INFO;
-  `probe_aiff.cpp:44` passes `in24`/`in32`/`23ni` through as opaque codecs.
-- **[Low]** `decoder_vorbis.cpp:98`: stb_vorbis has 32-bit lengths and a fuzz-crash history, and runs in
-  the UI process even when FFmpeg is available. → Prefer FFmpeg for Vorbis under `MSO_HAVE_FFMPEG`.
-- **[Low]** `file_handle.cpp:114-124`: POSIX `open()` without `O_NONBLOCK` blocks forever on a FIFO; the
-  directory check is by path after open (TOCTOU). → `fstat` and require `S_ISREG`.
-- **[Low]** `file_handle.cpp:57-60`: no `\\?\` prefix, and only the GUI exe is `longPathAware`; long paths
-  fail as `FileMissing` in `mso.exe` and `mso-worker.exe` (possible).
-- **[Low]** API: `Decoder::read(float*, size_t)` → `std::span<float>`; seek past end behaves differently per
-  backend.
-- **[Nit]** `id3.cpp:256` reads the ID3v1.0 comment as 28 bytes, not 30; `id3.cpp:89` keeps the `((`
-  escape; `tag_mapping.cpp:64` has only 80 genres; `parse_tag_key` lacks Open Key ("8m"); `probe_mpeg.cpp:156`
-  variable `bits` holds microseconds × kbps; missing `<limits>` (`probe_caf.cpp`), `<string>`/`<utility>`
-  (`ffmpeg_input.hpp`).
-- **[Nit]** Missing `///` on most parser internals (`WaveParser::*`, `walk_chunks`, `find_box`,
-  `parse_sample_entry`, `read_page`, `handle_frame`, `open_codec`, …). Names: `ext_lower` (`media.hpp:59`),
-  lambda `c` (`filename_hints.cpp:88, 129`), `mtime_ns`.
+Partly fixed: each `read_exact` still returns its own `std::vector`; implicit-SBR HE-AAC still reports the
+core rate (documented).
 
-### 4.5 files (`include/mso/files`, `src/files`): 6/10
+- **[Medium] (verified)** `deps/miniaudio/extras/stb_vorbis.c:758-759, 4158, 4188-4193`: see Fix first #3.
+- **[Low] (latent)** `stb_vorbis.c:1360-1375, 3712, 3724, 3736`: in push mode `stream_bytes_left` sees only
+  the bytes pushed so far, so a long comment (cover art) now fails `invalid_setup` instead of
+  `need_more_data`. The app uses pull mode only, so nothing breaks today. → Set `f->eof` in push mode.
+- **[Low] (possible)** `stb_vorbis.c:1367`: in FILE mode `stream_bytes_left` calls `ftell` per comment; a
+  crafted header with millions of empty comments could take seconds to open. → Compute once before the
+  loop.
+- **[Low]** `src/media/decoder_vorbis.cpp:52-58`: stb_vorbis turns an `fread` failure into EOF, so on the
+  default Vorbis path a drive that drops out ends preview silently (the FFmpeg path was just fixed for
+  this). → Check `ferror()` on the stdio handle on a short read.
+- **[Low] (possible)** `ffmpeg_input.cpp:49-52`: `read_error_` is sticky; after one transient read failure
+  every later EOF reports that stale error. → Clear on success or in `seek()`.
+- **[Low]** No tests for the resampler drain on a mid-stream change, EOF-with-read-error, or
+  `frames_exact() == false` for Vorbis through FFmpeg.
+- **[Nit]** `bounded_reader.cpp:54-56`: scattered reads refill 16 KiB each but are charged only their own
+  bytes (disk traffic can exceed `max_bytes`; `media.hpp:68` says "slightly more"); a successful
+  `find_stream_info` just past the deadline is reported as `ProbeLimit`; `deps/README.md:99-104` omits
+  part of the patch.
 
-Strengths: enumeration on its own thread into a bounded moodycamel
-`BlockingReaderWriterCircularBuffer` with timed waits; probes in a bounded BS thread pool; nothing past the
-cancellation fence is committed; directory listing failures become gaps, so files are never marked missing
-due to permissions; Windows identity opens with `FILE_READ_ATTRIBUTES` and full sharing; unchanged files are
-not re-probed. `scanned.reserve()` keeps task references stable while the batch grows (checked).
+### 4.5 files: 8.5/10
 
-- **[High] ✔** `src/files/importer.cpp:254-255` (in the loop that submits tasks at 260): if
-  `known_stats()` fails partway through a batch, `commit_batch` returns while already-submitted tasks hold
-  `&file` (into the local `scanned`) and `&stop`. BS `submit_task` futures do not block on destruction.
-  *Running tasks write into freed memory.* → Load the directory stats before submitting anything, or wait
-  for all futures in a scope guard before every return.
-- **[Medium]** `file_identity.cpp:85-93`: POSIX identity sets no `volume_id`/`file_id` (no rename tracking
-  on Linux), ignores the `last_write_time` error, maps EACCES to `FileMissing`, and converts
-  `file_clock` directly (not the Unix epoch on libstdc++). → `stat`: `st_dev`, `st_ino`, `st_mtim`.
-- **[Medium]** `file_identity.cpp:97` with `importer.cpp:93`: POSIX `is_reparse_point` calls throwing
-  `std::filesystem::is_symlink`; an `lstat` failure throws on the enumeration jthread and terminates the app.
-  → `entry.is_symlink(error_code)`.
-- **[Medium]** `importer.cpp:93`: every `FILE_ATTRIBUTE_REPARSE_POINT` entry is skipped on Windows, including
-  OneDrive and dedup files. *Whole synced folders import as empty, with no gap and no count.* → Check the
-  reparse tag; handle cloud placeholders explicitly; count skips.
-- **[Medium]** `importer.cpp:95`, `file_identity.cpp:54`: with `follow_reparse_points`, no cycle
-  detection, and `FILE_FLAG_OPEN_REPARSE_POINT` stats the link rather than its target. → Track visited
-  (volume, file id) for directories; drop the flag when following.
-- **[Medium]** `importer.cpp:330-335`: the enumerator watches only `enumeration_stop`. If the committer
-  constructor or `run` throws, the jthread destructor joins a thread blocked on a full queue: deadlock. →
-  Pass the jthread's token, or request stop in a scope guard.
-- **[Medium]** `importer.cpp`, `file_identity.cpp:52`: long paths without `\\?\` in `mso.exe` become
-  `FileMissing` (possible).
-- **[Medium]** `tests/import_tests.cpp`: untested are permission-denied gaps, symlinks and junctions,
-  cancellation mid-scan with resume, small batch sizes, probe-failure counting, catalog errors mid-batch
-  (which would have caught the High), and `read_file_identity` itself.
-- **[Low]** `importer.cpp:270`: `probe.wait()` drops task exceptions; the file is committed with no metadata
-  and no error. → `.get()` and convert to `probe_error`.
-- **[Low]** `file_identity.cpp:42`: `filename().string()` goes through the ANSI code page; Win32 error
-  mapping disagrees with `media::detail::FileHandle`.
-- **[Low]** `file_identity.cpp:36`: `(ticks - epoch) * 100` can overflow (UB) for crafted timestamps.
-- **[Low]** `importer.cpp:68`: pending-directories `deque` unbounded for wide trees.
-- **[Low]** API: `file_id` as `std::string` → `std::array<std::uint8_t,16>`; cancellation drops progress and
-  summary; `ProbeLimits` not settable via `ImportOptions`; `volume_id` 16 vs 8 hex digits.
-- **[Nit]** Duplicate Win32 RAII handle (`file_identity.cpp:17-31` vs media); `relative_utf8` is a no-op
-  wrapper; missing `<chrono>`, `<cstddef>`, `<map>`; missing `///` on `Enumerator::*`,
-  `ImportCommitter::*`, `ImportOptions`, `error_from_last_error`.
+Second-review High and Medium fixed with targeted tests: skipped files are marked seen and skipped
+directories become gaps; `StoredStatCache` loads each directory once (8-directory LRU). Also fixed:
+duplicate links (global visited set), setup exceptions, the cross-module include (public
+`media/native_file.hpp`), surrogate round-trip, visible skips in tests. Partly fixed: identities are read
+in parallel, but unchanged files are still opened; dedup is still untested; `ScannedFile::file_id` is
+still a `std::string`.
 
-### 4.6 analysis DSP (`include/mso/analysis`, `src/analysis` minus worker files): 8/10
+- **[Medium]** `src/files/file_identity.cpp:45-51, 120-130` with `importer.cpp:224-226`: see Fix first #8.
+- **[Low] (per-entry hot path on OneDrive roots)** `importer.cpp:219-226, 432, 520-530`: skips are sent
+  before the extension filter, so every cloud-only or link *non-audio* file (documents, DAW projects)
+  becomes a `mark_scan_entries_seen` path, which is the High in §4.2 multiplied. → For files, send the
+  skip only when `has_candidate_extension`.
+- **[Low]** `importer.cpp:42, 386-391`: with DFS interleaving, a subtree touching 8 or more directories
+  evicts the parent's map, which then reloads in full. → Key the LRU on the directories open on the
+  enumeration stack.
+- **[Low]** `importer.cpp:488`: each skipped directory records its gap as its own transaction. → Batch
+  with `pending_directories_`.
+- **[Nit]** Roots with any unfollowed link now always report `complete_coverage == false` (by design);
+  the UI wording should not read as an error.
 
-Strengths: one streaming decode feeds every stage, NaN/Inf cleaned once and reported; memory bounded by
-block size and the musical window; `WaveformBuilder` coarsens adaptively; the waveform codec validates size,
-flags, SHA-256 and ranges (tests flip every bit); DSP checked correct (Krumhansl-Kessler profiles, parabolic
-peak interpolation, periodic Hann normalised by 2/Σw, unbiased autocorrelation via zero-padded FFT,
-circular-mean tuning); canonical PCM hash; no exception crosses `analyze_file`.
+### 4.6 analysis: 9.5/10
 
-- **[Medium] ✔** `src/analysis/spectrum.cpp:38-39`: `pocketfft::r2c` free function on every frame with
-  `POCKETFFT_CACHE_SIZE` 0 (only `POCKETFFT_NO_MULTITHREADING` is set, `deps/CMakeLists.txt:41`). *The plan
-  and twiddles are rebuilt and scratch allocated per frame (~86/s of audio), contradicting
-  `spectrum.hpp:15-16`.* → Keep a `pocketfft_r<float>` plan as a member, or define `POCKETFFT_CACHE_SIZE`.
-- **[Medium]** `tempo_estimator.cpp:166-185` (possible): `climb_octaves` accepts 2× and 3× tempi at 85% of
-  the slower comb with no prior; dense hi-hat grooves at 85-95 BPM can read as 170-190. Tests cover only
-  kick patterns. → Weigh climbs by `tempo_prior`; add 16th-hat and half-time regression fixtures.
-- **[Medium]** `tests/analysis_tests.cpp`: no direct tests for `MagnitudeSpectrum`, `autocorrelation`,
-  `nearest_power_of_two`, `SpectrogramStream`, `MusicalFeatureExtractor`; tempo and key never tested at
-  48/96 kHz; only three keys tested.
-- **[Low]** `key_estimator.cpp:26, 92-93` (possible): the 0.03 margin includes relative and parallel keys,
-  so expect many "unknown key" results on real music.
-- **[Low]** `spectrogram_stream.hpp:43-44`: `erase(begin, begin+hop)` memmoves per hop. → Ring buffer.
-- **[Low]** `analyze_file.cpp:60-75`: byte hash and decoder each read the whole file (double I/O on slow
-  shares).
-- **[Low]** `analyze_file.cpp:31-34`: the `status` error is ignored, so EACCES reports as `FILE_MISSING`.
-- **[Low]** `waveform_builder.cpp:38-41` (possible): bin width set from an inexact frame-count hint can stay
-  too coarse for VBR files.
-- **[Low]** Duplicated limits: `kMaximumMusicalSeconds` vs `kMaxMusicalSeconds`, `kMaximumWaveformBins`
-  (1<<20) vs `kMaxWaveformBins` (65536), `kMaximumSampleRate` twice. Three little-endian serializers
-  (`pcm_hasher.cpp:18-24`, `waveform_codec.cpp:44-87`, `worker_protocol.cpp:25-39`).
-- **[Low]** `pcm_hasher.hpp:9`: public header includes `<picosha2.h>`. → Pimpl.
-- **[Nit]** `waveform_builder.cpp:42` reserves up to 24 MiB for tiny files; no `catch (...)` in
-  `analyze_file.cpp:97-103`; missing `///` on `parse_stage`, `LoudnessResult`, `AnalysisRequest`,
-  `AnalysisReport`, `read_file_stamp`, `analyze_file_or_throw`, `StageSelection::from`; `kMax*` vs
-  `kMaximum*`, `mtime_ns`.
+All second-review findings fixed (`hypot` removed from the per-frame path, duplicate stages refused,
+unused link removed, docs). Kept on purpose: pocketfft's internal scratch allocation (documented). Passes
+39/39 under ASan on Windows.
 
-### 4.7 worker (protocol, supervision, platform files, `src/worker/main.cpp`): 7/10
+- **[Low] (measured)** `src/analysis/byte_hash.cpp:25-30`: libc++ maps ERROR_BAD_NETPATH (server
+  unreachable) to "not found" with no error code, so only ERROR_BAD_NET_NAME becomes SOURCE_OFFLINE.
+  Measured with a scratch probe. It changes nothing in practice, because `read_file_stamp` already
+  returns FILE_MISSING first and the catalog treats both the same. → Classify by `GetFileAttributesW`'s
+  error code in both places, or drop the distinction.
+- **[Nit]** `spectrum.cpp:75`: float cast of a double above FLT_MAX is formally undefined (gives inf on
+  IEEE).
 
-Strengths: robust framing (partial reads, length checked before allocation, garbage becomes
-`PARSE_ERROR`, no paths in error text); strict schema decoding with `std::in_range` and finite floats;
-handshake PID check, watchdog for handshake, lease and cancel deadlines, bounded event queue, late results
-after cancel become `CANCELLED`. Win32: `CREATE_SUSPENDED` → job → resume, `KILL_ON_JOB_CLOSE`, memory and
-verified CPU caps, explicit handle list. POSIX: `pipe2(O_CLOEXEC)`, everything prepared before fork, only
-async-signal-safe calls after it, `close_range`, EINTR loops, SIGPIPE handled, zombies reaped.
+### 4.7 worker: 9/10
 
-- **[High] ✔** `src/worker/main.cpp:13-15, 115`: `#include <picosha2.h>` is inside `#ifdef _WIN32`, but
-  `picosha2::hash256_hex_string` is used unconditionally, and none of the included `mso/` headers pull it in
-  (checked). **mso-worker does not compile on Linux.** → Move the include out of the `#ifdef`.
-- **[High]** `src/worker/main.cpp:303-318` with `src/analysis/worker_process.cpp:470-474`: heartbeats come
-  from an independent `HeartbeatPump` thread and any frame renews the lease. *A task thread stuck in a
-  decoder or on an offline share keeps the lease alive forever; only a frozen whole process is detected
-  (the tests use SIGSTOP/SuspendThread). docs/04_CONTRACTS.md:111 requires cancel, then termination.* →
-  Heartbeat carries a task progress counter; add a per-task no-progress deadline in
-  `Session::overdue_deadline`.
-- **[Medium]** `worker_platform_posix.cpp:317, 323, 338-339`: the child `chdir`s to the executable's parent,
-  then `execv`s the original (possibly relative) path, so `build/mso-worker` resolves to
-  `build/build/mso-worker`; a bare `mso-worker` (the fallback at :276) makes `chdir("")` fail. → Make the
-  path absolute first.
-- **[Medium]** `worker_protocol.cpp:205-237, 592-594`: `TaskResult` values are schema-checked but not
-  range-checked (confidence, BPM, sha256 format, counts, waveform fields), unlike Progress. → A
-  `validate_result()` symmetric to `validate_task`.
-- **[Medium]** `worker_process.cpp:414-428`: the handshake ignores `algorithm_versions` and `self_test`; a
-  stale binary gets its results stamped with current algorithm versions. → Require equality; refuse
-  self-test unless asked.
-- **[Medium]** `worker_platform_posix.cpp:324-325, 336, 218`: `RLIMIT_AS` breaks sanitizer builds and
-  counts mappings; setting the hard limit fails with EPERM under a lower `ulimit -v` and surfaces as a crash,
-  not `RESOURCE_LIMIT`; `memory_limit_applied = true` unconfirmed. → Clamp, set only the soft limit, report
-  setup errors through a CLOEXEC error pipe, disable for sanitizer presets.
-- **[Medium]** `src/worker/main.cpp:410-418`: command line parsed by hand while CLI11 is vendored (rule 1).
-- **[Medium]** `worker_process.cpp:68-120, 137-167`: `FrameSender` and `EventQueue` are hand-written
-  mutex+deque queues; the SPSC `readerwriterqueue` does not fit (multiple producers, drop-oldest), which is
-  a legitimate reason but undocumented. → Vendor `moodycamel::ConcurrentQueue`, or record the exception.
-- **[Medium]** `tests/worker_tests.cpp`: untested are a live worker sending garbage, a message before the
-  handshake, a second or wrong-PID handshake, the handshake timeout, a hung task thread with heartbeats
-  running, `write_file_atomically`, and the memory-cap path; `sleep_for(4500ms)` at :499; the file uses
-  `TEST_SUITE("analysis")` (:245).
-- **[Low]** `worker_platform_win32.cpp:161-174`: `CreatePipe` makes both ends inheritable before the
-  supervisor end is cleared; a concurrent `CreateProcess(bInheritHandles=TRUE)` (QProcess) can inherit
-  them. → Create non-inheritable and mark only the child end.
-- **[Low]** `worker_platform_posix.cpp:328-341`: no signal-mask reset before exec; no `PR_SET_PDEATHSIG`
-  on Linux, so a hung task survives a supervisor crash.
-- **[Low]** `worker_platform_posix.cpp:331-332` (possible): if fds 0-2 were closed, `dup2` can clobber a
-  pipe end. → `F_DUPFD_CLOEXEC` above 2 first.
-- **[Low]** `worker_platform_posix.cpp:134-142`: blocking `waitpid` after SIGKILL can hang on a D-state child.
-- **[Low]** Subprocess management hand-written on both platforms; reproc (MIT) would cover spawn, pipes and
-  kill but not the confinement. → Record the decision.
-- **[Low]** `worker_process.cpp:48-64`: `validate_options` does not check durations (a lease deadline under
-  the 2 s heartbeat kills healthy workers).
-- **[Low]** `worker_protocol.cpp:480-497`: no catch for `bad_alloc` or `format_error`, despite "no exception
-  escapes". `worker_protocol.cpp:559-563`: `request_sequence` never validated.
-- **[Low]** `src/worker/main.cpp:194`: `TaskRunner::start` joins the previous task thread on the protocol
-  thread; a blocked final write stops Cancel/Shutdown handling. `main.cpp:344-345`: `__clang_major__` fails
-  with GCC.
-- **[Low]** `include/mso/analysis/worker_*.hpp` use namespace `mso::worker` in the analysis folder;
-  `worker_platform.hpp` is internal but public. → `include/mso/worker/`.
-- **[Nit]** Progress matched on job id, not `cancel_epoch` (`worker_process.cpp:396-399`);
-  `parse_error_code` assumes `Internal` is the last enumerator (`worker_protocol.cpp:639-645`);
-  `GetExitCodeProcess` unchecked (`win32:261`); `Overloaded`/`error_of` duplicated; no `@file` in
-  `worker_protocol.cpp`/`worker_process.cpp`; undocumented `to_json`/`from_json` layer; `kMax*` names.
-- **Observation (invariant 10):** `src/ui/preview_panel.cpp:340` calls `analysis::analyze_file` in the GUI
-  for the waveform stage. Allowed for preview, but it links the full analysis entry point into the UI and
-  lets a malformed file crash the UI. → A narrower preview-only waveform API.
+All Windows-relevant findings fixed with fault-injected tests:
+- `kTaskStopDeadline` plus `_Exit` on every exit path;
+- `waveform_segment` bins bounded by the task;
+- handshake limits compared;
+- CLI11 help to stderr;
+- single progress throttle;
+- a Win32 `cancel_blocked_read` test.
 
-### 4.8 audio (`include/mso/audio`, `src/audio`): 7/10
+Passes 36/36 under ASan on Windows inside the 2 GiB job cap.
 
-Strengths: the callback path (`OutputDevice::on_audio` → `PlaybackRenderer::render` →
-`PcmRing::front/pop_front`) uses only preallocated moodycamel operations, atomics and arithmetic; no
-allocation, locks, I/O, logging, virtual decoder calls or exceptions (invariant 12 holds). Exact integer
-source clock (`source_position.hpp:30-64`); epochs invalidate stale audio; correct shutdown order; resampling
-and folding through `ma_data_converter`, time-stretch through signalsmith; an offline backend gives 18
-hardware-free end-to-end tests.
+- **[Low]** `tests/worker_tests.cpp:744-761`: only the Shutdown path of the stuck-task exit is tested; the
+  stdin-EOF and protocol-violation exits are not.
+- **[Nit]** `kTaskStopDeadline` (2 s) equals the default `shutdown_grace` (2 s), so the worker's own exit
+  races the supervisor's terminate (same outcome; only the exit code differs). → Use 1 s.
 
-- **[High] ✔** `src/audio/source_stream.cpp:264-291` (with :260, :266, `playback_renderer.cpp:33`): every
-  segment start gets a 5 ms fade-in, including play from frame 0 of a one-shot, and every loop pass gets a
-  fade-out and fade-in at the seam, plus a transport fade on Play. docs/05_AUDIO_INTELLIGENCE.md §8: "Use
-  short crossfades only as a selected preview option and show that they alter audition"; not listed as a
-  deviation. *Drum attacks are softened in a sample auditioner, seamless loops dip every pass, and loops
-  under ~10 ms play nearly silent.* → Ramp only when a segment starts mid-signal; make seam fades an opt-in
-  `PlaybackShape` option reported in the snapshot; enforce a minimum loop length.
-- **[Medium] ✔** `src/audio/command_mailbox.cpp:117-118`: `take()` loads `stop_sequence_` before
-  `queue_.peek()`; the producer can store Stop (s) and enqueue Play (s+1) between the two loads. *"Stop then
-  Play" ends Stopped; "Stop then Seek" lands at 0; `tests/audio_tests.cpp:440-444` can flake.* → Peek first,
-  then load with acquire.
-- **[Medium] ✔** `src/audio/playback_renderer.cpp:31-32`: `output_enabled` is loaded before `pcm_epoch`,
-  while the decoder thread stores them in the opposite order. *A callback can play the new epoch (file start
-  or a new file) at full gain after Stop.* → Load the epoch first, or pack both in one 64-bit atomic.
-- **[Medium]** `playback_renderer.cpp:106-108`: mid-callback epoch adoption reuses the `output_enabled`
-  captured at callback start and skips the gain cut and declick decay (click; new audio leaks under a pause
-  fade). → Route through `follow_current_epoch`.
-- **[Medium]** `preview_engine.cpp:86-97` / `preview_engine.hpp:83`: `select_output_device` destroys the old
-  device before starting the new one, contrary to the doc. *One failed switch kills output.* → Stop the old
-  device without destroying it; restart it on failure.
-- **[Medium]** `preview_engine.cpp:150-165`: after a device switch, blocks rendered for the old rate play at
-  the new rate until re-anchor. → Bump the epoch or store the rate in `PcmBlockHeader`.
-- **[Medium]** `playback_controller.cpp:48-60`: `run()` has no exception barrier; `open_stream` catches only
-  `bad_alloc`. *One bad file or OOM terminates the desktop app.* → try/catch per pass → `fail_source`.
-- **[Low]** `source_stream.cpp:255-262`: `wrap_to_loop_start` ignores the decoder's real landing position;
-  each wrap is a full seek.
-- **[Low]** `source_stream.cpp:66-75`: loop end not clamped to the real end when frames are inexact.
-- **[Low]** `source_stream.cpp:167-169` with `playback_controller.cpp:295-308`: a persistent converter error
-  can become a busy loop of zero-frame blocks (possible).
-- **[Low]** `preview_engine.cpp:28, 37`; `playback_controller.cpp:364-369`: ring sized for 192 kHz while
-  384 kHz is accepted; prebuffer silently capped at 125 ms.
-- **[Low]** `source_stream.cpp:202-213`: stretch-mode tail approximate; position can exceed `total_frames`.
-- **[Low]** `shared_playback_state.hpp:36-91`: no `static_assert(is_always_lock_free)`; callback and decoder
-  writes share cache lines. → `alignas(std::hardware_destructive_interference_size)`.
-- **[Low]** No FTZ/DAZ anywhere: denormals on decaying stretch tails cost decoder-thread throughput.
-- **[Low]** `playback_controller.cpp:143-151`: after device-loss recovery every source becomes `Paused`.
-- **[Low]** `playback_renderer.cpp:157-161`, `preview_engine.cpp:227-230`: the playhead ignores device
-  latency (leads by 10-40 ms); snapshot reads epoch before frame.
-- **[Low]** `command_mailbox.cpp:73-114`: custom lock-free coalescing on top of moodycamel between two
-  non-real-time threads, which is where the ordering bug lives. → A mutex-protected latest-values struct
-  plus moodycamel, or direct unit tests.
-- **[Low]** `fixed_text.hpp:72-75`: `AtomicText::load` spins without pause or yield (the seqlock ordering is
-  correct).
-- **[Low]** `output_device.hpp:13`, `stereo_converter.hpp:10`, `command_mailbox.hpp:10`, `pcm_ring.hpp:11`:
-  public headers include PRIVATE deps. → `detail/`.
-- **[Low]** `tests/audio_tests.cpp:197-219, 410-412`: wall-clock sleeps.
-- **[Nit]** Discarded `try_enqueue` results (`pcm_ring.cpp:32, 52, 69`); `set_loop` re-anchors when
-  unchanged (`playback_controller.cpp:225-232`); superseded decoder destroyed under `request_mutex_`
-  (40-44); `Overloaded` defined twice; wrong "768 KiB" comment (`preview_engine.cpp:26-27`); no fade-in
-  after underrun (`playback_renderer.cpp:45-47`); missing `///` on many private members of
-  `CommandMailbox`, `PlaybackController`, `PlaybackRenderer`, `SourceStream`, `OutputDevice`, `PcmRing`.
-- **Tests:** no direct tests for `CommandMailbox`, `PcmRing`, `SourceClock`/`LoopFold`, `AtomicText` UTF-8
-  truncation, `StereoDownmix`, `LinearRamp`, `WakeupSignal`, `select_output_device`, device-loss recovery,
-  loop or seek in stretch mode, underrun counting, non-48 kHz output.
+### 4.8 audio: 8/10
 
-### 4.9 app (`include/mso/app`, `src/app`): 5/10
+Every second-review finding fixed, each with a test:
+- unconditional `cut_audio()` on epoch change;
+- re-anchor at the consumed position for shape changes;
+- epoch copied before adoption;
+- `configure()` drops other-rate blocks;
+- loop minimum after inexact EOF;
+- generation bookkeeping;
+- the deviations listed;
+- `Overloaded` deduplicated.
 
-Strengths: export streams into `<destination>.<uuid>.partial` and renames into place, with CSV quoting via
-csv-parser and JSON via nlohmann; `search`/`count` hold a `shared_ptr` snapshot of libraries; the event
-handler is invoked outside its mutex; the supervisor fences results and verifies waveform segments before
-referencing them; workspace writes via temp plus rename, sets aside corrupt files, and has
-`#ifdef _WIN32` LOCALAPPDATA and POSIX XDG branches.
+The callback path was re-traced: no allocation, lock, I/O, logging, exception or unbounded loop. The new
+output supervisor runs every backend call on one thread (COM balanced), tears down in the right order and
+never runs two callbacks at once.
 
-- **[Critical] ✔** `src/app/application.cpp:294-296`, `include/mso/app/application.hpp:137`:
-  `Application::library()` returns `.get()` of a temporary `shared_ptr` ("valid until close_library()").
-  UI pool lambdas (`main_window.cpp:716, 862, 892, 947`; `inspector_panel.cpp:418, 521`;
-  `history_panel.cpp:70`; `navigator_panel.cpp:103, 248`) call `apply_edit`, `undo`, `history`,
-  `list_folders` and `create_backup` through it while `close_library` (279-286) can run on another of the
-  four pool threads. *Use-after-free; the navigator reload during import makes it reachable.* → A
-  `with_library(uuid, function)` that holds the `shared_ptr` for the call; route every UI catalog access
-  through it; remove the raw-pointer accessors.
-- **[High] ✔** `application.cpp:257-272`: `open_library` calls `catalog::Library::open` before the
-  duplicate-UUID and 8-library checks; a writable open always runs `recover_after_crash()`
-  (`library_lifecycle.cpp:225-226, 265-293`). *Opening an already-open folder (UI twice, or the CLI while
-  the desktop runs, since there is no lock file) marks live jobs interrupted, pauses runs and scans, marks
-  in-flight history partial. A 9th library is migrated and backed up before being refused.* → Read the
-  manifest UUID first; add a per-library exclusive lock (`LockFileEx`/`flock`); recover only when the lock is
-  acquired cleanly.
-- **[High] ✔** `src/app/workspace.cpp:14-17, 24`: on Windows `std::getenv` returns ANSI-code-page bytes
-  that are decoded as UTF-8 by `path_from_utf8`. *A profile like `C:\Users\אלון\…` gives a wrong or
-  unwritable workspace path.* → `SHGetKnownFolderPath(FOLDERID_LocalAppData)` or `_wgetenv` inside the
-  existing `#ifdef`; same for `MSO_WORKSPACE_DIR`.
-- **[High] ✔** `application.cpp:139-152` with 508: `~Application` destroys the supervisor before stopping
-  and joining imports; an import finishing in automatic mode reads `state_->supervisor` unsynchronized.
-  *Data race and possible use-after-free at shutdown.* → Join operations first, then the supervisor.
-- **[High]** `src/app/analysis_supervisor.cpp:147-209`: no wall-clock timeout per job; the lease is renewed
-  every 5 s forever, also after a failed renewal (155-158). See theme 2. → Per-job deadline scaled by
-  duration, then kill and restart the worker, failing the job as retryable.
-- **[Medium]** `workspace.cpp:89-99` with `src/cli/main.cpp:61-73`: the desktop and CLI share
-  `workspace.json`, each rewriting the whole file from its in-memory copy, with the same fixed `.tmp` name
-  and no fsync. *Lost updates and possible corruption (which then sets aside every binding).* → Unique temp
-  name, inter-process lock, re-read and merge, fsync.
-- **[Medium]** `workspace.cpp:57-69`: `value("name", …)` throws on wrong-typed entries, escaping `load()`
-  and blocking startup, contrary to `workspace.hpp:44`.
-- **[Medium]** `application.cpp:377-406`: the operations map is pruned only by `wait_for_operation`, which
-  the UI never calls; finished jthreads accumulate; the thread starts before it is inserted, so an early
-  cancel is lost.
-- **[Medium]** `application.cpp:187-195, 370-406`: one jthread plus one probe pool per import, and start-up
-  scans every root at once. → One bounded queue on the vendored thread pool.
-- **[Medium]** `application.cpp:471-489`: `queue_automatic_analysis` pages a full hydrating search to collect
-  every sample id into an unbounded vector; errors dropped (482, 488). → Catalog-side `INSERT … SELECT` run
-  creation.
-- **[Medium]** `application.cpp:180-184`: the supervisor can lease a job before `set_paused(true)` is
-  applied after an unclean shutdown; libraries opened later are never checked.
-- **[Medium]** `application.cpp:174-179`, `analysis_supervisor.cpp:89, 139`: unthrottled analysis events
-  (see theme 3).
-- **[Medium]** `application.cpp:121, 201-204`: `set_event_handler` gives no guarantee the old handler is not
-  still running. → Document plus a quiescence mechanism.
-- **[Medium]** `analysis_supervisor.cpp:140-144`: a failed `submit` retries immediately, spawning workers
-  back to back. → Backoff.
-- **[Medium]** Tests: `AnalysisSupervisor` has none; `Workspace` has none for wrong types, newer versions,
-  rebinds; export lacks `--raw`, absolute paths, filters, multi-page (>500 rows, so the cursor path is never
-  exercised), replacing a destination; application tests sit in `TEST_SUITE("export")`.
-- **[Low]** `metadata_export.cpp:173-185`: the CSV manifest is written after the rename, directly, with no
-  error check; the rename error is overwritten (168-171).
-- **[Low]** `metadata_export.cpp:102, 131-159`: the recorded revision does not describe the exported data
-  under concurrent edits.
-- **[Low]** `metadata_export.cpp:127, 152`, `workspace.cpp:94`: `dump()` throws on invalid UTF-8. →
-  `error_handler_t::replace`.
-- **[Low]** `metadata_export.cpp:127`: JSON envelope built by splicing dump text. `:165`: stream failure
-  checked only after all pages.
-- **[Low]** `application.cpp:541`: absolute-path resolver ignores managed roots (latent until P2.1).
-  `application.cpp:95-96`: `resolve` joins catalog paths without `is_safe_relative_path` (possible).
-- **[Low]** `application.cpp:233-249`: folder-name sanitizing skips Windows reserved names.
-  `application.cpp:308-326`: `add_root` stores `absolute()` not canonical, allows duplicates, leaves an
-  unbound root on failure, emits no availability event.
-- **[Low]** `workspace.cpp:25, 30, 46`: temp-directory fallback for persistent state; an `exists()` error
-  yields an empty workspace that the next save writes over the real one.
-- **[Low]** `application.cpp:42, 186`: unused `State::owner` and a misleading comment;
-  `analysis_supervisor.hpp:6` contradicts automatic mode.
-- **[Low]** `analysis_supervisor.cpp:198-206`: failed waveform files left on disk; results `(void)`-dropped;
-  `profile_digest = "default"` hard-coded (133); a malformed lease token falls back to `new_uuid()` (130).
-- **[Nit]** `RunningOperation` in a named namespace in a .cpp (ODR hazard); the jthread's own token ignored
-  for a second `stop_source`; "scope" reused for a different meaning; missing `///` on
-  `AnalysisSupervisor`, `create_library`, `close_library`, `libraries`, `cancel_operation`, `count`,
-  `start_analysis`, `export_metadata`, `ExportOptions`, `Workspace` binding methods.
+- **[Medium] (verified by reading miniaudio 0.11.25)** `output_device.cpp:184-189`, `output_supervisor.cpp:181-183`:
+  see Fix first #4.
+- **[Medium] (possible)** `output_device.cpp:184-189`: loss detection relies only on miniaudio's "stopped"
+  notification, which is skipped when the backend stop fails (`miniaudio.h:42842-42849`), as after an
+  unplug of an explicitly chosen endpoint. *The engine stays "Playing" in silence with no Retry.* → A
+  watchdog on the output thread: a callback counter that has not advanced for about 1 s while started
+  means lost.
+- **[Low]** `playback_controller.cpp:404, 407-414`: the consumed re-anchor can still repeat or skip one
+  callback period. The gate is published before the first new-epoch block is committed, and a callback
+  can run in between. `IMPLEMENTATION_STATUS.md:206` ("nothing is replayed") overclaims. → Commit the
+  first block before publishing the gate.
+- **[Low]** `playback_renderer.cpp:22-41`: a same-rate device switch first plays old-epoch blocks from the
+  old consumed position, then jumps back. → Mark every current epoch superseded in `configure()`.
+- **[Nit]** A spurious underrun after a rate switch; sub-millisecond spin in `time_until_next_wake`
+  (moodycamel truncates to ms); `guarded_device_request` lacks `catch (...)`; `requests_` deque is
+  bounded only by blocking callers.
 
-### 4.10 cli (`include/mso/cli`, `src/cli`): 5/10
+### 4.9 app: 8/10
 
-Strengths: CLI11 throughout with `ensure_utf8(argv)` and `SetConsoleOutputCP(CP_UTF8)` behind
-`#ifdef _WIN32`; validators (`IsMember`, `Range(0,5)`, stduuid parsing); partial coverage reported as
-warnings; `--json` built with nlohmann; Ctrl+C maps to cooperative import cancellation.
+Second-review Highs fixed:
+- **Memory:** cap, compact rows, deviation recorded.
+- **Cursors:** keyset, per-stream resume.
 
-- **[High]** `src/cli/media_commands.cpp:18-35` with `analysis_supervisor.cpp:109-117`: `mso analyze` polls
-  until queued+running is 0, with no timeout. *If mso-worker cannot start, the supervisor pauses itself and
-  the CLI loops forever; a run older than the 100 most recent ends the wait early with false success.* →
-  Detect "paused/worker unavailable" and exit non-zero; overall timeout; Ctrl+C; query by run id.
-- **[Medium]** `src/cli/main.cpp:64-68`: only `CLI::ParseError` is caught; `json::type_error`,
-  `filesystem_error` (`bench_commands.cpp:130-131`) or `bad_alloc` abort with no message. → Catch
-  `std::exception`.
-- **[Medium]** `edit_commands.cpp:12-18`: `std::stod` is locale-dependent and accepts trailing garbage,
-  negatives, `nan`. → `std::from_chars` with full-consumption and range checks, shared with the query parser.
-- **[Medium]** `src/cli/main.cpp:61-73` with `application.cpp:273`: the CLI uses the desktop's workspace and
-  records every opened library as open. *Every folder touched by `mso info`, `mso bench` or tests is
-  auto-reopened by the desktop and counts against the 8-library limit.* → Do not persist "open" from the CLI.
-- **[Medium]** `edit_commands.cpp:134, 172`: `mso tag`/`mso collection` with no action exit 2 and print
-  nothing; conflicting options (99-100, 85-86) silently pick one. → `->excludes()`, `require_option(1)`.
-- **[Medium]** `library_commands.cpp:13-16, 96`: the SIGINT handler calls `stop_source::request_stop()`,
-  which is not async-signal-safe on POSIX (can deadlock); never restored; only `import` installs it. →
-  Atomic flag plus watcher thread, or `SetConsoleCtrlHandler`/`sigaction` behind `#ifdef`.
-- **[Medium]** No automated test of any CLI command (no `cli` suite, no CTest invocation of `mso`). Rule 5
-  **Fail**. → A doctest suite that drives `CLI::App` in-process against a scratch workspace.
-- **[Low]** `main.cpp:67`, `command_context.hpp:18-20`: usage errors exit with CLI11's 100-114 codes despite
-  `kExitUsage = 2`; every runtime error is 1; partial-coverage searches exit 0.
-- **[Low]** `search_commands.cpp:101-105`: `--json --count` appends plain text after the JSON; count errors
-  ignored.
-- **[Low]** `bench_commands.cpp:54-64`: `--repetitions 0` indexes an empty vector (UB); benchmark errors
-  ignored (114, 128).
-- **[Low]** `library_commands.cpp:98`: `import --root 99` does nothing and exits 0; `\r` progress written
-  when not a terminal and with `--json`; `info` swallows a count error (54).
-- **[Low]** `media_commands.cpp:137-147`: same unbounded id collection as the app.
-- **[Nit]** `register_analysis_commands` lives in `media_commands.cpp`; `play --volume` clamps instead of
-  `CLI::Range`; magic 3600 s cap (104); missing `<functional>` in `bench_commands.cpp`; `"mso 0.1.0"`
-  hard-coded (`main.cpp:49`) while the GUI uses `PROJECT_VERSION`; `g_interrupt` Hungarian prefix; missing
-  `///` on file-local helpers and the six `register_*` functions.
+Mediums fixed:
+- reload no longer holds the sync lock while streaming;
+- close gives the job back and reopen waits, then returns a retryable DB_BUSY;
+- read-only libraries are retried every 2 s and upgraded.
 
-### 4.11 ui (`include/mso/ui`, `src/ui`): 6/10
+Every Low fixed: workspace reload, backoff predicate, lease-error throttle, flushed export, generation-safe
+id cache, `remember_library`, thread docs, shared JSON helpers. Dropped as security-only: lock-file
+tampering.
 
-Strengths: one async gateway (`background_tasks.hpp`, `ApplicationSession::run`) delivering through
-`QFuture::then(context, …)`, so destroyed panels never get callbacks; generation counters drop stale
-results; all `this`-capturing connects pass a context object; `SampleTableModel` is a proper paged model
-(native `canFetchMore`/`fetchMore`, keyset cursors, LRU of 10 pages, old rows kept until the new page
-arrives) with tests that interleave deliveries; accessibility considered throughout; palette-only painting;
-careful UTF-8/UTF-16 handling; refusing partial drags.
+Partly fixed:
+- An `all_samples` edit (more than 10,000 samples) still returns before the index reflects it.
+- The memory figure comes from best-case names.
 
-- **[Critical] ✔** UI use of `Application::library()`: see §4.9.
-- **[High] ✔** `src/ui/sample_table_model.cpp:307-322, 516-539` (with 256, 78): `refresh()` during a pending
-  `restart()` never resets `replacing_` (only `replace_rows`/`clear` do). *`canFetchMore()` stays false: the
-  user cannot scroll past ~400 rows and sees "Loading…" until the next query. Very likely, since catalog
-  refreshes fire every 750 ms during import and analysis.* → Reset `replacing_`/`append_pending_` in
-  `refresh()`, or defer refresh to the pending restart; add a test.
-- **[High] ✔** `src/ui/main_window.cpp:257, 280`; `src/ui/shortcut_catalog.cpp:11-23`: Space, Escape,
-  Delete, F and 0–5 are `Qt::WindowShortcut`s. *Delete pressed in the Navigator, Jobs or History removes the
-  table selection from the library; digits and F in the tree change the table selection's rating or
-  favourite and kill type-ahead.* → `Qt::WidgetWithChildrenShortcut` on the table for single-key commands;
-  only modifier shortcuts window-wide.
-- **[High]** `application.cpp:176-178` → `main_window.cpp:416-426` → `sample_table_model.cpp:313-321, 538`:
-  every analysis tick triggers a refresh (up to 10 sequential pages plus a count every 750 ms), a navigator
-  rebuild, an inspector re-read and a drag re-check of up to 1,000 files. *A view scrolled past row 2,000 is
-  cut back every 750 ms; the refresh may never commit if 10 pages take longer than the throttle.* → See
-  theme 3; re-read loaded pages from stored cursors; recount less often.
-- **[High]** `inspector_panel.cpp:565-567, 486-489, 449-453` (via `main_window.cpp:178-181, 444`): every
-  refresh calls `show_selection`, resetting the name field, BPM spin box and tag list even when the selection
-  is unchanged. *A rename or BPM edit in progress is overwritten during import or analysis.* → Update only
-  unfocused, unmodified fields, or diff first.
-- **[Medium]** `application_session.cpp:88-95`; `main_window.cpp:1099-1103, 1123-1126`: `set_preference`
-  updates memory only when the queued writer runs, so the presets menu can show stale data and two quick
-  saves can lose one; `preference()` on the UI thread waits on the mutex held during file write. → A
-  session-side cache updated synchronously, coalesced writes.
-- **[Medium]** `sample_table_view.cpp:223-226`; `main_window.cpp:443`: a drag starts only if async
-  resolution for exactly this selection finished. *Click-and-drag in one motion is often refused.* → Build
-  URLs at drag start from catalog data; check availability in the background.
-- **[Medium]** `drag_path_resolver.cpp:9-29`; `application_session.cpp:17`: every selection change checks
-  up to 1,000 files on the shared 4-thread pool, uncancellable. → A dedicated one-thread pool with a
-  `stop_token`; debounce.
-- **[Medium]** `navigator_panel.cpp:96-128, 137-195`: every reload reads every folder of every root and
-  rebuilds a `QTreeWidget` (every 2 s during import); the header (`navigator_panel.hpp:25-26`) still says
-  folders load on expand. Invariant 13. → A lazy `QAbstractItemModel`; fix the comment.
-- **[Medium]** `main_window.cpp` (~1,200 lines, ~60 functions): business logic in the window (multi-library
-  edit fan-out 849-885, undo routing 922-929, export 661-705, backup 711-727, presets 1093-1129, direct
-  `catalog::Library` calls). → Extract `EditController`/`UndoRouter` behind the Application API,
-  `ExportController`, `LayoutPresetStore`, `SampleContextMenu`.
-- **[Medium]** `main_window.cpp:1131-1150`: the About box hard-codes dependencies and omits
-  signalsmith-stretch, signalsmith-linear and csv-parser (MIT notices required). → Generate from
-  `deps/manifest.json` at configure time.
-- **[Medium]** `main_window.cpp:1165-1175`: `choose_library` maps the choice back by name; duplicate names
-  ("My Samples") act on the wrong library. → Choose by index.
-- **[Medium]** `inspector_panel.cpp:384, 394-402`: `same_library_set` compares only first rows; combos stay
-  empty after a multi-library selection; never reloaded after taxonomy edits.
-- **[Medium]** `inspector_panel.cpp:38-41, 198, 594-605`: tags rebuilt by splitting the display string on
-  ", "; a tag containing ", " breaks counts and removes the wrong tag. → Carry tag ids in `SampleRow`.
-- **[Medium]** `jobs_panel.cpp:192-194, 91-105`: the `present` set is filled but never read, so cleared
-  runs come back and rows grow unbounded; `worker_status_` keyed by library name (`jobs_panel.hpp:66`).
-- **[Medium]** `waveform_view.cpp:131-158, 66-71`; `preview_panel.cpp:29`: one logical pixel per column
-  with no device-pixel-ratio handling (blocky on high DPI); full redraw every 30 ms. → Cached `QPixmap` at
-  `devicePixelRatioF()`; repaint the playhead strip only.
-- **[Medium]** `preview_panel.cpp:110-117`: every volume-slider step queues a full workspace file write. →
-  Persist on release or debounce.
-- **[Medium]** `tests/ui_tests.cpp`: no tests for MainWindow, InspectorPanel, JobsPanel, HistoryPanel,
-  SearchBar, PreferencesDialog, LayoutStore, DisplayFormat, DragPathResolver, WaveformView, AddFolderDialog,
-  EmptyStateWidget, FileManager, `select_keys`; refresh-while-pending untested.
-- **[Low]** `sample_row_delegate.cpp:130-134` vs `main_window.cpp:138`: Qt emits `doubleClicked` before
-  `edit()`, so double-clicking a star probably still plays the sample.
-- **[Low]** `display_format.cpp:15-19`: analysis flag bits copied from the catalog's private `stage_flag()`.
-- **[Low]** `background_tasks.hpp:28`: `takeResult()` rethrows on the UI thread → `std::terminate`. →
-  Convert to `Result` in `run_in_background`, or `onFailed`.
-- **[Low]** `display_format.cpp:32-34`, `sample_table_view.cpp:234`, `main_window.cpp:832`: three separate
-  `generic_u16string()` conversions, lossy or throwing for non-UTF-8 Linux names.
-- **[Low]** `file_manager.cpp:13`, `main_window.cpp:753`, `navigator_panel.cpp:415, 423`: `Q_OS_WIN`
-  instead of `_WIN32`; "Show in Explorer" label on Linux.
-- **[Low]** Qt already provides: clock formatting (`preview_panel.cpp:37-43`), `QLocale::formattedDataSize`
-  (`display_format.cpp:80-83`), plural `tr("%n …", nullptr, n)` (`main_window.cpp:474`), no concatenated
-  translations (`main_window.cpp:476-479`, `navigator_panel.cpp:149`), `QKeySequence::Undo/Redo/Find/…`
-  (`shortcut_catalog.cpp:13-28`; Ctrl+Shift+Z is not Windows' Redo).
-- **[Low]** `search_bar.cpp:107-108, 115`: hard-coded `#c42b1c` stylesheet; unused "invalid" property.
-- **[Low]** `sample_table_model.cpp:78, 550-553, 456-458, 313, 487-491`: failed loads retried with no
-  back-off; a failed refresh can leave pages `hydrating` forever.
-- **[Low]** `main_window.cpp:880, 953-956, 1183`: edit and undo failures shown only as a 6 s status message.
-- **[Low]** `add_folder_dialog.cpp:36-38`: says analysis runs "only when you ask", contradicting automatic
-  mode.
-- **[Low]** UI-thread blocking: engine created on first play (`preview_panel.cpp:244-263`);
-  `is_library_folder` disk check (`main_window.cpp:517`).
-- **[Low]** Layout restored after `show()` (window jumps); initial size set twice (`main_window.cpp:79`,
-  `main.cpp:84`); `restoreState()` result ignored (`layout_store.cpp:41-42`).
-- **[Low]** Model nits: `commit_staged_pages` swaps rows under persistent indexes without
-  `layoutAboutToBeChanged` (523-536); unused `SampleKeyRole`; `queryFailed` used for info (572); first-page
-  failure clears rows contrary to the header (417-419); `select_keys` is O(keys × rows).
-- **[Low]** Accessibility: `StarRatingWidget` and `WaveformView` expose no role or value; the context-menu
-  key uses the pointer position; `poll_engine` resets the accessible name every 30 ms.
-- **[Low]** `navigator_panel.cpp:295, 354-361, 436-439`: root name parsed from display text; tag rename loses
-  expansion; "Move tag" offers the tag's own descendants.
-- **[Low]** `main_window.cpp:146-161`: modal `QMessageBox` from inside `startDrag`. → `QTimer::singleShot(0)`.
-- **[Low]** `application_session.cpp:48-51`: one queued lambda per event, no coalescing.
-- **[Low]** `sample_table_model.cpp:545`: `const_cast<SampleTableModel*>(this)`. → `mutable` cache.
-- **[Nit]** Missing `///` on private members across ~18 headers (largest: `main_window.hpp:64-123`,
-  `inspector_panel.hpp:53-59` `update_summary`, `navigator_panel.hpp:85` `show_context_menu`, 140 lines);
-  `a`/`b` in `same_scope` (`sample_table_model.cpp:20-21`); custom JSON preference store instead of
-  QSettings should be justified in a comment.
+Not fixed:
+- `State` is about 380 lines.
+- Supervisor deadline, abandon and backoff have no tests.
+- The JSON export envelope is spliced.
+
+- **[Medium] (verified by reading)** `src/app/application.cpp:300-306, 382-385, 454-457, 472-503`: see Fix
+  first #5.
+- **[Medium]** `src/app/sample_index.cpp:743-772`: see Fix first #6.
+- **[Medium] (possible; estimate)** `src/cli/bench_commands.cpp:36-48`, `sample_index.cpp:191-193, 893-909`:
+  the recorded 248-265 B/row uses 12-16-byte synthetic names that fit libc++'s small-string buffer. Real
+  names (25-60 bytes, often non-ASCII) allocate, roughly +100-190 B/row, and `fresh.rows` is never
+  reserved (1.5× during growth). *"About 520 MiB at the cap fits 768 MiB" may not hold on real libraries.*
+  → Benchmark with realistic names, keep row text in one arena, reserve, consider a byte cap.
+- **[Low] (possible)** `sample_index.cpp:46-48, 616-631, 514-523`: the id-to-slot vector and id bitmaps are
+  sized by the largest sample id (up to 2^31), outside the row cap. A sparse or huge rowid commits
+  gigabytes, and a `bad_alloc` on the `apply_edit` path escapes. → Tie the id limit to the row limit.
+- **[Low]** `sample_index.cpp:896-897`: a cancelled load still streams every row (the `for_each_row` visitor
+  cannot stop). → Let it return `bool`.
+- **[Low]** `sample_index.cpp:847-856`: the previous index is freed while the sync mutex is held. → Destroy
+  it after release.
+- **[Low]** `application.cpp:104, 360-365, 482`: `index_disabled` is permanent; a library pushed over the
+  budget stays on SQLite after the other library closes. → Re-check on close and on the poll.
+- **[Low] (possible)** `sample_index.cpp:1237-1248, 1425, 1488`: a library incomplete on one page and
+  complete on the next has no stored position and restarts at row 0. → Treat it as STALE.
+- **[Low]** `docs/DEVELOPING.md:120-126`, `IMPLEMENTATION_STATUS.md:186-187`: the docs say *closing* waits
+  10 s (it is *opening* that waits) and that cursors go stale "only when rows are added or removed"
+  (taxonomy changes also do).
+- **[Nit]** `SampleIndex::loading()` is `noexcept` but locks and is unused; the 300 vs 260 MiB comment
+  mismatch; tag sets not counted in the cap.
+
+### 4.10 cli: 8.5/10
+
+The Critical is fixed at the root and every binding audited. Also fixed:
+- `play` stops on Stopped or at the known length plus 2 s;
+- the stall limit is the job cap plus 5 min;
+- `analyze` stops only when the queue is paused;
+- a second Ctrl+C reaches the default handler;
+- `backup` takes the lock;
+- new tests for interrupts, timeouts, exit 3 and `play`;
+- `value_parsing` split out.
+
+Not fixed: `current_runs` lists 1,000 runs; `analyze` with a query still collects every id.
+
+- **[Low]** `src/cli/search_commands.cpp:96-97, 114, 122-123, 138-144`: `--json` builds the whole result as
+  one JSON DOM, and `--limit` accepts 10,000,000 (gigabytes at 1M rows). → Stream the array.
+- **[Low] (possible)** `media_commands.cpp:290-294`: the end limit trusts estimated lengths (VBR MP3 without
+  a seek header), so a longer file is cut. → Apply it only to exact durations.
+- **[Nit]** The coverage warning repeats on every page; the binding test's comment says it exercises every
+  flag but skips five; `bench --rows` above 1M cannot measure the index.
+
+### 4.11 ui (core): 7.5/10
+
+Second-review High fixed (anchored refresh over every loaded row, layout change moving persistent
+indexes by key). Mediums fixed:
+- partial selections refused;
+- writes queued per library;
+- `rows()` returns `Result`;
+- the re-select removed;
+- history reloaded on demand;
+- exports on their own pool.
+
+Lows fixed: the pending-edit overlay on every install path, taxonomy through `Application`, obsolete
+generations stopped, teardown disconnects, shortcut scope per key, per-event costs trimmed, preferences
+read on the pool, drag `path_of` map. `AnalysisController` and `LayoutController` were extracted, so
+MainWindow is now 828 lines. Partly fixed: a running backup still delays exit.
+
+- **[High] (verified code; livelock possible)** `src/ui/sample_table_model.cpp:326-353` with
+  `main_window.cpp:506-510, 522-524`: see Fix first #2.
+- **[Medium]** `sample_table_model.cpp:362-364` with `334, 748`; `edit_controller.cpp:75-76`:
+  `refresh_rows` deliveries are dropped when the generation moves, and a refresh moves it both at its
+  start and at its commit. *An analysis result or an edit's settle read arriving during a walk is lost,
+  so the old value stays or a saved rating flickers back.* → Apply row deliveries by key regardless of
+  generation, or re-request the keys read during a refresh after the commit.
+- **[Medium]** `sample_table_view.cpp:204-209`, `main_window.cpp:662-681`: the partial-selection refusal is
+  avoidable. Pages keep keys for every covered row, but `selected_keys()` returns only hydrated rows, so a
+  Ctrl+A over more than 2,000 rows ("search kick, select all, press 5") is always refused. → Build the
+  selection's keys from `Page::keys`; keep the refusal only for drag and copy, which need paths.
+- **[Medium] (possible; Qt internals)** `sample_table_model.cpp:780-797`: the layout change is emitted
+  without `QAbstractItemModel::VerticalSortHint`, so a 20,000-row Shift-selection holds about 340,000
+  persistent indexes (rows × 17 columns), rebuilt on every refresh. The commit also builds a `std::map`
+  over every common row. → Pass the hint; look up only the persistent rows' keys.
+- **[Low]** `sample_table_model.cpp:785, 792`: when the result grows, persistent indexes past the old row
+  count become invalid (selected rows pushed down by an import drop out). → Insert the extra rows before
+  the layout change.
+- **[Low]** `sample_table_model.cpp:93, 853-856` vs `733-742`: between stale retries a visible evicted page
+  can hydrate with a stale cursor and refresh immediately, skipping back-off.
+- **[Low]** `edit_controller.cpp:75-82`: if the reconcile read fails after a failed write, rows keep the
+  failed prediction although the message says it "was undone on screen".
+- **[Low]** `sample_table_model.cpp:271-274` vs `347-348`: appended pages and `seen_keys_` are unbounded
+  while a refresh cuts at 500,000 rows. → Stop `canFetchMore` at the cap.
+- **[Low]** `main_window.cpp:547-550`: a linear `library_info()` search plus a copy per selected sample on
+  every selection update.
+- **[Low]** No test drives MainWindow's selection refusal, `refresh()` while refreshing, or the 500 ms
+  window path.
+- **[Nit]** `IMPLEMENTATION_STATUS.md:199-200` says partial selections "ask the user to wait" (the code
+  refuses); `layout_controller.cpp:46-47` skips the header restore when the dock restore fails; the
+  "Select the samples to analyze first" message also shows when the session is not ready; `restart()`
+  keeps `staged_keys_`.
+
+### 4.12 ui (panels): 8.5/10
+
+Every second-review High and Medium fixed:
+- **Navigator:** use-after-free fixed by value capture, reads coalesced (one in flight per library, a
+  1 s interval and a generation).
+- **History and inspector:** history read on demand; the inspector Format line kept.
+- **Preview:** device recovery with Retry and an Output menu, and the single-thread engine contract.
+
+Every Low fixed:
+- **Preview:** the "Opening…" status cleared; waveform-only generation.
+- **Inspector:** drafts per field, focus-independent reset, Clear notes, stars, multi-arg tag text,
+  builders split.
+- **Jobs and history:** closed libraries' rows removed; Undo enabled only with something to undo.
+- **Other panels:** locale formatting, asynchronous file manager, plain-text labels, menus split.
+
+Deferred (Linux): `QFile::decodeName`.
+
+- **[Medium] (verified)** `src/ui/preview_panel.cpp:249, 258, 310, 437, 451, 474, 490`: see Fix first #7.
+- **[Low]** `preview_panel.cpp:248-251`: Space after a device loss resumes and then pauses at once. Restore
+  re-plays and the queued `TogglePlayPause` then pauses. → Post `Play` when the snapshot is not Playing.
+- **[Low] (possible)** `navigator_panel.cpp:134-153, 183, 194`: a full reload's older outline can overwrite
+  a newer per-library one, and the tree stays stale until the next change. → Re-mark dirty libraries
+  whose read started after the full read.
+- **[Low] (possible)** `inspector_panel.cpp:725-736`: a focused collection combo keeps the previous
+  library's ids when the selection moves to another library, so "Add to" can target the wrong collection.
+  → Always refill on a library change.
+- **[Low]** `inspector_panel.cpp:556-559`: a multi-selection with different manual BPMs shows "Value" with
+  the previous sample's number and Apply enabled. → Show Mixed.
+- **[Low] (perf)** `inspector_panel.cpp:571-588`: `reload_library_choices()` runs on every structure change
+  of any library (about 6.7/s during import). → Ignore other libraries; coalesce like the navigator.
+- **[Low] (possible)** `navigator_panel.cpp:298-303, 323-327`: a parent cycle in a damaged catalog builds
+  items that are never attached (a leak on every rebuild; no crash).
+- **[Low]** Device loss and engine-creation failure are untested (the null device is never lost).
+- **[Nit]** Rich-text tooltips from user text; one shared library timer; `library_reloads_` keeps closed
+  libraries; run states untranslated; chained `.arg()` in `provenance`; a conditional emoji CHECK; a long
+  comment line; a redundant clip region.
 
 ---
 
 ## 5. Infrastructure
 
-### 5.1 Build & CMake: 7/10
+### 5.1 Build & CMake: 9/10
 
-Strengths: one static library per module with `mso::` aliases for vendored targets; SYSTEM includes and
-`-w` for C deps; `compile_commands.json`; `-Werror` in `release`; SQLite with FTS5, `THREADSAFE=2`,
-`DQS=0`, `OMIT_LOAD_EXTENSION`, `DEFAULT_FOREIGN_KEYS`; the include graph matches the documented layering
-with no upward includes.
+Fixed:
+- WiX `perMachine` (`Packaging.cmake:39`);
+- third-party licenses installed (`InstallThirdPartyLicenses.cmake`, `THIRD_PARTY_NOTICES.txt` with source
+  links);
+- the GUI-target guard;
+- stale paths, the version define, doctest marked test-only, the README image;
+- the include-graph check now rejects other modules' `detail/` headers.
 
-- **[Medium]** `CMakeLists.txt:78`: `set(CMAKE_AUTOMOC ON)` before `add_subdirectory(tests)` gives the
-  Qt-free `mso_tests` an autogen step (`build/release/tests/mso_tests_autogen` exists). → Set `AUTOMOC` per
-  Qt target.
-- **[Medium]** `CMakeLists.txt:31`: every module exposes the whole `include/` PUBLIC, so layering is only a
-  convention. → Per-module include roots, or a CI include-graph check.
-- **[Medium]** `tests/CMakeLists.txt:8`: hard-coded suite list; a new `TEST_SUITE("files")` or `("cli")`
-  compiles but never runs under ctest, and doctest exits 0 on an empty filter. → A catch-all entry or
-  `doctest_discover_tests`.
-- **[Medium]** `CMakeLists.txt:76`: `find_package(Qt6 6.5 QUIET …)` silently drops the GUI and UI tests. →
-  `MSO_REQUIRE_GUI` (ON in CI).
-- **[Low]** `cmake/ProjectOptions.cmake:2-12`: no ASan/UBSan option, no `_LIBCPP_HARDENING_MODE` in Debug,
-  no `-Wold-style-cast`/`-Wconversion`/`-Wsign-conversion` (the code already has 0 C-style casts).
-- **[Low]** No `install()` rules or windeployqt; double-click launch does not work (README admits it).
-- **[Low]** `CMakeLists.txt:62`: `mso_app` links `mso_audio` PUBLIC but uses no audio header.
-- **[Low]** `tests/worker_tests.cpp:115-119`: worker binary found by guessing. → `$<TARGET_FILE:mso-worker>`
-  as a compile definition.
-- **[Nit]** `deps/CMakeLists.txt:4`: claims compile features are asserted at startup; only FTS5 is.
-  `SQLITE_*` definitions PUBLIC; consider `OMIT_DEPRECATED`, `OMIT_SHARED_CACHE`,
-  `LIKE_DOESNT_MATCH_BLOBS`. `file(GLOB CONFIGURE_DEPENDS)` sources; `ui_tests.cpp` globbed into
-  `mso_tests` as an empty TU; `release` preset is RelWithDebInfo.
+Not fixed: no IPO/LTO option.
 
-### 5.2 CI (`.github/workflows/ci.yml`): 4/10
+- **[Low] (possible)** `Packaging.cmake:39` with `CMakeLists.txt:1`: if `CPACK_WIX_INSTALL_SCOPE` needs CMake
+  3.29, a 3.28 configure silently ignores it. → Raise the minimum or fail on older versions with WiX on.
+- **[Low]** `cmake/DependencyNotices.cmake:77` embeds a literal CR byte, so git treats the file as binary,
+  and an editor that saves it as LF would silently strip newlines from every license text. → Use `"\r"`.
+- **[Nit]** `ASAN_SYMBOLIZER_PATH` decided at configure time (harmless; PATH covers it); pacman output
+  parsed in English (`LC_ALL=C`); a long header line in `tests/fuzz/CMakeLists.txt`.
 
-- **[High] ✔** `ci.yml:17-29`: the MSYS2 job runs `python3 … || python …` but installs no Python, and
-  `path-type: minimal` hides the runner's. *The first real step fails.* → Add
-  `mingw-w64-clang-x86_64-python`.
-- **[High] ✔** `ci.yml:44-45` with `CMakeLists.txt:76`: Ubuntu 24.04's `qt6-base-dev` is 6.4.2, below 6.5,
-  so the GUI and `ui` suite are silently skipped on Linux; distro Qt is also built against libstdc++ (ABI
-  risk with libc++). → Qt ≥ 6.5 for this toolchain, or document Linux as CLI-only, and make a missing GUI
-  fatal in CI.
-- **[Medium]** `ci.yml:43`: `wget … llvm.sh | sudo bash` runs an unpinned script as root. → Add the apt repo
-  and key explicitly.
-- **[Medium]** Only `release` is built: no Debug, no sanitizer job, no `clang-format --dry-run`.
-- **[Low]** Actions pinned by major tag, not SHA; no `permissions: contents: read`; no `concurrency`.
-- **[Low]** `update: true` with unpinned pacman packages plus `-Werror`: a toolchain bump can break CI with
-  no code change.
-- **[Low]** No ccache; nothing forces the ffmpeg-dependent tests to run (`MSO_REQUIRE_FFMPEG=1`).
-- **Observation:** the repository has no git remote and the code is uncommitted, so CI has never run.
+### 5.2 CI: 7.5/10
 
-### 5.3 Dependencies & patches: 7/10
+The design now matches the Windows-first plan:
+- a `ci`, `ci-debug` and `ci-sanitize` matrix;
+- a fuzz job time-boxed at 60 s per target, with crash artifacts uploaded;
+- an MSI built with WiX 3.14.1 and uploaded;
+- a pinned `windows-2025` runner;
+- caches saved on failure.
 
-All 14 vendored directories match the 14 manifest entries and the 14 `deps/README.md` rows; every rule-1
-library is present; the single patch is listed, applied and present in the vendored file; archives are
-sha256-pinned; `zipfile.extractall` sanitizes `..`.
+The Linux job is parked with a truthful comment. **None of the new legs has run**: the last run is still
+39233493989 on `6b5f1d4`.
 
-- **[Medium]** `deps/update_deps.py:356-365`: `--check` only checks files exist; it cannot detect a hand
-  edit (rule 2) or an unapplied patch. → Record post-patch sha256 per file and verify offline.
-- **[Medium]** `update_deps.py:270-284` with `manifest.json:94-95`: pocketfft is cloned `--depth 1 --branch
-  cpp` then compared with the pinned commit; once the branch moves, the pin is unreproducible. → `git fetch
-  --depth 1 origin <commit>`.
-- **[Medium]** `manifest.json`: the other 10 git deps are pinned only by tag (movable). → Add `commit` for
-  every git entry (the script already verifies it).
-- **[Medium]** About box missing MIT notices (see §4.11).
-- **[Low]** `update_deps.py:306-307`: sha256 optional; CLI11's LICENSE download has none.
-- **[Low]** `update_deps.py:303-312, 328-335`: downloads land in place before verification; a failed
-  `git apply` leaves an unpatched file. → Stage, verify and patch in a temp dir, then move.
-- **[Low]** `update_deps.py:290, 304`: `urlopen` without timeout; files dropped from the manifest are never
-  deleted.
-- **[Low]** `deps/miniaudio_impl.c` (project code in the vendored tree, not in `deps/README.md`),
-  `deps/.clang-format`, `deps/picosha2/README.md`, `deps/stduuid/README.md` are not produced by the
-  manifest. → Document `miniaudio_impl.c` as the sanctioned glue unit or move it; list or drop the READMEs.
-- **[Nit]** `deps/miniaudio/miniaudio.c` and `signalsmith_linear/platform/linear-xsimd-dispatch.cpp` are
-  vendored but never compiled. FFmpeg comes from pkg-config (documented); its license variant is not stated.
+- **[Medium] (possible)** `ci.yml:64-70, 151`: `update: false` with an `install:` list may install the
+  package versions from setup-msys2's pinned snapshot (older clang, Qt and FFmpeg than the verified
+  23.1.3, 6.11.2 and 9.0.2), or 404 once mirrors drop them, against `-Werror` legs. → Check the "Toolchain
+  versions" step on the first run; switch to `update: true` or add `pacman -Sy` if they are old.
+- **[Low]** `ci.yml:178`: fuzzing restarts from the checked-in seeds every run and the grown corpus is
+  discarded (`stb_vorbis` reached 784 edges in 60 s locally). → Cache the corpus; add a longer scheduled
+  run.
+- **[Nit]** The comment says "five cached legs" (four are active); every run writes about 1.6 GB of new
+  ccache entries.
 
-### 5.4 Layout: 9/10
+### 5.3 Fuzzing & sanitizers: 8/10 (new)
 
-No `.h`/`.hpp` under `src/` or `tools/`; only `.cpp` in `src/`; nothing in `include/` outside
-`include/mso/<module>/`; all 87 headers have `#pragma once`; none has `using namespace`.
+- **Targets:** eleven libFuzzer targets.
+  - seven probe families through `media::probe_memory`, which uses the same reader as `probe_file`;
+  - `stb_vorbis`;
+  - the worker protocol, with a decode→encode invariant;
+  - the query parser plus RowMatcher;
+  - the SQL and index cursor decoders, run on a real library.
+- **Build:** ASan, UBSan and libFuzzer coverage on Windows, with flags spelled out because clang refuses
+  `-fsanitize=fuzzer` for MinGW. `-fno-sanitize-recover=all` is set.
+- **Runner:** time-boxed with an RSS limit and a hard kill. Crashes go to `fuzz-artifacts/` and are
+  uploaded from CI; replay is documented.
+- **Results:** four stb_vorbis defects found and fixed, with regression seeds; 11/11 clean in `run3.log`.
+- **Windows sanitize preset:** 17/17 green in `build/integ-asan`. Its first run found the CLI
+  use-after-free.
 
-- **[Low]** `tests/test_support.hpp` is the only header outside `include/`. → Add a one-line `tests/`
-  exception to AGENTS.md rule 4.
-- **[Low]** Internal headers in the public tree (theme 9).
-- **[Nit]** `SKILLS/README.md:31-32` says platform code is never in public headers, but
-  `worker_process.hpp:33` and `file_handle.hpp:36` contain `#ifdef _WIN32` (with POSIX branches).
+- **[Medium]** `tests/fuzz/`: the decoders the desktop process runs on every preview and waveform are not
+  fuzzed. That covers dr_wav, dr_flac and dr_mp3 through `ma_decoder` (`decoder_miniaudio.cpp:186-189`),
+  the FFmpeg decoder glue, and stb_vorbis's FILE path, which production uses
+  (`decoder_vorbis.cpp:104` vs the target's `open_memory`). *A crash on a damaged WAV, FLAC or MP3
+  during preview takes down the UI.* → A `fuzz_decoder` target over `ma_decoder_init_memory` per
+  encoding, decoding a bounded number of frames, plus a FILE-based stb_vorbis variant.
+- **[Low]** The seeds contain no `smpl`, `acid`, `cue `, `ds64`/RF64 or AIFF `MARK`/`INST` chunks, the very
+  parsers the rule-1 deviation exists for. → One small seed per chunk type.
+- **[Low]** `tools/run_fuzzers.py:12` says a leak fails the run; LeakSanitizer does not exist on Windows
+  (the stb_vorbis leak was caught by the RSS limit). → Say so.
+- **[Low]** Regression seeds are replayed only by the fuzz job. → A `-runs=0` CTest entry in fuzz builds.
+- **[Nit]** `fuzz_cursor.cpp:50-78` leaves its temporary library in `%TEMP%` on every crash.
 
-### 5.5 Tests & coverage: 6/10
+### 5.4 Dependencies & patches: 9/10
 
-Tests use exact or principled tolerances, generate fixtures at runtime, and include real fault injection for
-the worker; no relaxed acceptance criteria were found (rule 16 holds).
+The stb_vorbis patch is recorded in the manifest and applied by the script. Applied to the LF baseline,
+it reproduces the working-tree file byte for byte. 55/55 digests match. The CRLF refresh is done (44
+files to LF; one upstream-CRLF file remains). `ref` is required; the non-atomic staging copy is
+documented.
+
+- **[Low]** Commit hygiene: the 44-file line-ending refresh (about 170k changed lines under `deps/`, which
+  is `-text`) and the patch touch the same file. → Commit the refresh first, then the patch, so the
+  patch stays reviewable.
+- **[Low] (possible)** `stb_vorbis.c:953`: the comment cites GHSL-2023-165 to 172, part of which concern
+  decode-time reads rather than setup. → Check the list and narrow the comment.
+- (The push-mode Low is in §4.4.)
+
+**Line endings:** the "LF will be replaced by CRLF" warnings come from the system `core.autocrlf=true`
+and are harmless. Every tracked text file is LF in the index, and outside `deps/` there is no
+line-ending diff. The only file with mixed endings is `cmake/DependencyNotices.cmake` (§5.1).
+
+### 5.5 Tests & coverage: 8/10
+
+The four UI controllers are now tested, and so are the output supervisor, `value_parsing`, domain
+`json_fields` and `native_file`. ASan + UBSan pass 17/17 on Windows. Silent skips are now real skips;
+`std::system` was replaced by `_wsystem`.
 
 | Module | Component | Tested? |
 |---|---|---|
-| domain | core | yes |
-| domain | error | partial |
-| catalog | Library lifecycle, history/undo, scans, queries, analysis jobs, backups | yes |
-| catalog | sqlite wrapper, migrations, patch_operations, edit_command, types | partial (indirect) |
-| search | parser, compiler, service | yes (gaps in §4.3) |
-| media | WAV/RF64, AIFF, MPEG+ID3, container detect, filename hints, miniaudio decoder | yes |
-| media | FLAC, Ogg, Vorbis | only when `ffmpeg` is on PATH |
-| media | MP4, ASF, CAF, WavPack, FFmpeg decoder/probe | partial, silently skipped without ffmpeg |
-| media | text decoding, tag mapping, bounded reader, byte cursor, file handle | partial (indirect) |
-| files | importer | yes |
-| files | file_identity | partial |
-| audio | preview engine end to end | yes (black-box) |
-| audio | ring, mailbox, controller, renderer, source stream, converters, stretcher, device | partial (indirect) |
-| analysis | tempo, key, chroma, onset, loudness, waveform builder+codec, hashers, analyze_file | yes |
-| analysis | spectrum, musical features, spectrogram stream | partial |
-| worker | protocol, process, main, win32 platform | yes |
-| worker | posix platform | written, never run |
-| app | application, workspace, export | yes (in `export_tests.cpp`) |
-| app | analysis_supervisor | partial |
-| cli | all six sources (~935 lines) | **no** |
-| ui | table model, star rating, delegate, table view, shortcut catalog, session | yes |
-| ui | navigator, preview, waveform, display format | partial |
-| ui | main window, inspector, jobs, history, search bar, preferences, add folder, layout store, drag resolver, file manager, empty state, background tasks | **no** |
+| domain | all, incl. `json_fields` | yes |
+| catalog | lifecycle, migrations 1-6 (pinned), history, scans, outbox, analysis queue, backups, reader pool, durable file, SQLite | yes |
+| catalog | patch operations, edit command, taxonomy lookup | partial (through the Library API) |
+| search | parser, compiler, service, paging, federation, RowMatcher parity, sample rows | yes, plus fuzz |
+| media | every probe, bounded reader, `probe_memory`, tags, file handle, `native_file` | yes, plus 7 fuzz targets |
+| media | miniaudio, Vorbis and FFmpeg decoders | yes (fixtures); **not fuzzed** |
+| files | importer, file identity, gaps, skips, link cycles | yes (dedup and WOF untested) |
+| analysis | every stage | yes |
+| audio | engine, building blocks, output supervisor, wakeup signal | yes |
+| audio | real output device, device loss | partial (null and offline backends) |
+| worker | protocol, supervision, Win32 platform | yes, plus fuzz |
+| app | application, workspace, sample index, file lock, export | yes, plus cursor fuzz |
+| app | analysis supervisor | partial (through `Application`) |
+| cli | every command, `value_parsing` | yes |
+| ui | model, delegate, view, edits, undo, inspector, jobs, history, search bar, preferences, layout, waveform, preview, dialogs, session, five controllers | yes |
+| ui | navigator, drag path resolver, main window | partial (end to end) |
 
-- **[High]** CLI and 12 UI components untested (rule 5). → `tests/cli_tests.cpp` driving `CLI::App`
-  in-process; offscreen widget tests for inspector, jobs, history, search bar, layout store, drag resolver.
-- **[Medium]** `media_tests.cpp:735-737, 789-791, 859-861`: tests `return` with a MESSAGE when `ffmpeg` is
-  absent and count as passed. → `doctest::skip()`, and fail under `MSO_REQUIRE_FFMPEG`.
-- **[Medium]** Sleep-based timing: `worker_tests.cpp:497-498` (4.5 s then `heartbeats >= 2`), :506 (cancel
-  under 2 s), `audio_tests.cpp:215-218, 391`. → Poll with deadlines; derive bounds from configured intervals.
-- **[Low]** Four temp-directory and four WAV-writer helpers despite `test_support`.
-- **[Low]** Suite naming: `worker_tests.cpp:245` uses `"analysis"`; app tests under `"export"`.
-- **[Low]** No `TIMEOUT` or `LABELS` on CTest entries.
-- **[Nit]** `tests/ui_tests.cpp` changed during the review; re-check counts at hand-off.
+- **[Low]** No unit tests for `AnalysisSupervisor` (deadline, abandon, backoff) or `DragPathResolver`.
+- **[Low]** `worker_tests.cpp:608` still has a generous wall-clock upper bound.
 
-### 5.6 Documentation: 7/10
+### 5.6 Documentation: 8.5/10
 
-Every file path cited in README, BUILDING, deps/README, IMPLEMENTATION_STATUS and SKILLS exists; preset
-names and output paths are right; README's CLI list matches the subcommands; SKILLS symbols exist; the
-124 `mso_tests` cases and 9/9 CTest suites match registration.
+Fixed: the Linux CI narrative, the status header (names the real commits, says the round is
+uncommitted), the MSI claims ("Verified so far…"), the cursor and memory deviation, "fuzz-tested" (now
+true), the search SKILLS. Not fixed: the `docs/COMMAND_LINE.md` synopsis still omits `--move-to-top`,
+`--limit`, `--raw`, `--absolute-paths`, `--clear-category`, `--operation`, `--restore` and others.
 
-- **[High] ✔** `README.md:9-12`: says CI "runs every test suite on Windows … and Linux … on every push".
-  CI has never run, Windows would fail at Python, and Linux skips Qt. → "CI is configured for …; not yet
-  run", and correct the Linux Qt claim.
-- **[Medium]** `IMPLEMENTATION_STATUS.md:31`: "`mso_ui_tests` 7 cases"; `tests/ui_tests.cpp` now has 11.
-  → Re-run and report real output (rule 16).
-- **[Medium]** Undocumented deviations: unconditional declick fades (§4.8), hand-rolled container/tag parsers
-  (§4.4), hand-rolled worker queues (§4.7). Each belongs in `IMPLEMENTATION_STATUS.md`.
-- **[Low]** `README.md:42-43`, `IMPLEMENTATION_STATUS.md:12`: "job object (memory and CPU caps)" is
-  Windows-only; POSIX has `RLIMIT_AS` and nice, no CPU cap.
-- **[Low]** `SKILLS/add-dependency/SKILL.md:100-101`: Qt is found in the top-level CMakeLists, not
-  `deps/CMakeLists.txt`.
-- **[Low]** `docs/BUILDING.md:56-57`: apt list omits `ffmpeg`; :64 says CI runs "the same steps" but CI
-  uses `release`, not `debug`; :14-15 omits Python.
-- **[Low]** Stale code comments: `navigator_panel.hpp:25-26` (lazy folder load), `analysis_supervisor.hpp:6`
-  (never starts work on its own), `add_folder_dialog.cpp:36-38`, `decoder_vorbis.cpp:24`,
-  `deps/CMakeLists.txt:4`.
-- **[Nit]** `SKILLS/build-and-test/SKILL.md:51` mentions `REQUIRE_OK`, which does not exist;
-  `deps/README.md:405` says readerwriterqueue is "available" (it is used); `BUILDING.md:72` omits
-  `mso_ui_tests`; `SKILLS/add-dependency/SKILL.md:79` says `mso::<name>` but nlohmann is `mso::json`;
-  `VALIDATION.md:22` reads as stale.
+- **[Low]** `IMPLEMENTATION_STATUS.md:58-59` ("CI repeats the 60 s runs on every push") and
+  `docs/DEVELOPING.md:20-31` describe the new CI legs in the present tense, but none has run. → Add
+  "(configured; not yet run)".
+- **[Low] (possible)** `docs/BUILDING.md:61`: "point `WIX` at" the unzipped folder. CPack looks for
+  `$WIX/bin/candle`, and the zip has no `bin/`. → Say `WIX` is the parent of `bin/`, or drop that route.
+- **[Low]** The stale statements already listed: close vs open waiting (§4.9), "nothing is replayed"
+  (§4.8), "ask the user to wait" (§4.11), `folder:Loops` 86 ms (§4.3), 46 vs 44 CRLF files.
+- **[Nit]** "`[[nodiscard]]` on every Result" misses two private `Workspace` members; a SKILL tells the
+  reader to set `ASAN_SYMBOLIZER_PATH` by hand (CTest does it); `THIRD_PARTY_NOTICES.txt` points at
+  `share/licenses/` even when nothing was installed there.
 
-### 5.7 Codebase-wide scans: 9/10
+### 5.7 Codebase-wide scans: 9.5/10
 
 | Pattern (over `include/` and `src/`) | Count | Notes |
 |---|---|---|
 | TODO / FIXME / HACK / XXX | 0 | |
-| `#ifdef _WIN32` files | 12 | Every logic block has an `#else`; single-branch blocks are Windows-only additions. |
-| `<windows.h>` | 6 | All inside guards in platform .cpp files. |
-| raw `new` outside UI | 7 | All private-constructor factories into `unique_ptr`. |
-| raw `new` in UI | ~152 | Qt parent ownership (idiomatic). |
-| `delete` | 1 | `QTreeWidgetItem` removal. |
-| `rand` | 0 | `random_device`, seeded `mt19937` in bench. |
-| `sprintf`/`strcpy`/`strcat` | 0 | |
-| `catch (...)` | 0 | 17 typed catches. |
-| `std::regex` | 0 | |
-| `std::endl` / iostream | 0 | `<print>` used. |
-| C-style value casts | 0 | 447 `static_cast`, 18 `reinterpret_cast`, 2 `const_cast`. |
-| `(void)` discards | 32 | ~16 drop catalog job-state errors (theme 5). |
-| headers without `#pragma once` | 0 | |
-| `using namespace` in headers | 0 | |
-| abbreviated identifiers | ~6 | `v`, `m`, `c`, `a`/`b` (listed in §4.2); no `stmt`/`cfg`/`ctx`/`buf`/`idx`/`tmp`/`err`/`db`. |
+| Files with `_WIN32` | 24 | logic blocks all have POSIX branches |
+| `<windows.h>` | 13 | all in `.cpp`, all guarded |
+| raw `new` outside UI | 9 + 7 `new (std::nothrow)` | all into `unique_ptr` except the miniaudio VFS handle |
+| raw `new` in UI | ~215 | Qt parent ownership |
+| `delete` | 4 | VFS handle (2), `QTreeWidgetItem` (2) |
+| `catch (...)` | 5 | all commented thread barriers after typed catches (new: `output_supervisor.cpp:108`, `playback_controller.cpp:72`) |
+| typed `catch` | 62 | |
+| regex / sprintf / strcpy / rand | 0 | |
+| C-style casts | 0 | 623 `static_cast`, 21 `reinterpret_cast`, 1 `const_cast` |
+| `(void)` discards | 11 | each commented |
+| `[[nodiscard]]` on Result-returning header declarations | 250 of 252 | missing: `workspace.hpp:110, 113` (private) |
+| headers without `#pragma once` / with `using namespace` | 0 / 0 | 133 headers |
+| duplicate helpers | 1 pair left | `media::UniqueWin32Handle` vs `worker::UniqueHandle` (the latter also wraps fds; justified) |
 
 ---
 
-## 6. Suggested order of work
+## 6. Cross-cutting themes
 
-1. **Memory safety:** the `Application::library()` use-after-free (§4.9), the importer use-after-free
-   (§4.5), the FFmpeg channel-change overflow (§4.4).
-2. **Data integrity:** re-open recovery plus a per-library lock (§4.9), partial chunked-edit receipts and
-   undo conflicts (§4.2), workspace lost updates and the encoding of its path (§4.9), fsync on atomic writes
-   (§4.2, §4.9).
-3. **Stuck work:** the analysis-queue starvation (§4.2), hang detection end to end (theme 2), the CLI
-   `analyze` wait (§4.10).
-4. **Everyday UI:** paging stall, single-key shortcuts, refresh storm and inspector clobbering (§4.11),
-   relevance OR drops (§4.3), declick fades (§4.8), the three audio ordering races (§4.8).
-5. **Linux and CI:** the worker include, case-sensitive path keys, POSIX identity and symlinks, the POSIX
-   spawn path, then make CI green on both platforms with Python, Qt ≥ 6.5, `MSO_REQUIRE_GUI`,
-   `MSO_REQUIRE_FFMPEG`, plus a Debug+sanitizer job.
-6. **Rules 3, 5 and 6:** `///` on the core headers named in theme 10; CLI tests and the untested UI
-   components; pinned migration checksums; correct the README CI claim and record the three undocumented
-   deviations.
-7. **Hygiene:** `detail/` headers, deduplicated constants and helpers, commit-pinned deps with content
-   hashes, generated About box, `(void)` discards logged.
+1. **Partial-index predicates.** The new High (§4.2) is a query that cannot use the partial index it was
+   written for. Check every statement on `locations` and `jobs` with `EXPLAIN QUERY PLAN` in a test,
+   just as `search_tests.cpp:1130-1175` already does for the folder filter.
+2. **Refresh, reload and patch loops on busy sessions.** Three of the Mediums share one shape: work
+   restarted or repeated while the previous run is still going.
+   - the anchored table refresh (§4.11);
+   - index reloads queued without dedup (§4.9);
+   - `patch_orders` re-merging every order (§4.9).
+
+   One rule fixes them: at most one in flight plus a dirty flag, and incremental updates.
+3. **Blocking the UI thread on device work.** The output supervisor made audio robust, but its
+   synchronous API is now called from UI handlers (§4.12). Keep the supervisor API async for UI callers.
+4. **Fuzz what the UI decodes.** Parsers are fuzzed; decoders run in the UI process are not (§5.3).
+   stb_vorbis showed that this is where crashes hide (§4.4).
+5. **Present-tense claims about configured but never-run CI.** These are small now (§5.6), but under
+   rule 16 they should say "configured; not yet run" until the first green run.
+
+---
+
+## 7. Suggested order of work
+
+1. **Stability on Windows:**
+   - add the `submap` bounds to the stb_vorbis patch, plus a seed (§4.4);
+   - make default-device changes and failed stops reliable in loss detection (§4.8);
+   - make the preview's device calls asynchronous (§4.12);
+   - treat WOF-compressed files as ordinary files (§4.5).
+2. **Hot paths:**
+   - `AND state<>'retired'` on the revive statement, with a plan test (§4.2);
+   - filter skips by extension (§4.5);
+   - refresh dedup with a dirty flag in the table (§4.11);
+   - reload dedup and incremental `patch_orders` in the index (§4.9);
+   - `VerticalSortHint` (§4.11).
+3. **Correctness:**
+   - row deliveries applied by key (§4.11);
+   - selection keys from `Page::keys` (§4.11);
+   - collision-safe rekey (§4.2);
+   - endless paging under a persistent hydration failure (§4.3);
+   - the chunked no-op receipt (§4.2).
+4. **Bug catching:**
+   - a decoder fuzz target and chunk-type seeds (§5.3);
+   - unit tests for `AnalysisSupervisor` and device loss (§5.5);
+   - confirm the first CI run's toolchain versions (§5.2).
+5. **Commit and docs:**
+   - commit the deps line-ending refresh separately from the stb_vorbis patch (§5.4);
+   - fix the literal CR (§5.1);
+   - mark CI claims "not yet run", and fix the stale statements and the CLI synopsis (§5.6).
+
+---
+
+## 8. Deferred (Linux)
+
+Out of scope by the owner's decision (Windows first):
+- **Linux CI:** the parked job and its symbolizer.
+- **Worker:** sanitizer-aware POSIX memory-cap tests, the PDEATHSIG header contract, tests for the POSIX
+  error pipe, PDEATHSIG and fds 0-2, and `ScopedSigpipeBlock`.
+- **CLI:** the POSIX process group for Ctrl+C.
+- **Build:** Linux `INSTALL_RPATH` and the libc++ probe.
+- **Other POSIX-only items:**
+  - `QFile::decodeName` round-trip;
+  - the POSIX `durable_file` report after rename;
+  - POSIX `classify_entry` following the link target.

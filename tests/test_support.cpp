@@ -268,9 +268,9 @@ PopulatedLibrary make_library(const std::filesystem::path& directory, const std:
     populated.root_id = root->id;
     auto session = populated.library->begin_scan(root->id);
     REQUIRE(session.has_value());
-    for (std::size_t offset = 0; offset < files.size(); offset += 500) {
-        const std::span<const catalog::ScannedFile> batch(files.data() + offset,
-                                                          std::min<std::size_t>(500, files.size() - offset));
+    for (std::size_t offset = 0; offset < files.size(); offset += catalog::Library::kMaximumScanBatchFiles) {
+        const std::span<const catalog::ScannedFile> batch(
+            files.data() + offset, std::min(catalog::Library::kMaximumScanBatchFiles, files.size() - offset));
         auto committed =
             populated.library->commit_scan_batch(*session, batch, {}, [](std::string_view) { return false; });
         REQUIRE(committed.has_value());

@@ -40,6 +40,10 @@ struct PreviewSnapshot {
 
     OutputDeviceName output_device_name;   ///< UTF-8 name of the open endpoint
     bool output_device_available = false;  ///< false before a device opens and after DEVICE_LOST
+    /// True while the endpoint is lost, or none could be opened: the engine is re-opening one by
+    /// itself with backoff, and a UI may offer "Retry" (PreviewEngine::restart_output_device()).
+    /// Never set for the Offline backend.
+    bool output_device_lost = false;
     /// Rate of the stereo float stream handed to the device (the device's native rate by default).
     std::uint32_t output_sample_rate = 0;
     /// Actual period negotiated with the endpoint, in device frames and in microseconds.

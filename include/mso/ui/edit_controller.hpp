@@ -5,7 +5,11 @@
 #include <QObject>
 #include <QString>
 
+#include <deque>
+#include <functional>
+#include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include "mso/catalog/edit_command.hpp"
@@ -22,6 +26,11 @@ class SampleTableModel;
 /// on success that shows values only the catalog computes, on failure it reverts the prediction —
 /// and the outcome is reported. Several edits of the same row may be in flight; the model leaves
 /// such rows alone until the last one settles.
+///
+/// Writes are ordered per library: edits, taxonomy changes, undo and redo of one library run one
+/// at a time in the order the user made them (a queue per library), so two quick edits of the same
+/// sample commit in that order and history and Undo follow it. Different libraries write in
+/// parallel.
 class EditController final : public QObject {
     Q_OBJECT
 
@@ -40,6 +49,8 @@ public:
     void redo(const uuids::uuid& library);
     /// Library of the most recent edit (an undo routing fallback).
     std::optional<uuids::uuid> last_edited_library() const { return last_edited_library_; }
+    /// Writes of `library` waiting behind the one in flight (tests check the ordering).
+    std::size_t queued_writes(const uuids::uuid& library) const;
 
 signals:
     /// An edit, undo or redo succeeded (short status text).
@@ -55,8 +66,15 @@ signals:
     void reloadRequested();
 
 private:
+    /// One queued write: starts the request and calls `settled` once its delivery was handled.
+    using Write = std::function<void(std::function<void()> settled)>;
+
     /// Shared tail of undo() and redo().
     void undo_or_redo(const uuids::uuid& library, bool redo);
+    /// Queues `write` behind the library's earlier writes (starts it when none is in flight).
+    void enqueue_write(const uuids::uuid& library, Write write);
+    /// Starts the library's next queued write, or marks the library idle.
+    void start_next_write(const uuids::uuid& library);
 
     /// Where edits are written.
     EditGateway& gateway_;
@@ -64,6 +82,10 @@ private:
     SampleTableModel& model_;
     /// Library of the most recent edit.
     std::optional<uuids::uuid> last_edited_library_;
+    /// Writes waiting per library (the one in flight is not in the queue).
+    std::map<uuids::uuid, std::deque<Write>> queued_writes_;
+    /// Libraries with a write in flight.
+    std::set<uuids::uuid> writing_libraries_;
 };
 
 }  // namespace mso::ui

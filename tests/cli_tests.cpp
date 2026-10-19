@@ -1,6 +1,6 @@
 // The `mso` command line, driven in-process through mso::cli::run() against a scratch workspace:
-// every command, exit codes, --json output, option exclusivity, the library lock shared with the
-// desktop app, Ctrl+C handling and an analyze that cannot hang.
+// every command, exit codes, --json output, option exclusivity, option storage lifetime, the
+// library lock shared with the desktop app, Ctrl+C handling and an analyze that cannot hang.
 #include <doctest.h>
 
 #include <cstdio>
@@ -14,6 +14,7 @@
 #include "mso/app/workspace.hpp"
 #include "mso/cli/command_context.hpp"
 #include "mso/cli/interrupt.hpp"
+#include "mso/cli/value_parsing.hpp"
 #include "test_support.hpp"
 
 using namespace mso;
@@ -78,6 +79,14 @@ private:
 
 bool contains(const std::string& text, std::string_view part) {
     return text.find(part) != std::string::npos;
+}
+
+/// A file that exists but cannot be started as a program: the analysis supervisor treats it as a
+/// transient start failure and keeps retrying, so a run never makes progress.
+std::string unstartable_worker(const CommandLine& cli) {
+    const auto file = cli.scratch() / "not-a-program.exe";
+    test::write_file(file, "this is not an executable");
+    return path_to_utf8(file);
 }
 
 }  // namespace
@@ -273,6 +282,101 @@ TEST_SUITE("cli") {
         cli::InterruptScope::simulate_interrupt();
         CHECK(test::wait_until([&] { return scope.interrupted(); }, std::chrono::milliseconds(5'000)));
         CHECK(scope.token().stop_requested());
+    }
+
+    TEST_CASE("every flag and option binds to storage that outlives registration") {
+        // Regression: `collection --delete` bound CLI11 to a bool whose last owner died when
+        // registration returned, so parse() wrote into freed memory (ASan: heap-use-after-free).
+        // Option values now live in the CommandContext; this exercises every flag of every
+        // command, so the sanitize preset fails here if any binding regresses.
+        CommandLine cli;
+        cli.prepare_library();
+        CHECK(cli.run({"collection", cli.library(), "--create", "Doomed"}).exit_code == cli::kExitSuccess);
+        CHECK(contains(cli.run({"collections", cli.library()}).output, "Doomed"));
+        CHECK(cli.run({"collection", cli.library(), "--id", "1", "--delete"}).exit_code == cli::kExitSuccess);
+        CHECK_FALSE(contains(cli.run({"collections", cli.library()}).output, "Doomed"));
+        CHECK(cli.run({"collection", cli.library(), "--delete"}).exit_code == cli::kExitUsage);  // needs --id
+
+        CHECK(cli.run({"edit", cli.library(), "1", "--tag", "Drums/Kick", "--category", "Bass"}).exit_code ==
+              cli::kExitSuccess);
+        CHECK(cli.run({"edit", cli.library(), "1", "--clear-category"}).exit_code == cli::kExitSuccess);
+        CHECK(cli.run({"edit", cli.library(), "1", "--remove"}).exit_code == cli::kExitSuccess);
+        CHECK(cli.run({"edit", cli.library(), "1", "--restore"}).exit_code == cli::kExitSuccess);
+        CHECK(cli.run({"tag", cli.library(), "2", "--move-to-top"}).exit_code == cli::kExitSuccess);
+        auto searched = cli.run({"--json", "search", "-l", cli.library(), "--desc", "--count", "--sort", "bpm"});
+        CHECK(searched.exit_code == cli::kExitSuccess);
+        CHECK(nlohmann::json::parse(searched.output, nullptr, false)["total"] == 1);
+        CHECK(cli.run({"export", cli.library(), path_to_utf8(cli.scratch() / "raw.csv"), "--raw", "--absolute-paths"})
+                  .exit_code == cli::kExitSuccess);
+    }
+
+    TEST_CASE("Ctrl+C during import, export and analyze exits 130 and keeps committed work") {
+        CommandLine cli;
+        REQUIRE(cli.run({"create", cli.library()}).exit_code == cli::kExitSuccess);
+        REQUIRE(cli.run({"add-root", cli.library(), cli.samples()}).exit_code == cli::kExitSuccess);
+        // A pending interrupt reaches the command's scope as soon as it starts, like a Ctrl+C
+        // pressed right after the scan began.
+        cli::InterruptScope::simulate_interrupt();
+        auto import = cli.run({"import", cli.library()});
+        CHECK(import.exit_code == cli::kExitInterrupted);
+        CHECK(contains(import.output, "cancelled"));
+        CHECK(cli.run({"import", cli.library()}).exit_code == cli::kExitSuccess);  // the next run is not interrupted
+
+        cli::InterruptScope::simulate_interrupt();
+        CHECK(cli.run({"export", cli.library(), path_to_utf8(cli.scratch() / "out.csv")}).exit_code ==
+              cli::kExitInterrupted);
+        CHECK_FALSE(std::filesystem::exists(cli.scratch() / "out.csv"));
+
+        cli::InterruptScope::simulate_interrupt();
+        auto analyze = cli.run(
+            {"--worker", unstartable_worker(cli), "analyze", cli.library(), "--profile", "Waveforms", "--force"});
+        CHECK(analyze.exit_code == cli::kExitInterrupted);
+        CHECK(contains(analyze.output, "cancelled"));
+        auto info = cli.run({"info", cli.library()});
+        CHECK(contains(info.output, "samples   1"));
+    }
+
+    TEST_CASE("analyze keeps waiting through transient worker failures until its timeout") {
+        CommandLine cli;
+        cli.prepare_library();
+        auto timed_out = cli.run({"--worker", unstartable_worker(cli), "analyze", cli.library(), "--profile",
+                                  "Waveforms", "--timeout", "1"});
+        CHECK(timed_out.exit_code == cli::kExitFailure);
+        CHECK(contains(timed_out.errors, "timed out"));
+    }
+
+    TEST_CASE("analyze exits 3 when a sample cannot be analyzed") {
+        CommandLine cli;
+        cli.prepare_library();
+        std::filesystem::remove(cli.scratch() / "samples/Drums/Kick 01.wav");  // catalogued, now unreadable
+        auto analyzed = cli.run({"--worker", path_to_utf8(test::worker_executable()), "analyze", cli.library(),
+                                 "--profile", "Waveforms", "--timeout", "120"});
+        CAPTURE(analyzed.output);
+        CHECK(analyzed.exit_code == cli::kExitPartial);
+        CHECK(contains(analyzed.output, "1 blocked"));  // a missing file is blocked, not failed
+    }
+
+    TEST_CASE("play without --seconds stops when the file ends") {
+        CommandLine cli;
+        const auto wav = path_to_utf8(cli.scratch() / "samples/Drums/Kick 01.wav");  // 0.2 s
+        const auto started = std::chrono::steady_clock::now();
+        CHECK(cli.run({"play", wav, "--backend", "null"}).exit_code == cli::kExitSuccess);
+        CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(60));
+    }
+
+    TEST_CASE("backup needs the library lock") {
+        CommandLine cli;
+        cli.prepare_library();
+        app::ApplicationOptions options;
+        options.workspace_directory = cli.scratch() / "desktop";
+        options.monitor_roots = false;
+        options.run_analysis_supervisor = false;
+        auto desktop = app::Application::start(options);
+        REQUIRE(desktop.has_value());
+        REQUIRE((*desktop)->open_library(path_from_utf8(cli.library())).has_value());
+        auto refused = cli.run({"backup", cli.library()});
+        CHECK(refused.exit_code == cli::kExitFailure);
+        CHECK(contains(refused.errors, "another Music Sample Organizer process"));
     }
 
     TEST_CASE("BPM text parsing is strict") {

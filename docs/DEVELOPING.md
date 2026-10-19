@@ -14,16 +14,26 @@ is C++23 (clang + libc++), Qt 6 and SQLite, licensed under the GNU GPL v3.
 ## Continuous integration
 
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds with warnings as errors and runs every
-CTest entry, using only prebuilt packages for the toolchain, Qt and FFmpeg:
+CTest entry, using only prebuilt packages for the toolchain, Qt and FFmpeg. The owner's focus is
+Windows, so every build runs there (MSYS2 CLANG64: clang + libc++, Qt 6, FFmpeg), covering the whole
+project including the desktop app and its UI tests:
 
-- **Windows** (MSYS2 CLANG64: clang + libc++, Qt 6, FFmpeg) covers the whole project, including the
-  desktop app and its UI tests, plus an install-and-launch check without MSYS2 on `PATH`.
-- **Linux** (Ubuntu 24.04, LLVM 23 clang + libc++, FFmpeg) covers the core, the CLI and the worker,
-  with a release run and a Debug + AddressSanitizer/UndefinedBehaviorSanitizer run. The desktop app
-  is not built there: no prebuilt Qt uses libc++, and building Qt in CI is too slow (see
-  `BUILDING.md`). **The Linux job is parked for now** (`if: ${{ false }}` in the workflow) because
-  most users are on Windows; its last run built cleanly and passed every test suite.
+- **`ci`**: release build and tests, then an install-and-launch check without MSYS2 on `PATH` and the
+  `.msi` (kept as a run artifact for 7 days).
+- **`ci-debug`**: Debug build with libc++'s debug hardening (bounds, iterator and comparator checks).
+- **`ci-sanitize`**: Debug build with AddressSanitizer and UndefinedBehaviorSanitizer; reports are
+  symbolized (file:line).
+- **`fuzz`**: every libFuzzer target in `tests/fuzz/` for 60 s from its seed corpus
+  (`tools/run_fuzzers.py`); a crashing input is kept as a run artifact. The targets crash-proof the
+  code that reads damaged or unusual input: audio files and tags, the worker's pipe, query text and
+  paging cursors.
 - **Lint** checks the vendored-dependency digests and `clang-format`.
+
+Each Windows leg keeps its own ccache, saved even when a run fails or is cancelled. **The Linux job is
+parked** (`if: ${{ false }}`). Its last run, 39229983572, **failed**: `include-graph` in both presets
+(fixed since), and in the sanitizer preset also `cli` (a use-after-free, fixed since) and `worker` (two
+memory-cap tests that cannot pass under ASan). It builds the core, the CLI and the worker only: no
+prebuilt Qt uses libc++, and building Qt in CI is too slow (see `BUILDING.md`).
 
 A missing FFmpeg (or, on Windows, Qt) fails the build instead of being skipped.
 
@@ -51,7 +61,9 @@ A missing FFmpeg (or, on Windows, Qt) fails the build instead of being skipped.
   aliases), categories, manual and smart collections. Every edit is a durable history action with
   compare-and-set undo/redo that survives restarts and refuses to clobber later edits.
 - **Preview:** a streaming playback engine (WASAPI on Windows, PulseAudio/ALSA on Linux) with a lock-free
-  real-time callback, seek, volume, loops and varispeed.
+  real-time callback, seek, volume, loops with optional seam fades, varispeed and independent
+  tempo/pitch (signalsmith-stretch), and automatic recovery from a lost output device (own output
+  thread, retry with backoff).
 - **Automatic in the desktop app:** added folders are scanned and analyzed (BPM, key, waveforms,
   loudness, duplicate hashes) without further steps. A default library ("My Samples") is created in
   the workspace on first start, folders are rescanned at start-up and when a drive reconnects, and
@@ -78,7 +90,7 @@ include/mso/<module>/   all headers          src/<module>/   implementation (.cp
   app        workspace, application services, in-memory sample index, library lock, analysis supervisor, export
   cli        the mso tool        ui   the Qt desktop app
 include/mso/<module>/detail/   internal headers; the module include graph is checked (CTest include-graph)
-tests/      doctest suites per area, shared helpers in test_support.{hpp,cpp}
+tests/      doctest suites per area, shared helpers in test_support.{hpp,cpp}; tests/fuzz/ libFuzzer targets
 deps/       vendored libraries (+ patches/)
 resources/  application icon (SVG source + generated PNG/ICO), Windows .rc, Linux .desktop entry
 SKILLS/     task guides for coding agents    docs/   specification, build and developer docs
@@ -92,22 +104,43 @@ or the outbox was pruned), and `acknowledge_changes(consumer, revision)` lets th
 the lowest revision every consumer has applied. The search module exposes rows without SQL paging:
 `search::for_each_row` streams every live `SampleRow` set-based, `load_rows` hydrates specific ids,
 `matching_ids` evaluates FTS text and scope in SQLite, and `RowMatcher` / `matches` evaluate a query on
-a row with the SQL compiler's semantics (`is_row_evaluable` says whether a query has no text terms).
+a row with the SQL compiler's semantics. `is_row_evaluable` says whether a query can be evaluated on
+rows: no text terms, no `collection:`, no multi-segment `tag:` and no invalid `category:` path.
+`RowMatcher` takes the libraries' merged-tag aliases (`TagAliases`), so a merged tag matches by its old
+name, and tests `folder:` against `SampleRow::path_key`, the stored location key, with `starts_with`.
 
 `app::Application` builds an in-memory `SampleIndex` per library from `for_each_row` on a loader thread
 and keeps it current from `changes_since` plus `load_rows`. `search` and `count` are served from it
 (folder, tag, category and collection scopes, sorting, paging and row-evaluable filters in memory;
-text relevance and still-loading indexes fall back to `SearchService`); its cursors become
-`STALE_CURSOR` when rows are added or removed. `apply_edit`, `undo` and `redo` patch the index before
-returning, and `rows(keys)` returns current rows for specific `SampleKey`s (library UUID + sample id).
-Libraries are reached only through `with_library(uuid, work)`, which keeps the library open while
-`work` runs.
+text relevance and still-loading indexes fall back to `SearchService`). Its cursors are per-library
+keyset cursors (sort key, library, sample id; version 102), and the federated merge finds each
+library's position by binary search, so value edits never skip rows. A row whose own sort value changes
+across the cursor can reappear, as with `SearchService`, and the UI de-duplicates rows by key. A
+cursor becomes `STALE_CURSOR` only when rows are added or removed. The indexes of all open libraries
+hold at most 1,000,000 rows together (`ApplicationOptions::index_row_limit`); a library beyond that is
+searched in SQLite (`IMPLEMENTATION_STATUS.md` records the memory decision). `apply_edit`, `undo` and
+`redo` patch the index before returning, and `rows(keys)` returns current rows for specific
+`SampleKey`s (library UUID + sample id): a missing key is omitted, a real failure is an error. Libraries
+are reached only through `with_library(uuid, work)`, which keeps the library open while `work` runs.
+`LibraryAccessChangedEvent` reports a library opened read-only becoming writable once the CLI releases
+its lock; closing a library that a job or an index load still holds waits up to 10 s, then returns a
+retryable `DB_BUSY`.
 
 `CatalogChangedEvent` is coalesced to at most one per 150 ms per library and carries the changed sample
 ids, `structure_changed` (reload navigator trees) and `full_reload` (re-run the query; imports set it).
 The UI applies edits optimistically, refreshes changed rows in place from those ids, rebuilds a
 navigator tree only on structure changes, and keeps the previous rows on screen until a new page
-arrives.
+arrives. More precisely:
+
+- On `STALE_CURSOR` and on a full reload the table refreshes *anchored*: it re-queries from the first row
+  of the failing page with enough pages to cover what was loaded, keeping rows, scroll position and
+  selection (capped at 500,000 rows). Pages are de-duplicated by `SampleKey`, and pending edits overlay
+  every incoming page.
+- Writes are ordered per library (one queue each); exports and backups run on a 2-thread long-task
+  pool.
+- History is read on demand: when its panel is shown, after this window's edits, otherwise at most
+  every 2 s while visible. Navigator reads are coalesced to at most one per second per library.
+- `MainWindow` delegates to controllers (edit, library, export, analysis, layout, undo routing).
 
 ## The specification
 

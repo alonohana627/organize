@@ -13,7 +13,11 @@ if(TARGET MusicSampleOrganizer)
   list(APPEND _mso_installed_targets MusicSampleOrganizer)
 endif()
 install(TARGETS ${_mso_installed_targets} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES LICENSE README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+# The README (with the screenshot and the command-line guide it links to), the GPL text and the
+# third-party notices generated from deps/manifest.json (cmake/DependencyNotices.cmake).
+install(FILES LICENSE README.md "${PROJECT_BINARY_DIR}/THIRD_PARTY_NOTICES.txt" DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES docs/COMMAND_LINE.md DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs)
+install(FILES docs/images/main-window.png DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs/images)
 if(TARGET MusicSampleOrganizer)
   mso_install_desktop_entry()
 endif()
@@ -76,5 +80,17 @@ if(WIN32)
     if(mso_unresolved)
       message(WARNING \"MSO install: unresolved runtime dependencies: \${mso_unresolved}\")
     endif()
+  ")
+
+  # The license texts of those prebuilt DLLs (Qt LGPL-3.0, FFmpeg GPL-3.0, libc++, codecs, ...), taken
+  # from the MSYS2 packages that own them: share/licenses/<package>/ (the MSYS2 layout, short enough
+  # for WiX's 260-character path limit) and share/licenses/PACKAGES.txt.
+  get_filename_component(_mso_toolchain_prefix "${_mso_toolchain_bin}" DIRECTORY)
+  find_program(MSO_PACMAN pacman HINTS "${_mso_toolchain_prefix}/../usr/bin" NO_DEFAULT_PATH)
+  install(CODE "
+    set(MSO_TOOLCHAIN_PREFIX [[${_mso_toolchain_prefix}]])
+    set(MSO_PACMAN [[${MSO_PACMAN}]])
+    set(MSO_LICENSE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/licenses\")
+    include([[${PROJECT_SOURCE_DIR}/cmake/InstallThirdPartyLicenses.cmake]])
   ")
 endif()

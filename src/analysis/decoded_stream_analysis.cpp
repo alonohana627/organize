@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <iterator>
 #include <optional>
 
 #include "mso/analysis/detail/decode_loop.hpp"
@@ -62,6 +63,10 @@ StageSelection StageSelection::from(std::span<const Stage> stages) noexcept {
 }
 
 Result<void> validate_request(const AnalysisRequest& request) {
+    for (auto stage = request.stages.begin(); stage != request.stages.end(); ++stage) {
+        if (std::find(std::next(stage), request.stages.end(), *stage) != request.stages.end())
+            return fail(ErrorCode::InvalidArgument, std::format("stage {} is requested twice", to_string(*stage)));
+    }
     const StageSelection stages = StageSelection::from(request.stages);
     if (stages.waveform && (request.waveform_bins < 1 || request.waveform_bins > kMaximumWaveformBins))
         return fail(ErrorCode::InvalidArgument, std::format("waveform_bins must be in [1, {}]", kMaximumWaveformBins));

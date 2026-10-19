@@ -233,11 +233,13 @@ private:
     }
 
     /// Exact counts from the native probe when it had one (ALAC, PCM, Ogg granules); otherwise the
-    /// container's duration, which for lossy codecs is an estimate.
+    /// container's duration, which for lossy codecs is an estimate. FFmpeg's Vorbis decoder delivers
+    /// 128 frames fewer than the granule count (measured: 43972 of 44100), so for Vorbis the probe's
+    /// count is only an estimate here.
     void determine_length(const ProbeResult& probe) {
         if (probe.frames && probe.sample_rate == output_rate_) {
             total_frames_ = probe.frames;
-            frames_exact_ = true;
+            frames_exact_ = probe.codec != "vorbis";
         } else if (stream_->duration != AV_NOPTS_VALUE && stream_->duration > 0) {
             total_frames_ = av_rescale_q(stream_->duration, stream_->time_base, sample_time_base(output_rate_));
         } else if (probe.duration_us) {
@@ -246,16 +248,22 @@ private:
     }
 
     /// Converts the decoded frame in frame_ to interleaved float32 in pending_, at the output
-    /// layout and rate.
-    Result<void> convert_frame() {
+    /// layout and rate. When the input format changes part-way, the samples the old resampler
+    /// still buffers are drained first and kept in front of the new frame's output. Returns how
+    /// many frames of pending_ were carried over that way.
+    Result<std::size_t> convert_frame() {
         if (frame_->ch_layout.nb_channels < 1 || frame_->sample_rate < 1) {
             return fail(ErrorCode::CorruptAudio, "decoded frame has no channels or sample rate");
         }
         const bool input_changed = !resampler_ || frame_->format != input_format_ ||
                                    frame_->sample_rate != input_rate_ ||
                                    av_channel_layout_compare(&frame_->ch_layout, &input_layout_.get()) != 0;
+        std::vector<float> carried;
         if (input_changed) {
-            if (auto configured = configure_resampler(); !configured) return configured;
+            if (resampler_) {
+                if (auto drained = drain_resampler(carried); !drained) return std::unexpected(drained.error());
+            }
+            if (auto configured = configure_resampler(); !configured) return std::unexpected(configured.error());
         }
         const int capacity = swr_get_out_samples(resampler_.get(), frame_->nb_samples);
         if (capacity < 0) return fail(ErrorCode::CorruptAudio, "resampler rejected the decoded frame");
@@ -268,7 +276,22 @@ private:
                                           const_cast<const std::uint8_t**>(frame_->extended_data), frame_->nb_samples);
         if (converted < 0) return fail(ErrorCode::CorruptAudio, "sample format conversion failed");
         pending_.resize(static_cast<std::size_t>(converted) * channel_count);
+        pending_.insert(pending_.begin(), carried.begin(), carried.end());
         pending_offset_ = 0;
+        return carried.size() / channel_count;
+    }
+
+    /// Appends to `out` every sample the current resampler still buffers (its rate-conversion
+    /// delay), at the output layout.
+    Result<void> drain_resampler(std::vector<float>& out) {
+        const int capacity = swr_get_out_samples(resampler_.get(), 0);
+        if (capacity <= 0) return {};
+        const auto channel_count = static_cast<std::size_t>(output_layout_.channels());
+        out.resize(static_cast<std::size_t>(capacity) * channel_count);
+        auto* output = reinterpret_cast<std::uint8_t*>(out.data());
+        const int converted = swr_convert(resampler_.get(), &output, capacity, nullptr, 0);
+        if (converted < 0) return fail(ErrorCode::CorruptAudio, "sample format conversion failed");
+        out.resize(static_cast<std::size_t>(converted) * channel_count);
         return {};
     }
 
@@ -300,19 +323,13 @@ private:
     Result<bool> flush_resampler() {
         if (!resampler_ || resampler_flushed_) return false;
         resampler_flushed_ = true;
-        const int capacity = swr_get_out_samples(resampler_.get(), 0);
-        if (capacity <= 0) return false;
-        const auto channel_count = static_cast<std::size_t>(output_layout_.channels());
-        pending_.resize(static_cast<std::size_t>(capacity) * channel_count);
-        auto* output = reinterpret_cast<std::uint8_t*>(pending_.data());
-        const int converted = swr_convert(resampler_.get(), &output, capacity, nullptr, 0);
-        if (converted < 0) return fail(ErrorCode::CorruptAudio, "sample format conversion failed");
-        pending_.resize(static_cast<std::size_t>(converted) * channel_count);
+        pending_.clear();
         pending_offset_ = 0;
-        if (converted == 0) return false;
+        if (auto drained = drain_resampler(pending_); !drained) return std::unexpected(drained.error());
+        if (pending_.empty()) return false;
         if (next_frame_position_) {
             current_frame_position_ = next_frame_position_;
-            next_frame_position_ = *next_frame_position_ + converted;
+            next_frame_position_ = *next_frame_position_ + static_cast<std::int64_t>(pending_frames());
         }
         return true;
     }
@@ -344,7 +361,9 @@ private:
             if (received == 0) {
                 consecutive_corrupt_units_ = 0;
                 auto converted = convert_frame();
-                const auto start = frame_position();
+                auto start = frame_position();
+                // Samples carried over from the previous resampler precede this frame's own.
+                if (start && converted && !next_frame_position_) *start -= static_cast<std::int64_t>(*converted);
                 current_frame_position_ = start;
                 if (start) next_frame_position_ = *start + static_cast<std::int64_t>(pending_frames());
                 av_frame_unref(frame_.get());
@@ -371,6 +390,9 @@ private:
         while (true) {
             const int status = av_read_frame(input_->context(), packet_.get());
             if (status == AVERROR_EOF) {
+                // A failing read callback can surface as a plain end of file; an unplugged drive
+                // must report its error instead of ending playback silently.
+                if (input_->read_error()) return std::unexpected(*input_->read_error());
                 // Entering drain mode only fails when the decoder is already draining, and then
                 // receive reports AVERROR_EOF, which ends the stream either way.
                 const int drain_status = avcodec_send_packet(codec_.get(), nullptr);

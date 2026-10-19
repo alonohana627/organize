@@ -107,17 +107,17 @@ enum class PreviewState : std::uint8_t {
 };
 
 /// Stable lowercase name of a state, for diagnostics and logs.
-std::string_view to_string(PreviewState state) noexcept;
+[[nodiscard]] std::string_view to_string(PreviewState state) noexcept;
 /// Stable lowercase name of a playback mode ("varispeed", "independent_tempo_pitch").
-std::string_view to_string(PlaybackMode mode) noexcept;
+[[nodiscard]] std::string_view to_string(PlaybackMode mode) noexcept;
 
 /// Converts decibels to linear gain clamped to 0..1: 0 dB is unity, -inf/NaN/below -120 dB is silence.
-float linear_gain_from_decibels(double decibels) noexcept;
+[[nodiscard]] float linear_gain_from_decibels(double decibels) noexcept;
 
 /// Clamps a linear gain to 0..1; NaN becomes silence.
-float clamped_linear_gain(double gain) noexcept;
+[[nodiscard]] float clamped_linear_gain(double gain) noexcept;
 
 /// Clamps a pitch shift to ±kMaximumPitchSemitones; NaN becomes 0.
-double clamped_pitch_semitones(double semitones) noexcept;
+[[nodiscard]] double clamped_pitch_semitones(double semitones) noexcept;
 
 }  // namespace mso::audio

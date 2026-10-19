@@ -62,7 +62,7 @@ enum class Field {
 };
 
 /// Canonical name of a field as written in queries ("tag", "bpm", "rate", "bits"...).
-std::string_view to_string(Field field) noexcept;
+[[nodiscard]] std::string_view to_string(Field field) noexcept;
 
 /// Comparison of a numeric field, as typed by the user.
 enum class Comparison { Equal, Less, LessOrEqual, Greater, GreaterOrEqual, Between };
@@ -109,7 +109,7 @@ struct QueryNode {
 struct Query {
     QueryNodePointer root;  ///< null for the empty query
     /// True for the empty query.
-    bool empty() const { return root == nullptr; }
+    [[nodiscard]] bool empty() const { return root == nullptr; }
 };
 
 /// Longest accepted query, in Unicode code points.
@@ -120,14 +120,14 @@ inline constexpr std::size_t kMaxQueryDepth = 16;
 inline constexpr std::size_t kMaxQueryNodes = 256;
 
 /// Parses query text. PARSE_ERROR carries Error::position (code-point offset) on failure.
-Result<Query> parse_query(std::string_view text);
+[[nodiscard]] Result<Query> parse_query(std::string_view text);
 
 /// Collects the positive (non-negated) text terms, used for relevance ranking.
-std::vector<TextTerm> positive_text_terms(const Query& query);
+[[nodiscard]] std::vector<TextTerm> positive_text_terms(const Query& query);
 
 /// True when every sample the query matches necessarily matches one of its positive text terms
 /// (so ranking only full-text hits loses nothing). False for `kick OR tag:Drums`, `NOT kick`, or a
 /// query without text.
-bool requires_text_match(const Query& query);
+[[nodiscard]] bool requires_text_match(const Query& query);
 
 }  // namespace mso::search

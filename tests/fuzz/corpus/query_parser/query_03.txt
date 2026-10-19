@@ -1,0 +1,1 @@
+bpm:140..155 key:F#minor duration:<2s available:true

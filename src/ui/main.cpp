@@ -17,18 +17,16 @@
 #include <QTimer>
 
 #include "mso/app/application.hpp"
+#include "mso/generated/dependencies.hpp"
 #include "mso/ui/application_session.hpp"
 #include "mso/ui/display_format.hpp"
 #include "mso/ui/main_window.hpp"
 
-#ifndef MSO_VERSION_STRING
-#define MSO_VERSION_STRING "0.0.0"
-#endif
-
 int main(int argc, char* argv[]) {
     QApplication application(argc, argv);
     QApplication::setApplicationName(QStringLiteral("Music Sample Organizer"));
-    QApplication::setApplicationVersion(QStringLiteral(MSO_VERSION_STRING));
+    QApplication::setApplicationVersion(QString::fromUtf8(
+        mso::generated::kProjectVersion.data(), static_cast<qsizetype>(mso::generated::kProjectVersion.size())));
     // Every rendered size from the Qt resources (cmake/ApplicationIcon.cmake), so title bars, the
     // taskbar and Alt+Tab each get a crisp image instead of a scaled one.
     QIcon application_icon;

@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "mso/app/json_fields.hpp"
+#include "mso/domain/json_fields.hpp"
 #include "mso/ui/display_format.hpp"
 
 namespace mso::ui {
@@ -18,9 +18,9 @@ QKeySequence standard_or(QKeySequence::StandardKey key, const QKeySequence& fall
 
 }  // namespace
 
-const std::vector<ShortcutDefinition>& ShortcutCatalog::definitions() {
+std::vector<ShortcutDefinition> ShortcutCatalog::definitions() {
     using enum ShortcutScope;
-    static const std::vector<ShortcutDefinition> kDefinitions = {
+    return {
         {QStringLiteral("play_pause"), tr("Play / pause preview"), QKeySequence(Qt::Key_Space), SampleTable},
         {QStringLiteral("stop"), tr("Stop preview"), QKeySequence(Qt::Key_Escape), SampleTable},
         {QStringLiteral("undo"), tr("Undo"), QKeySequence(QKeySequence::Undo), Window},
@@ -43,7 +43,6 @@ const std::vector<ShortcutDefinition>& ShortcutCatalog::definitions() {
         {QStringLiteral("quit"), tr("Quit"), standard_or(QKeySequence::Quit, QKeySequence(Qt::CTRL | Qt::Key_Q)),
          Window},
     };
-    return kDefinitions;
 }
 
 ShortcutBindings ShortcutCatalog::defaults() {
@@ -55,8 +54,8 @@ ShortcutBindings ShortcutCatalog::defaults() {
 
 ShortcutBindings ShortcutCatalog::from_json(const nlohmann::json& stored) {
     ShortcutBindings bindings = defaults();
-    if (app::integer_field(stored, "version") != kSchemaVersion) return bindings;
-    const nlohmann::json* entries = app::object_field(stored, "bindings");
+    if (json_fields::integer_field(stored, "version") != kSchemaVersion) return bindings;
+    const nlohmann::json* entries = json_fields::object_field(stored, "bindings");
     if (!entries) return bindings;
     for (const auto& [id, value] : entries->items()) {
         const QString action = DisplayFormat::from_utf8(id);
@@ -91,6 +90,11 @@ ShortcutScope ShortcutCatalog::scope(const QString& id) {
     for (const auto& definition : definitions())
         if (definition.id == id) return definition.scope;
     return ShortcutScope::Window;
+}
+
+bool ShortcutCatalog::is_single_key(const QKeySequence& sequence) {
+    if (sequence.count() != 1) return false;
+    return (sequence[0].keyboardModifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == 0;
 }
 
 QString ShortcutCatalog::label(const QString& id) {

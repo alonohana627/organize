@@ -17,6 +17,6 @@ namespace mso::analysis {
 /// they often score almost as high on real music, and a DJ treats a relative-key confusion as
 /// compatible (same Camelot number). Confidence is the best correlation scaled by how clearly it
 /// beats the runner-up, related keys included; it is a heuristic, not a probability.
-KeyResult estimate_key(const ChromaProfile& profile);
+[[nodiscard]] KeyResult estimate_key(const ChromaProfile& profile);
 
 }  // namespace mso::analysis

@@ -162,8 +162,8 @@ Result<std::vector<OutputDeviceInfo>> OutputContext::list_devices() {
 /// The miniaudio device and what its callbacks reach through pUserData. Fixed heap address:
 /// ma_device holds pointers into itself and miniaudio holds a pointer to this object.
 struct OutputDevice::Engine {
-    Engine(PlaybackRenderer& playback_renderer, SharedPlaybackState& shared_state, WakeupSignal& wakeup_signal) noexcept
-        : renderer(playback_renderer), shared(shared_state), wakeup(wakeup_signal) {}
+    Engine(PlaybackRenderer& playback_renderer, DeviceLossListener& device_loss_listener) noexcept
+        : renderer(playback_renderer), loss_listener(device_loss_listener) {}
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
     ~Engine() {
@@ -185,14 +185,12 @@ struct OutputDevice::Engine {
         auto* engine = static_cast<Engine*>(notification->pDevice->pUserData);
         if (notification->type == ma_device_notification_type_stopped &&
             !engine->expecting_stop.load(std::memory_order_acquire)) {
-            engine->shared.device_lost.store(true, std::memory_order_release);
-            engine->wakeup.notify();
+            engine->loss_listener.on_device_lost();
         }
     }
 
     PlaybackRenderer& renderer;              ///< what the callback runs
-    SharedPlaybackState& shared;             ///< where a loss is reported
-    WakeupSignal& wakeup;                    ///< wakes the decoder thread on a loss
+    DeviceLossListener& loss_listener;       ///< told about an unexpected stop
     std::atomic<bool> expecting_stop{true};  ///< our own stop/close: do not report it as a loss
     bool initialized = false;                ///< ma_device_init succeeded
     ma_device device{};                      ///< the endpoint
@@ -204,8 +202,8 @@ OutputDevice::~OutputDevice() = default;
 
 Result<std::unique_ptr<OutputDevice>> OutputDevice::open(OutputContext& context, const OutputDeviceId& device,
                                                          const OutputDeviceSettings& settings,
-                                                         PlaybackRenderer& renderer, SharedPlaybackState& shared,
-                                                         WakeupSignal& wakeup) {
+                                                         PlaybackRenderer& renderer,
+                                                         DeviceLossListener& loss_listener) {
     auto native_id = context.engine_->resolve(device);
     if (!native_id) {
         return std::unexpected(native_id.error());
@@ -214,7 +212,7 @@ Result<std::unique_ptr<OutputDevice>> OutputDevice::open(OutputContext& context,
     if (!output) {
         return fail(ErrorCode::ResourceLimit, "out of memory for the output device");
     }
-    output->engine_.reset(new (std::nothrow) Engine(renderer, shared, wakeup));
+    output->engine_.reset(new (std::nothrow) Engine(renderer, loss_listener));
     if (!output->engine_) {
         return fail(ErrorCode::ResourceLimit, "out of memory for the output device");
     }

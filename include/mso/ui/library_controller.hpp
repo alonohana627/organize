@@ -42,10 +42,10 @@ public:
 
     /// Lets the user pick one open library by position (names may repeat: duplicates show their
     /// folder). Returns the only candidate without asking; nullopt when cancelled or none is open.
-    static std::optional<uuids::uuid> choose_library(QWidget* parent,
-                                                     const std::vector<app::OpenLibraryInfo>& libraries,
-                                                     const QString& purpose, bool writable_only,
-                                                     const std::optional<uuids::uuid>& preferred);
+    [[nodiscard]] static std::optional<uuids::uuid> choose_library(QWidget* parent,
+                                                                   const std::vector<app::OpenLibraryInfo>& libraries,
+                                                                   const QString& purpose, bool writable_only,
+                                                                   const std::optional<uuids::uuid>& preferred);
 
 signals:
     /// An import started (for the Jobs panel).

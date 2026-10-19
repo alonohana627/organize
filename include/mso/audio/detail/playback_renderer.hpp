@@ -18,12 +18,15 @@ namespace mso::audio::detail {
 ///
 /// Per callback it drops ring blocks of superseded epochs (and of another device rate), plays
 /// blocks of the current epoch while output is enabled, smooths volume per sample, decays the last
-/// output value to zero whenever audio is cut (flush, underrun), clamps the result to ±1, and
-/// publishes consumption, the latency-compensated audible position, end-of-stream and underruns.
+/// output value to zero whenever audio is cut (every epoch change, flush, underrun), clamps the
+/// result to ±1, and publishes consumption, the latency-compensated audible position, end-of-stream
+/// and underruns.
 ///
 /// Fades never touch intact audio: a fresh epoch starts at full gain (its first frame is either
-/// frame 0 of the source or already faded in by the decoder thread); only resuming after a pause
-/// or an underrun, which re-enters the signal mid-way, fades in over 5 ms; pausing fades out.
+/// frame 0 of the source or already faded in by the decoder thread), while the previous epoch's last
+/// output value decays over 5 ms on top of it, so a seek or re-anchor while playing never steps.
+/// Only resuming after a pause, an underrun or a device change, which re-enters the signal mid-way,
+/// fades in over 5 ms; pausing fades out.
 class PlaybackRenderer {
 public:
     /// Renderer over `ring`, publishing into `shared`. configure() must run before the first render().
@@ -33,7 +36,9 @@ public:
     PlaybackRenderer& operator=(const PlaybackRenderer&) = delete;
 
     /// Sets the device rate (ramp lengths, accepted blocks) and the output latency the playhead is
-    /// compensated for. Call only while no callback can run.
+    /// compensated for, for a device that is about to start. The playhead history restarts from the
+    /// position last heard on the previous device, a held block of another rate is dropped on the
+    /// next render, and output that is enabled fades back in. Call only while no callback can run.
     void configure(std::uint32_t output_rate, std::uint32_t latency_frames) noexcept;
 
     /// Fills all of `stereo_output` (interleaved left/right).
@@ -44,14 +49,19 @@ private:
     /// audio, and sets the transport gain for the new state.
     void adopt_gate(TransportGate gate) noexcept;
     /// True while frames should be pulled from the ring (playing, or a pause fade still audible).
-    bool consuming() const noexcept { return transport_gain_.target() > 0.0f || transport_gain_.value() > 0.0f; }
+    [[nodiscard]] bool consuming() const noexcept {
+        return transport_gain_.target() > 0.0f || transport_gain_.value() > 0.0f;
+    }
     /// Reads the next frame of the current epoch; false when there is none (or output just stopped).
-    bool read_frame(float& left, float& right) noexcept;
+    [[nodiscard]] bool read_frame(float& left, float& right) noexcept;
     /// True when a block must not be played: an older epoch, or rendered for another device rate.
-    bool is_superseded(const PcmBlockHeader& header) const noexcept;
+    [[nodiscard]] bool is_superseded(const PcmBlockHeader& header) const noexcept;
     /// Releases the current block (reporting end of stream when it carries the flag).
     void finish_block() noexcept;
-    /// Starts the decay of the last output value when audio was audible: avoids a step to silence.
+    /// Releases the held block unplayed when it belongs to an older epoch or another device rate.
+    void release_superseded_held_block() noexcept;
+    /// Starts the decay of the last output value when audio was audible: avoids a step to silence or
+    /// to another place in the source.
     void cut_audio() noexcept;
     /// Publishes consumption and the audible position for this callback.
     void publish_progress() noexcept;

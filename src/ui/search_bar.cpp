@@ -101,8 +101,13 @@ void SearchBar::show_error(const QString& message, int character_index) {
     const QString text = input_->text();
     const int clamped = std::clamp(character_index, 0, static_cast<int>(text.size()));
     const QString before = text.left(clamped).toHtmlEscaped();
-    const QString at = clamped < text.size() ? text.mid(clamped, 1).toHtmlEscaped() : QStringLiteral("&nbsp;");
-    const QString after = text.mid(clamped + 1).toHtmlEscaped();
+    // The marked character is a whole code point: a surrogate pair (emoji, rare CJK) is never split.
+    const int marked_length =
+        clamped + 1 < text.size() && text.at(clamped).isHighSurrogate() && text.at(clamped + 1).isLowSurrogate() ? 2
+                                                                                                                 : 1;
+    const QString at =
+        clamped < text.size() ? text.mid(clamped, marked_length).toHtmlEscaped() : QStringLiteral("&nbsp;");
+    const QString after = text.mid(clamped + marked_length).toHtmlEscaped();
     error_label_->setText(tr("Query not run, error at position %1: %2<br><code>%3<u><b>%4</b></u>%5</code>")
                               .arg(clamped + 1)
                               .arg(message.toHtmlEscaped(), before, at, after));

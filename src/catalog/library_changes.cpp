@@ -16,10 +16,10 @@ constexpr std::size_t kMaximumConsumerNameCodePoints = 128;
 bool merge_envelope(std::int64_t envelope_version, const std::string& payload_text, ChangeSet& changes,
                     std::vector<std::int64_t>& sample_ids) {
     if (envelope_version != detail::kOutboxEnvelopeVersion) return false;
-    const auto payload = detail::parse_json(payload_text);
-    if (detail::json_boolean_member(payload, "all_samples").value_or(false)) return false;
-    const auto samples = detail::json_integer_array_member(payload, "samples");
-    const auto structure = detail::json_boolean_member(payload, "structure");
+    const auto payload = json_fields::parse_json(payload_text);
+    if (json_fields::boolean_field(payload, "all_samples").value_or(false)) return false;
+    const auto samples = json_fields::integer_array_field(payload, "samples");
+    const auto structure = json_fields::boolean_field(payload, "structure");
     if (!samples || !structure) return false;
     sample_ids.insert(sample_ids.end(), samples->begin(), samples->end());
     changes.structure_changed = changes.structure_changed || *structure;
@@ -91,9 +91,9 @@ Result<void> Library::acknowledge_changes(std::string_view consumer, std::int64_
     sqlite::WriteTransaction transaction(writer_);
     if (auto began = transaction.begin(); !began) return began;
     auto upsert = writer_.prepare(
-        "INSERT INTO consumer_cursors(name,revision,baseline_required) "
-        "VALUES(?1,min(?2,(SELECT catalog_revision FROM library_state WHERE singleton=1)),0) "
-        "ON CONFLICT(name) DO UPDATE SET revision=excluded.revision, baseline_required=0");
+        "INSERT INTO consumer_cursors(name,revision) "
+        "VALUES(?1,min(?2,(SELECT catalog_revision FROM library_state WHERE singleton=1))) "
+        "ON CONFLICT(name) DO UPDATE SET revision=excluded.revision");
     if (!upsert) return std::unexpected(upsert.error());
     upsert->bind(1, consumer).bind(2, revision);
     if (auto stored = upsert->run(); !stored) return stored;

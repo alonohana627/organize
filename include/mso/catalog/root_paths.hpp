@@ -11,11 +11,11 @@ namespace mso::catalog {
 
 /// The case sensitivity assumed when no directory can be examined: false on Windows and macOS,
 /// true on other POSIX systems.
-bool default_case_sensitivity() noexcept;
+[[nodiscard]] bool default_case_sensitivity() noexcept;
 
 /// Examines a directory without writing to it: finds an entry whose name has a case variant and
 /// checks whether that variant resolves to the same file. Falls back to the directory's own name,
 /// then to default_case_sensitivity(). NOT_FOUND / ACCESS_DENIED when the directory is unusable.
-Result<bool> detect_case_sensitivity(const std::filesystem::path& directory);
+[[nodiscard]] Result<bool> detect_case_sensitivity(const std::filesystem::path& directory);
 
 }  // namespace mso::catalog

@@ -18,14 +18,18 @@ void print_root(const CommandContext& context, const catalog::RootRecord& root,
 /// Registers `create`.
 void register_create(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("create", "Create a new library folder");
-    auto directory = std::make_shared<std::string>();
-    auto name = std::make_shared<std::string>("My Samples");
-    command->add_option("library", *directory, "New (empty) library folder")->required();
-    command->add_option("--name", *name, "Library name");
-    command->callback([&, directory, name] {
+    /// Every option of `create`.
+    struct Options {
+        std::string directory;
+        std::string name = "My Samples";
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "New (empty) library folder")->required();
+    command->add_option("--name", options.name, "Library name");
+    command->callback([&] {
         auto application = context.application();
         if (!application) return void(exit_code = context.report(application.error()));
-        auto created = (*application)->create_library(path_from_utf8(*directory), *name);
+        auto created = (*application)->create_library(path_from_utf8(options.directory), options.name);
         if (!created) return void(exit_code = context.report(created.error()));
         context.print("created library '{}' ({})", created->name, uuids::to_string(created->uuid));
     });
@@ -34,10 +38,10 @@ void register_create(CLI::App& root, CommandContext& context, int& exit_code) {
 /// Registers `info`.
 void register_info(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("info", "Show library identity, roots and counts");
-    auto directory = std::make_shared<std::string>();
-    command->add_option("library", *directory, "Library folder")->required();
-    command->callback([&, directory] {
-        auto library = context.open_library(path_from_utf8(*directory));
+    auto& directory = context.command_options<std::string>();
+    command->add_option("library", directory, "Library folder")->required();
+    command->callback([&] {
+        auto library = context.open_library(path_from_utf8(directory));
         if (!library) return void(exit_code = context.report(library.error()));
         auto* application = *context.application();
         auto shown = application->with_library(library->uuid, [&](catalog::Library& opened) -> Result<void> {
@@ -66,16 +70,20 @@ void register_info(CLI::App& root, CommandContext& context, int& exit_code) {
 /// Registers `add-root`.
 void register_add_root(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("add-root", "Reference a sample folder in place (files are never moved)");
-    auto directory = std::make_shared<std::string>();
-    auto folder = std::make_shared<std::string>();
-    auto name = std::make_shared<std::string>();
-    command->add_option("library", *directory, "Library folder")->required();
-    command->add_option("folder", *folder, "Sample folder to reference")->required();
-    command->add_option("--name", *name, "Display name of the root");
-    command->callback([&, directory, folder, name] {
-        auto library = context.open_library(path_from_utf8(*directory), Access::Write);
+    /// Every option of `add-root`.
+    struct Options {
+        std::string directory;
+        std::string folder;
+        std::string name;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "Library folder")->required();
+    command->add_option("folder", options.folder, "Sample folder to reference")->required();
+    command->add_option("--name", options.name, "Display name of the root");
+    command->callback([&] {
+        auto library = context.open_library(path_from_utf8(options.directory), Access::Write);
         if (!library) return void(exit_code = context.report(library.error()));
-        auto added = (*context.application())->add_root(library->uuid, path_from_utf8(*folder), *name);
+        auto added = (*context.application())->add_root(library->uuid, path_from_utf8(options.folder), options.name);
         if (!added) return void(exit_code = context.report(added.error()));
         context.print("added root {} '{}'", added->id, added->name);
     });
@@ -84,24 +92,29 @@ void register_add_root(CLI::App& root, CommandContext& context, int& exit_code) 
 /// Registers `import`.
 void register_import(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("import", "Scan roots: add new files, notice changes, moves and missing files");
-    auto directory = std::make_shared<std::string>();
-    auto root_id = std::make_shared<std::optional<std::int64_t>>();
-    command->add_option("library", *directory, "Library folder")->required();
-    command->add_option("--root", *root_id, "Only this root id (default: all roots)");
-    command->callback([&, directory, root_id] {
-        auto library = context.open_library(path_from_utf8(*directory), Access::Write);
+    /// Every option of `import`.
+    struct Options {
+        std::string directory;
+        std::optional<std::int64_t> root_id;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "Library folder")->required();
+    command->add_option("--root", options.root_id, "Only this root id (default: all roots)");
+    command->callback([&] {
+        const auto& root_id = options.root_id;
+        auto library = context.open_library(path_from_utf8(options.directory), Access::Write);
         if (!library) return void(exit_code = context.report(library.error()));
         auto* application = *context.application();
         auto roots =
             application->with_library(library->uuid, [](catalog::Library& opened) { return opened.list_roots(); });
         if (!roots) return void(exit_code = context.report(roots.error()));
-        if (*root_id && std::ranges::find(*roots, **root_id, &catalog::RootRecord::id) == roots->end())
+        if (root_id && std::ranges::find(*roots, *root_id, &catalog::RootRecord::id) == roots->end())
             return void(exit_code = context.report(Error{
-                            ErrorCode::NotFound, false, std::format("the library has no root {}", **root_id), {}, {}}));
+                            ErrorCode::NotFound, false, std::format("the library has no root {}", *root_id), {}, {}}));
         InterruptScope interrupt;
         bool incomplete = false;
         for (const auto& entry : *roots) {
-            if (*root_id && entry.id != **root_id) continue;
+            if (root_id && entry.id != *root_id) continue;
             context.print("scanning '{}'", entry.name);
             auto summary = application->import_now(
                 library->uuid, entry.id, interrupt.token(), [&](const files::ImportProgress& progress) {
@@ -133,10 +146,10 @@ void register_history_steps(CLI::App& root, CommandContext& context, int& exit_c
         const bool undo = std::string_view(verb) == "undo";
         auto* command = root.add_subcommand(
             verb, undo ? "Undo the last metadata edit (persists across restarts)" : "Redo the last undone edit");
-        auto directory = std::make_shared<std::string>();
-        command->add_option("library", *directory, "Library folder")->required();
-        command->callback([&, directory, undo] {
-            auto library = context.open_library(path_from_utf8(*directory), Access::Write);
+        auto& directory = context.command_options<std::string>();
+        command->add_option("library", directory, "Library folder")->required();
+        command->callback([&, undo] {
+            auto library = context.open_library(path_from_utf8(directory), Access::Write);
             if (!library) return void(exit_code = context.report(library.error()));
             auto* application = *context.application();
             auto receipt = undo ? application->undo(library->uuid) : application->redo(library->uuid);
@@ -154,10 +167,10 @@ void register_history_steps(CLI::App& root, CommandContext& context, int& exit_c
 /// Registers `history`.
 void register_history(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("history", "List recent edits");
-    auto directory = std::make_shared<std::string>();
-    command->add_option("library", *directory, "Library folder")->required();
-    command->callback([&, directory] {
-        auto library = context.open_library(path_from_utf8(*directory));
+    auto& directory = context.command_options<std::string>();
+    command->add_option("library", directory, "Library folder")->required();
+    command->callback([&] {
+        auto library = context.open_library(path_from_utf8(directory));
         if (!library) return void(exit_code = context.report(library.error()));
         auto entries = (*context.application())->with_library(library->uuid, [](catalog::Library& opened) {
             return opened.history(50);
@@ -172,10 +185,12 @@ void register_history(CLI::App& root, CommandContext& context, int& exit_code) {
 void register_maintenance(CLI::App& root, CommandContext& context, int& exit_code) {
     {
         auto* command = root.add_subcommand("backup", "Write a verified backup into the library's backups folder");
-        auto directory = std::make_shared<std::string>();
-        command->add_option("library", *directory, "Library folder")->required();
-        command->callback([&, directory] {
-            auto library = context.open_library(path_from_utf8(*directory));
+        auto& directory = context.command_options<std::string>();
+        command->add_option("library", directory, "Library folder")->required();
+        command->callback([&] {
+            // A backup writes and prunes the library's backups folder, so it needs the library's
+            // lock like any other write (never while the desktop app owns the folder).
+            auto library = context.open_library(path_from_utf8(directory), Access::Write);
             if (!library) return void(exit_code = context.report(library.error()));
             auto backup = (*context.application())->with_library(library->uuid, [](catalog::Library& opened) {
                 return opened.create_backup("manual");
@@ -186,10 +201,10 @@ void register_maintenance(CLI::App& root, CommandContext& context, int& exit_cod
     }
     {
         auto* command = root.add_subcommand("check", "Run integrity, foreign-key and search-index checks");
-        auto directory = std::make_shared<std::string>();
-        command->add_option("library", *directory, "Library folder")->required();
-        command->callback([&, directory] {
-            auto library = context.open_library(path_from_utf8(*directory));
+        auto& directory = context.command_options<std::string>();
+        command->add_option("library", directory, "Library folder")->required();
+        command->callback([&] {
+            auto library = context.open_library(path_from_utf8(directory));
             if (!library) return void(exit_code = context.report(library.error()));
             auto checked =
                 (*context.application())->with_library(library->uuid, [&](catalog::Library& opened) -> Result<void> {
@@ -213,32 +228,37 @@ void register_maintenance(CLI::App& root, CommandContext& context, int& exit_cod
 /// Registers `export`.
 void register_export(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("export", "Export metadata to CSV or JSON (atomic; never touches audio)");
-    auto directory = std::make_shared<std::string>();
-    auto destination = std::make_shared<std::string>();
-    auto format = std::make_shared<std::string>("csv");
-    auto query = std::make_shared<std::string>();
-    auto raw = std::make_shared<bool>(false);
-    auto absolute = std::make_shared<bool>(false);
-    command->add_option("library", *directory, "Library folder")->required();
-    command->add_option("file", *destination, "Destination file")->required();
-    command->add_option("--format", *format, "csv or json")->check(CLI::IsMember({"csv", "json"}));
-    command->add_option("--query", *query, "Only samples matching this search");
+    /// Every option of `export`.
+    struct Options {
+        std::string directory;
+        std::string destination;
+        std::string format = "csv";
+        std::string query;
+        bool raw = false;
+        bool absolute = false;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "Library folder")->required();
+    command->add_option("file", options.destination, "Destination file")->required();
+    command->add_option("--format", options.format, "csv or json")->check(CLI::IsMember({"csv", "json"}));
+    command->add_option("--query", options.query, "Only samples matching this search");
     auto* raw_flag =
-        command->add_flag("--raw", *raw, "CSV: keep cells starting with = + - @ exactly (not spreadsheet-safe)");
-    command->add_flag("--absolute-paths", *absolute, "Include machine-local absolute paths");
-    command->callback([&, directory, destination, format, query, raw, absolute, raw_flag] {
-        if (*format == "json" && raw_flag->count() > 0)
+        command->add_flag("--raw", options.raw, "CSV: keep cells starting with = + - @ exactly (not spreadsheet-safe)");
+    command->add_flag("--absolute-paths", options.absolute, "Include machine-local absolute paths");
+    command->callback([&, raw_flag] {
+        if (options.format == "json" && raw_flag->count() > 0)
             return void(exit_code = context.usage("--raw applies to CSV only"));
-        auto library = context.open_library(path_from_utf8(*directory));
+        auto library = context.open_library(path_from_utf8(options.directory));
         if (!library) return void(exit_code = context.report(library.error()));
-        app::ExportOptions options;
-        options.format = *format == "json" ? app::ExportFormat::Json : app::ExportFormat::Csv;
-        options.spreadsheet_safe = !*raw;
-        options.include_absolute_paths = *absolute;
-        options.query = *query;
+        app::ExportOptions export_options;
+        export_options.format = options.format == "json" ? app::ExportFormat::Json : app::ExportFormat::Csv;
+        export_options.spreadsheet_safe = !options.raw;
+        export_options.include_absolute_paths = options.absolute;
+        export_options.query = options.query;
         InterruptScope interrupt;
         auto summary = (*context.application())
-                           ->export_metadata(library->uuid, path_from_utf8(*destination), options, interrupt.token());
+                           ->export_metadata(library->uuid, path_from_utf8(options.destination), export_options,
+                                             interrupt.token());
         if (!summary) {
             if (summary.error().code == ErrorCode::Cancelled) return void(exit_code = kExitInterrupted);
             return void(exit_code = context.report(summary.error()));

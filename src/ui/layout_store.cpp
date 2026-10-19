@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-#include "mso/app/json_fields.hpp"
+#include "mso/domain/json_fields.hpp"
 
 namespace mso::ui {
 
@@ -22,7 +22,7 @@ std::string encode(const QByteArray& bytes) {
 
 /// Base64 field `key` of `layout`, or empty when absent or not a string.
 QByteArray decode(const nlohmann::json& layout, std::string_view key) {
-    const auto text = app::string_field(layout, key);
+    const auto text = json_fields::string_field(layout, key);
     if (!text) return {};
     return QByteArray::fromBase64(QByteArray(text->data(), static_cast<qsizetype>(text->size())));
 }
@@ -37,7 +37,7 @@ nlohmann::json LayoutStore::capture(const QMainWindow& window, const QHeaderView
 }
 
 bool LayoutStore::restore(QMainWindow& window, QHeaderView& header, const nlohmann::json& layout) {
-    if (app::integer_field(layout, "version") != kSchemaVersion) return false;
+    if (json_fields::integer_field(layout, "version") != kSchemaVersion) return false;
     const QByteArray geometry = decode(layout, "geometry");
     const QByteArray state = decode(layout, "state");
     const QByteArray header_state = decode(layout, "header");

@@ -24,10 +24,10 @@ void store_tag(EmbeddedTags& tags, TagField field, std::string_view value);
 std::optional<TagField> field_for_tag_name(std::string_view name);
 
 /// Converts a tempo in BPM to milli-BPM; nullopt outside 1..999 BPM or when not finite.
-std::optional<std::int64_t> milli_bpm_from_value(double bpm) noexcept;
+[[nodiscard]] std::optional<std::int64_t> milli_bpm_from_value(double bpm) noexcept;
 
 /// Parses a tag tempo such as "128", "127.5", "128,00" or "126 BPM" into milli-BPM (1..999 BPM).
-std::optional<std::int64_t> parse_tag_bpm(std::string_view text);
+[[nodiscard]] std::optional<std::int64_t> parse_tag_bpm(std::string_view text);
 
 /// Parses a tag key ("F#m", "Bbmin", "C major", Camelot "8A", Open Key "1m"); nullopt when the
 /// mode is unknown.

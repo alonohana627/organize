@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <stop_token>
 #include <vector>
@@ -62,15 +63,16 @@ private:
 
     /// Resolves through the Application.
     ApplicationSession& session_;
-    QThreadPool pool_;  ///< one thread, separate from the session's pool
-    QTimer debounce_;
-    std::stop_source stop_;  ///< cancels the running check
-    std::uint64_t generation_ = 0;
+    QThreadPool pool_;              ///< one thread, separate from the session's pool
+    QTimer debounce_;               ///< waits kDebounceMilliseconds after the last selection change
+    std::stop_source stop_;         ///< cancels the running check
+    std::uint64_t generation_ = 0;  ///< drops deliveries of superseded checks
     /// results_ belong to keys_ and are complete.
     bool ready_ = false;
-    bool checking_ = false;  ///< a check of keys_ is running on the pool
-    std::vector<SampleKey> keys_;
+    bool checking_ = false;                               ///< a check of keys_ is running on the pool
+    std::vector<SampleKey> keys_;                         ///< selection being (or last) checked
     std::vector<Result<std::filesystem::path>> results_;  ///< parallel to keys_
+    std::map<SampleKey, std::size_t> index_of_key_;       ///< position in keys_ (path_of() per drag row)
 };
 
 }  // namespace mso::ui

@@ -3,11 +3,21 @@
 // decoding real audio.
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <functional>
+#include <optional>
 #include <random>
 
 #include "mso/app/sample_index.hpp"
 #include "mso/cli/command_context.hpp"
+
+#ifdef _WIN32
+#include <windows.h>
+// windows.h first: psapi.h needs its types.
+#include <psapi.h>
+#else
+#include <unistd.h>  // sysconf
+#endif
 
 namespace mso::cli {
 
@@ -54,6 +64,33 @@ std::vector<catalog::ScannedFile> synthetic_batch(std::mt19937_64& random, std::
     return files;
 }
 
+/// Memory this process holds: committed private bytes on Windows (heap growth shows here even
+/// before pages are touched), the resident set on Linux; nullopt when the platform cannot say.
+std::optional<std::int64_t> process_memory_bytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                 sizeof(counters)))
+        return std::nullopt;
+    return static_cast<std::int64_t>(counters.PrivateUsage);
+#else
+    std::ifstream statm("/proc/self/statm");
+    std::int64_t total_pages = 0;
+    std::int64_t resident_pages = 0;
+    if (!(statm >> total_pages >> resident_pages)) return std::nullopt;
+    return resident_pages * static_cast<std::int64_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+/// "12.3 MiB (129 bytes/row)" for a memory delta over `rows` rows, or "unknown".
+std::string memory_text(std::optional<std::int64_t> before, std::optional<std::int64_t> after, std::size_t rows) {
+    if (!before || !after) return "unknown";
+    const auto delta = *after - *before;
+    return std::format("{:.1f} MiB ({} bytes/row)", static_cast<double>(delta) / (1024.0 * 1024.0),
+                       rows > 0 ? delta / static_cast<std::int64_t>(rows) : 0);
+}
+
 /// Median, 95th percentile and maximum of repeated measurements.
 struct Timing {
     double median_ms = 0;
@@ -87,18 +124,23 @@ struct Scenario {
 
 void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("bench", "Benchmark catalog, SQLite search and the in-memory index");
-    auto directory = std::make_shared<std::string>();
-    auto rows = std::make_shared<std::int64_t>(100'000);
-    auto repetitions = std::make_shared<int>(30);
-    command->add_option("library", *directory, "New library folder to create")->required();
-    command->add_option("--rows", *rows, "Synthetic samples to insert")
+    /// Every option of `bench`.
+    struct Options {
+        std::string directory;
+        std::int64_t rows = 100'000;
+        int repetitions = 30;
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("library", options.directory, "New library folder to create")->required();
+    command->add_option("--rows", options.rows, "Synthetic samples to insert")
         ->check(CLI::Range(std::int64_t{1}, kMaximumRows));
-    command->add_option("--repetitions", *repetitions, "Measurements per query")
+    command->add_option("--repetitions", options.repetitions, "Measurements per query")
         ->check(CLI::Range(1, kMaximumRepetitions));
-    command->callback([&, directory, rows, repetitions] {
+    command->callback([&] {
+        const auto& [directory, rows, repetitions] = options;
         auto application = context.application();
         if (!application) return void(exit_code = context.report(application.error()));
-        auto created = (*application)->create_library(path_from_utf8(*directory), "Benchmark");
+        auto created = (*application)->create_library(path_from_utf8(directory), "Benchmark");
         if (!created) return void(exit_code = context.report(created.error()));
         int failures = 0;
         auto ran = (*application)->with_library(created->uuid, [&](catalog::Library& library) -> Result<void> {
@@ -111,16 +153,16 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             auto session = library.begin_scan(root_record->id);
             if (!session) return std::unexpected(session.error());
             const auto import_started = Clock::now();
-            for (std::int64_t first = 0; first < *rows; first += kBatchRows) {
-                const auto batch = synthetic_batch(random, first, std::min(kBatchRows, *rows - first));
+            for (std::int64_t first = 0; first < rows; first += kBatchRows) {
+                const auto batch = synthetic_batch(random, first, std::min(kBatchRows, rows - first));
                 auto committed = library.commit_scan_batch(*session, batch, {}, [](std::string_view) { return false; });
                 if (!committed) return std::unexpected(committed.error());
             }
             if (auto finished = library.finish_scan(*session, false); !finished)
                 return std::unexpected(finished.error());
             const double import_seconds = std::chrono::duration<double>(Clock::now() - import_started).count();
-            context.print("inserted {} synthetic rows in {:.1f} s ({:.0f} rows/s, catalog only, no file I/O)", *rows,
-                          import_seconds, static_cast<double>(*rows) / import_seconds);
+            context.print("inserted {} synthetic rows in {:.1f} s ({:.0f} rows/s, catalog only, no file I/O)", rows,
+                          import_seconds, static_cast<double>(rows) / import_seconds);
 
             const std::vector<Scenario> scenarios = {
                 {"first page, name sort", {.sort = search::SortField::Name}},
@@ -138,12 +180,12 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             search::SearchService service;
             context.print("-- SQLite (search::SearchService)");
             for (const auto& scenario : scenarios) {
-                const auto timing = measure(*repetitions, failures,
+                const auto timing = measure(repetitions, failures,
                                             [&] { return service.search(sql_scope, scenario.request).has_value(); });
                 context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms   max {:7.2f} ms", scenario.label,
                               timing.median_ms, timing.p95_ms, timing.max_ms);
             }
-            const auto deep = measure(std::max(1, *repetitions / 5), failures, [&] {
+            const auto deep = measure(std::max(1, repetitions / 5), failures, [&] {
                 search::SearchRequest request{.sort = search::SortField::Duration};
                 for (int page = 0; page < 10; ++page) {
                     auto result = service.search(sql_scope, request);
@@ -161,12 +203,15 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
 
             // The desktop app answers from the in-memory index instead.
             context.print("-- in-memory index (app::SampleIndex)");
+            const auto memory_before_index = process_memory_bytes();
             app::SampleIndex index(library.uuid());
             const auto load_started = Clock::now();
             if (auto loaded = index.load(library); !loaded) return loaded;
             if (auto caught_up = index.synchronize(library); !caught_up) return std::unexpected(caught_up.error());
             context.print("{:<50} {:7.0f} ms for {} rows", "load (for_each_row)",
                           std::chrono::duration<double, std::milli>(Clock::now() - load_started).count(), index.size());
+            context.print("{:<50} {}", "index memory after load",
+                          memory_text(memory_before_index, process_memory_bytes(), index.size()));
             const app::IndexedLibrary sources[] = {{&index, &library, "Benchmark"}};
             for (const auto& scenario : scenarios) {
                 // The first query of a sort field also builds that field's order (kept up to date
@@ -176,12 +221,12 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
                 if (!app::search_indexes(sources, scenario.request)) ++failures;
                 const double first_ms = std::chrono::duration<double, std::milli>(Clock::now() - first_started).count();
                 const auto timing = measure(
-                    *repetitions, failures, [&] { return app::search_indexes(sources, scenario.request).has_value(); },
+                    repetitions, failures, [&] { return app::search_indexes(sources, scenario.request).has_value(); },
                     [&] { index.drop_query_caches(); });
                 context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms   max {:7.2f} ms   first {:7.2f} ms",
                               scenario.label, timing.median_ms, timing.p95_ms, timing.max_ms, first_ms);
             }
-            const auto deep_index = measure(std::max(1, *repetitions / 5), failures, [&] {
+            const auto deep_index = measure(std::max(1, repetitions / 5), failures, [&] {
                 search::SearchRequest request{.sort = search::SortField::Duration};
                 for (int page = 0; page < 10; ++page) {
                     auto result = app::search_indexes(sources, request);
@@ -191,14 +236,14 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
                 }
                 return true;
             });
-            context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms", "10 consecutive pages (offset cursor)",
+            context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms", "10 consecutive pages (keyset cursor)",
                           deep_index.median_ms, deep_index.p95_ms);
             const auto counted_index = measure(
                 5, failures, [&] { return app::count_indexes(sources, {.text = "bpm:120..130"}).has_value(); },
                 [&] { index.drop_query_caches(); });
             context.print("{:<50} median {:7.2f} ms", "exact count 'bpm:120..130'", counted_index.median_ms);
             std::int64_t rating = 0;
-            const auto edit = measure(std::max(1, *repetitions / 5), failures, [&] {
+            const auto edit = measure(std::max(1, repetitions / 5), failures, [&] {
                 catalog::EditCommand command;
                 command.sample_ids = {1};
                 command.rating = static_cast<int>(++rating % 6);
@@ -206,6 +251,9 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             });
             context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms", "rating edit committed + index patched",
                           edit.median_ms, edit.p95_ms);
+            index.drop_query_caches();
+            context.print("{:<50} {}", "index memory after the queries (sort orders built)",
+                          memory_text(memory_before_index, process_memory_bytes(), index.size()));
 
             std::error_code size_error;
             const auto database_size = std::filesystem::file_size(library.directory() / "catalog.sqlite", size_error);

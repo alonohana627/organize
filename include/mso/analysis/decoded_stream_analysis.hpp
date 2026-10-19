@@ -22,8 +22,9 @@ struct StageSelection {
     bool byte_hash = false;
     bool pcm_hash = false;
 
-    /// Sets the flag of every stage listed in `stages`; repeated stages are harmless.
-    static StageSelection from(std::span<const Stage> stages) noexcept;
+    /// Sets the flag of every stage listed in `stages`; repeated stages are harmless here
+    /// (validate_request() refuses them in a request).
+    [[nodiscard]] static StageSelection from(std::span<const Stage> stages) noexcept;
     /// Stages that need every decoded frame, not only the musical window.
     bool needs_whole_stream() const noexcept { return waveform || loudness || pcm_hash; }
     /// Stages fed by the mono musical front end (MusicalFeatureExtractor).
@@ -32,9 +33,10 @@ struct StageSelection {
     bool needs_decode() const noexcept { return needs_whole_stream() || needs_musical_features(); }
 };
 
-/// Checks the request's numeric limits: waveform_bins in [1, kMaximumWaveformBins] when the
-/// waveform stage is requested, and max_musical_seconds finite in (0, kMaximumMusicalSeconds].
-Result<void> validate_request(const AnalysisRequest& request);
+/// Checks the request: no stage listed twice (the worker protocol refuses that too), waveform_bins
+/// in [1, kMaximumWaveformBins] when the waveform stage is requested, and max_musical_seconds
+/// finite in (0, kMaximumMusicalSeconds]. INVALID_ARGUMENT on violation.
+[[nodiscard]] Result<void> validate_request(const AnalysisRequest& request);
 
 /// Reads the decoder from its current position to the end (or, when only tempo/key are
 /// requested, until the musical window is full) in kDecodeBlockFrames blocks and fills the
@@ -44,7 +46,7 @@ Result<void> validate_request(const AnalysisRequest& request);
 ///
 /// Errors: CANCELLED (checked before every block), decoder errors as returned by the decoder,
 /// UNSUPPORTED_CODEC / CORRUPT_AUDIO for unusable channel counts or sample rates.
-Result<AnalysisReport> analyze_decoded_stream(media::Decoder& decoder, const AnalysisRequest& request,
-                                              std::stop_token stop, const ProgressPhase& progress);
+[[nodiscard]] Result<AnalysisReport> analyze_decoded_stream(media::Decoder& decoder, const AnalysisRequest& request,
+                                                            std::stop_token stop, const ProgressPhase& progress);
 
 }  // namespace mso::analysis

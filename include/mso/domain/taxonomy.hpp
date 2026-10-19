@@ -19,6 +19,6 @@ inline constexpr std::size_t kMaxTaxonomyNameCodePoints = 128;
 /// Splits a '/'-separated tag or category path into trimmed display segments. INVALID_ARGUMENT for
 /// an empty segment ("a//b", "a/"), a segment longer than 128 code points or not valid UTF-8, or
 /// more than 16 segments.
-Result<std::vector<std::string>> split_taxonomy_path(std::string_view path);
+[[nodiscard]] Result<std::vector<std::string>> split_taxonomy_path(std::string_view path);
 
 }  // namespace mso

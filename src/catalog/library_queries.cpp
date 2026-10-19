@@ -138,7 +138,7 @@ Result<std::vector<CollectionRecord>> Library::list_collections() {
         CollectionRecord record{row.column_int64(0),           *uuid,        row.column_text(2),
                                 row.column_text(3) == "smart", std::nullopt, row.column_int64(5)};
         if (auto query = row.column_optional_text(4))
-            record.query = detail::json_string_member(detail::parse_json(*query), "text");
+            record.query = json_fields::string_field(json_fields::parse_json(*query), "text");
         collections.push_back(std::move(record));
         return {};
     });

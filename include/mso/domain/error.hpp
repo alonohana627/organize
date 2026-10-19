@@ -41,7 +41,7 @@ enum class ErrorCode : std::uint8_t {
 };
 
 /// Wire name of an error code ("SOURCE_OFFLINE", ..., "INTERNAL"); "INTERNAL" for out-of-range values.
-std::string_view to_string(ErrorCode code) noexcept;
+[[nodiscard]] std::string_view to_string(ErrorCode code) noexcept;
 
 /// A failure with a stable code and a detail that is safe to show to the user (no secrets, no raw SQL).
 struct Error {
@@ -52,7 +52,7 @@ struct Error {
     std::optional<std::uint32_t> position;  ///< parse errors: code-point offset into the parsed text
 
     /// "CODE: detail", "CODE at position: detail" for parse errors, or just "CODE" without a detail.
-    std::string message() const;
+    [[nodiscard]] std::string message() const;
 };
 
 /// The return type of every fallible operation: a value or an `Error`.
@@ -60,7 +60,7 @@ template <class T>
 using Result = std::expected<T, Error>;
 
 /// Builds the error half of a `Result` from a code, a safe detail and the retry hint.
-inline std::unexpected<Error> fail(ErrorCode code, std::string detail = {}, bool retryable = false) {
+[[nodiscard]] inline std::unexpected<Error> fail(ErrorCode code, std::string detail = {}, bool retryable = false) {
     return std::unexpected(Error{code, retryable, std::move(detail), std::nullopt, std::nullopt});
 }
 

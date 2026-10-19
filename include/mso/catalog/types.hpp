@@ -21,17 +21,17 @@ enum class Availability { Online, Offline, Unknown, Denied };
 enum class LocationState { Present, Missing, Unknown, Denied, Changed, Retired };
 
 /// Stored text of a root mode ("referenced", "managed").
-std::string_view to_string(RootMode mode) noexcept;
+[[nodiscard]] std::string_view to_string(RootMode mode) noexcept;
 /// Stored text of an availability ("online", "offline", "unknown", "denied").
-std::string_view to_string(Availability availability) noexcept;
+[[nodiscard]] std::string_view to_string(Availability availability) noexcept;
 /// Stored text of a location state ("present", "missing", …).
-std::string_view to_string(LocationState state) noexcept;
+[[nodiscard]] std::string_view to_string(LocationState state) noexcept;
 /// Parses stored root-mode text; nullopt for anything else.
-std::optional<RootMode> parse_root_mode(std::string_view text) noexcept;
+[[nodiscard]] std::optional<RootMode> parse_root_mode(std::string_view text) noexcept;
 /// Parses stored availability text; nullopt for anything else.
-std::optional<Availability> parse_availability(std::string_view text) noexcept;
+[[nodiscard]] std::optional<Availability> parse_availability(std::string_view text) noexcept;
 /// Parses stored location-state text; nullopt for anything else.
-std::optional<LocationState> parse_location_state(std::string_view text) noexcept;
+[[nodiscard]] std::optional<LocationState> parse_location_state(std::string_view text) noexcept;
 
 /// Identity and revision of an open library.
 struct LibraryIdentity {
@@ -137,8 +137,9 @@ struct ScanBatchOutcome {
 
 /// Result of finishing a scan.
 struct ScanFinishOutcome {
-    std::int64_t marked_missing = 0;  ///< unseen locations outside denied/failed subtrees, now missing
-    bool complete_coverage = false;   ///< no directory of the scan was denied or failed
+    std::int64_t marked_missing = 0;         ///< unseen locations outside denied/failed subtrees, now missing
+    bool complete_coverage = false;          ///< no directory of the scan was denied or failed
+    std::int64_t removed_empty_folders = 0;  ///< folders left without files or subfolders, now removed
 };
 
 /// One file occurrence of a sample.
@@ -170,9 +171,9 @@ struct ObservationRecord {
 /// Override state for user-editable musical facts (BPM, key).
 enum class OverrideState { Automatic, Value, Unknown };
 /// Stored text of an override state ("auto", "value", "unknown").
-std::string_view to_string(OverrideState state) noexcept;
+[[nodiscard]] std::string_view to_string(OverrideState state) noexcept;
 /// Parses stored override-state text; nullopt for anything else.
-std::optional<OverrideState> parse_override_state(std::string_view text) noexcept;
+[[nodiscard]] std::optional<OverrideState> parse_override_state(std::string_view text) noexcept;
 
 /// Everything the inspector shows about one sample.
 struct SampleDetail {

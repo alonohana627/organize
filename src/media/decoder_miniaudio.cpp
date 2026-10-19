@@ -1,10 +1,12 @@
 // miniaudio-backed streaming decoder (dr_wav, dr_flac, dr_mp3), reading through our own FileHandle.
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <format>
 #include <limits>
 #include <new>
 #include <optional>
+#include <type_traits>
 
 #include <miniaudio.h>
 
@@ -162,6 +164,10 @@ struct PreopenedFileSystem {
     PreopenedFileSystem& operator=(const PreopenedFileSystem&) = delete;
     ~PreopenedFileSystem() { delete outstanding; }
 };
+// miniaudio casts the ma_vfs* it is given to ma_vfs_callbacks*: that is only valid for a
+// standard-layout type whose first member is the callback table.
+static_assert(std::is_standard_layout_v<PreopenedFileSystem>);
+static_assert(offsetof(PreopenedFileSystem, callbacks) == 0);
 
 /// Streams float32 frames from an ma_decoder. Not movable: miniaudio keeps pointers to the
 /// decoder and to the file system.
@@ -251,8 +257,12 @@ private:
             if (probe.frames) {
                 total_frames_ = probe.frames;
                 frames_exact_ = true;
-            } else if (probe.duration_us) {
-                total_frames_ = *probe.duration_us * sample_rate_ / 1'000'000;
+            } else if (probe.duration_us && *probe.duration_us > 0) {
+                // An estimate from the bitrate; absurd values saturate instead of overflowing.
+                std::int64_t scaled = 0;
+                total_frames_ = __builtin_mul_overflow(*probe.duration_us, std::int64_t{sample_rate_}, &scaled)
+                                    ? std::numeric_limits<std::int64_t>::max() / 1'000'000
+                                    : scaled / 1'000'000;
             }
             return;
         }

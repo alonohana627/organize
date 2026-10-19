@@ -24,6 +24,45 @@ void new_uuid_sql_function(sqlite3_context* context, int /*argument_count*/, sql
     }
 }
 
+/// The text of a TEXT argument (UTF-8 bytes as stored), or nullopt for NULL and other types.
+std::optional<std::string_view> text_argument(sqlite3_value* value) {
+    if (sqlite3_value_type(value) != SQLITE_TEXT) return std::nullopt;
+    const auto* text = sqlite3_value_text(value);
+    const int size = sqlite3_value_bytes(value);
+    return std::string_view(reinterpret_cast<const char*>(text), static_cast<std::size_t>(size));
+}
+
+/// Returns a computed key as the function result (NULL input gives NULL).
+void return_key(sqlite3_context* context, const std::optional<std::string>& key) {
+    if (!key) {
+        sqlite3_result_null(context);
+        return;
+    }
+    sqlite3_result_text(context, key->data(), static_cast<int>(key->size()), SQLITE_TRANSIENT);
+}
+
+/// SQL function `fold_key(text)`: mso::fold_key, so stored name keys can be rebuilt set-based.
+void fold_key_sql_function(sqlite3_context* context, int /*argument_count*/, sqlite3_value** arguments) {
+    try {
+        const auto text = text_argument(arguments[0]);
+        return_key(context, text ? std::optional<std::string>(fold_key(*text)) : std::nullopt);
+    } catch (const std::exception& error) {
+        sqlite3_result_error(context, error.what(), -1);  // never let an exception cross the C boundary
+    }
+}
+
+/// SQL function `path_key(text, case_sensitive)`: mso::path_key, so stored path keys can be rebuilt
+/// set-based.
+void path_key_sql_function(sqlite3_context* context, int /*argument_count*/, sqlite3_value** arguments) {
+    try {
+        const auto text = text_argument(arguments[0]);
+        const bool case_sensitive = sqlite3_value_int64(arguments[1]) != 0;
+        return_key(context, text ? std::optional<std::string>(path_key(*text, case_sensitive)) : std::nullopt);
+    } catch (const std::exception& error) {
+        sqlite3_result_error(context, error.what(), -1);
+    }
+}
+
 /// Restores a connection's configured busy timeout when a scope that suspended it ends.
 class BusyTimeoutSuspension {
 public:
@@ -88,21 +127,34 @@ bool compiled_with(std::string_view option) {
 }
 
 // ---------------------------------------------------------------- StatementCache
-sqlite3_stmt* StatementCache::take(std::string_view sql) {
+StatementCache::Entry StatementCache::take(std::string_view sql) {
     const auto found = idle_.find(sql);
-    if (found == idle_.end()) return nullptr;
-    sqlite3_stmt* statement = found->second;
-    idle_.erase(found);
-    return statement;
+    if (found == idle_.end()) return {};
+    return idle_.extract(found);
 }
 
-void StatementCache::give_back(std::string sql, sqlite3_stmt* statement) noexcept {
+bool StatementCache::prepare_for_reuse(sqlite3_stmt* statement) noexcept {
     sqlite3_reset(statement);
     sqlite3_clear_bindings(statement);
     if (closed_ || idle_.size() >= kMaximumIdleStatements) {
         sqlite3_finalize(statement);
-        return;
+        return false;
     }
+    return true;
+}
+
+void StatementCache::give_back(Entry entry) noexcept {
+    if (entry.empty() || !prepare_for_reuse(entry.mapped())) return;
+    sqlite3_stmt* statement = entry.mapped();
+    try {
+        idle_.insert(std::move(entry));  // may grow the bucket array, never the node
+    } catch (const std::bad_alloc&) {
+        sqlite3_finalize(statement);  // caching is an optimization; dropping the statement is safe
+    }
+}
+
+void StatementCache::give_back(std::string sql, sqlite3_stmt* statement) noexcept {
+    if (!prepare_for_reuse(statement)) return;
     try {
         idle_.emplace(std::move(sql), statement);
     } catch (const std::bad_alloc&) {
@@ -123,6 +175,7 @@ PreparedStatement::PreparedStatement(PreparedStatement&& other) noexcept
       statement_(other.statement_),
       cache_(std::move(other.cache_)),
       sql_(std::move(other.sql_)),
+      cache_entry_(std::move(other.cache_entry_)),
       bind_error_code_(other.bind_error_code_),
       bind_error_parameter_(other.bind_error_parameter_),
       last_step_error_code_(other.last_step_error_code_) {
@@ -136,6 +189,7 @@ PreparedStatement& PreparedStatement::operator=(PreparedStatement&& other) noexc
         statement_ = other.statement_;
         cache_ = std::move(other.cache_);
         sql_ = std::move(other.sql_);
+        cache_entry_ = std::move(other.cache_entry_);
         bind_error_code_ = other.bind_error_code_;
         bind_error_parameter_ = other.bind_error_parameter_;
         last_step_error_code_ = other.last_step_error_code_;
@@ -150,10 +204,12 @@ PreparedStatement::~PreparedStatement() {
 
 void PreparedStatement::release() noexcept {
     if (!statement_) return;
-    if (cache_)
-        cache_->give_back(std::move(sql_), statement_);
-    else
+    if (!cache_)
         sqlite3_finalize(statement_);
+    else if (!cache_entry_.empty())
+        cache_->give_back(std::move(cache_entry_));
+    else
+        cache_->give_back(std::move(sql_), statement_);
     statement_ = nullptr;
 }
 
@@ -321,6 +377,15 @@ Result<Connection> Connection::open(const std::filesystem::path& file, const Con
                                    &new_uuid_sql_function, nullptr, nullptr, nullptr);
     if (function_code != SQLITE_OK)
         return std::unexpected(make_sqlite_error(connection.handle_, function_code, "register new_uuid()"));
+    constexpr int kKeyFunctionFlags = SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS;
+    const int fold_code = sqlite3_create_function_v2(connection.handle_, "fold_key", 1, kKeyFunctionFlags, nullptr,
+                                                     &fold_key_sql_function, nullptr, nullptr, nullptr);
+    if (fold_code != SQLITE_OK)
+        return std::unexpected(make_sqlite_error(connection.handle_, fold_code, "register fold_key()"));
+    const int path_code = sqlite3_create_function_v2(connection.handle_, "path_key", 2, kKeyFunctionFlags, nullptr,
+                                                     &path_key_sql_function, nullptr, nullptr, nullptr);
+    if (path_code != SQLITE_OK)
+        return std::unexpected(make_sqlite_error(connection.handle_, path_code, "register path_key()"));
 
     // Memory accounting stays simple: explicit page cache, no mmap, temp data on disk.
     std::string pragmas =
@@ -337,7 +402,7 @@ Result<Connection> Connection::open(const std::filesystem::path& file, const Con
 
 Result<PreparedStatement> Connection::prepare(std::string_view sql) {
     if (!handle_ || !cache_) return fail(ErrorCode::Internal, "prepare on a closed connection");
-    if (sqlite3_stmt* cached = cache_->take(sql)) return PreparedStatement(handle_, cached, cache_, std::string(sql));
+    if (auto cached = cache_->take(sql); !cached.empty()) return PreparedStatement(handle_, std::move(cached), cache_);
     sqlite3_stmt* statement = nullptr;
     const int result_code = sqlite3_prepare_v3(handle_, sql.data(), static_cast<int>(sql.size()),
                                                SQLITE_PREPARE_PERSISTENT, &statement, nullptr);

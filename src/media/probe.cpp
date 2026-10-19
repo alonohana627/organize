@@ -141,22 +141,32 @@ void finalize(ProbeResult& result) {
     if (result.loops.size() > kMaxLoopPoints) result.loops.resize(kMaxLoopPoints);
 }
 
-}  // namespace
-
-Result<ProbeResult> probe_file(const std::filesystem::path& file, const ProbeLimits& limits) {
-    auto reader = BoundedFileReader::open(file, limits);
-    if (!reader) return std::unexpected(reader.error());
-    if (reader->file_size() == 0) return fail(ErrorCode::CorruptAudio, "file is empty");
-
+/// Runs the parsers over an opened reader; shared by probe_file() and probe_memory().
+Result<ProbeResult> probe_reader(BoundedFileReader& reader, std::string_view extension) {
+    if (reader.file_size() == 0) return fail(ErrorCode::CorruptAudio, "file is empty");
     ProbeResult result;
-    const Result<void> outcome = probe_container(*reader, extension_hint(file), result);
+    const Result<void> outcome = probe_container(reader, extension, result);
     if (!outcome) {
         if (outcome.error().code != ErrorCode::ProbeLimit) return std::unexpected(outcome.error());
         result.partial = true;  // keep what was learned; unknown fields stay empty
     }
     finalize(result);
-    result.bytes_read = reader->bytes_read();
+    result.bytes_read = reader.bytes_read();
     return result;
+}
+
+}  // namespace
+
+Result<ProbeResult> probe_file(const std::filesystem::path& file, const ProbeLimits& limits) {
+    auto reader = BoundedFileReader::open(file, limits);
+    if (!reader) return std::unexpected(reader.error());
+    return probe_reader(*reader, extension_hint(file));
+}
+
+Result<ProbeResult> probe_memory(std::span<const std::uint8_t> bytes, std::string_view file_name_hint,
+                                 const ProbeLimits& limits) {
+    BoundedFileReader reader = BoundedFileReader::over_memory(bytes, limits);
+    return probe_reader(reader, extension_hint(path_from_utf8(file_name_hint)));
 }
 
 }  // namespace mso::media

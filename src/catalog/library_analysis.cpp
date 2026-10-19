@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <ranges>
 #include <set>
 
 #include <picosha2.h>
@@ -54,6 +55,13 @@ Result<void> validate_facts(const Library::AnalysisFacts& facts) {
         return invalid("waveform segment must be a safe path under derived/");
     if (!is_valid_utf8(facts.tempo_algorithm) || !is_valid_utf8(facts.key_algorithm))
         return invalid("algorithm names must be UTF-8");
+    const auto names_its_algorithm = [](bool fact_present, const std::string& algorithm) {
+        return !fact_present || (!trim(algorithm).empty() && is_valid_utf8(algorithm));
+    };
+    if (!names_its_algorithm(facts.peak_dbfs && facts.rms_dbfs, facts.loudness_algorithm) ||
+        !names_its_algorithm(facts.pcm_sha256.has_value(), facts.pcm_hash_algorithm) ||
+        !names_its_algorithm(facts.waveform_segment.has_value(), facts.waveform_algorithm))
+        return invalid("loudness, PCM hash and waveform results need their algorithm version");
     return {};
 }
 
@@ -78,6 +86,16 @@ std::string stage_key(const std::vector<std::string>& stages) {
         key += stage;
     }
     return key;
+}
+
+/// The stage names of a job's stage column (the inverse of stage_key); the fallback when a job's
+/// checkpoint no longer holds its stage list. Validity is checked by the caller (required_flags).
+std::optional<std::vector<std::string>> stages_of_stage_column(std::string_view stage_column) {
+    std::vector<std::string> stages;
+    for (const auto stage : std::views::split(stage_column, '+'))
+        if (!stage.empty()) stages.emplace_back(stage.begin(), stage.end());
+    if (stages.empty()) return std::nullopt;
+    return stages;
 }
 
 /// Writes observations, hashes and artifacts of one verified result and advances the revision
@@ -106,7 +124,7 @@ Result<std::int64_t> write_analysis_facts(sqlite::Connection& connection, const 
         if (auto done = invalidate->run(); !done) return std::unexpected(done.error());
         if (value.is_null()) return {};  // "no reliable estimate" also clears older analysis values
         insert->bind(1, facts.sample_id).bind(2, facts.content_revision).bind(3, field);
-        insert->bind(4, detail::to_json_text(value)).bind(5, algorithm).bind(6, confidence).bind(7, now_unix_ms());
+        insert->bind(4, json_fields::dump_json(value)).bind(5, algorithm).bind(6, confidence).bind(7, now_unix_ms());
         return insert->run();
     };
 
@@ -127,14 +145,14 @@ Result<std::int64_t> write_analysis_facts(sqlite::Connection& connection, const 
         flags |= kAnalyzedKey;
     }
     if (facts.peak_dbfs && facts.rms_dbfs) {
-        if (auto done = observe("peak_dbfs", *facts.peak_dbfs, "loudness-peak-rms-1", std::nullopt); !done)
+        if (auto done = observe("peak_dbfs", *facts.peak_dbfs, facts.loudness_algorithm, std::nullopt); !done)
             return std::unexpected(done.error());
-        if (auto done = observe("rms_dbfs", *facts.rms_dbfs, "loudness-peak-rms-1", std::nullopt); !done)
+        if (auto done = observe("rms_dbfs", *facts.rms_dbfs, facts.loudness_algorithm, std::nullopt); !done)
             return std::unexpected(done.error());
         flags |= kAnalyzedLoudness;
     }
     if (facts.pcm_sha256) {
-        if (auto done = observe("pcm_sha256", *facts.pcm_sha256, "sha256-pcm-s24-1", std::nullopt); !done)
+        if (auto done = observe("pcm_sha256", *facts.pcm_sha256, facts.pcm_hash_algorithm, std::nullopt); !done)
             return std::unexpected(done.error());
         flags |= kAnalyzedHash;
     }
@@ -151,12 +169,13 @@ Result<std::int64_t> write_analysis_facts(sqlite::Connection& connection, const 
         auto artifact = connection.prepare(
             "INSERT INTO "
             "artifacts(sample_id,content_revision,kind,algorithm_version,profile_digest,summary_json,state) "
-            "VALUES(?1,?2,'waveform','waveform-minmaxrms-1','default',?3,'ready') "
+            "VALUES(?1,?2,'waveform',?4,'default',?3,'ready') "
             "ON CONFLICT(sample_id,content_revision,kind,algorithm_version,profile_digest) DO UPDATE SET "
             "summary_json=excluded.summary_json, state='ready'");
         if (!artifact) return std::unexpected(artifact.error());
         artifact->bind(1, facts.sample_id).bind(2, facts.content_revision);
-        artifact->bind(3, detail::to_json_text(nlohmann::json{{"path", *facts.waveform_segment}}));
+        artifact->bind(3, json_fields::dump_json(nlohmann::json{{"path", *facts.waveform_segment}}));
+        artifact->bind(4, facts.waveform_algorithm);
         if (auto done = artifact->run(); !done) return std::unexpected(done.error());
         flags |= kAnalyzedWaveform;
     }
@@ -172,12 +191,14 @@ Result<std::int64_t> write_analysis_facts(sqlite::Connection& connection, const 
     return detail::advance_revision(connection, {.kind = "analysis"});
 }
 
-/// Marks a run completed once nothing is left to do.
+/// Marks a run completed once nothing is left to do. A paused run settles too: when its last leased
+/// jobs finish after the pause, nothing remains for Resume to start.
 Result<void> settle_run(sqlite::Connection& connection, std::int64_t run_id) {
     auto settle = connection.prepare(
         "UPDATE analysis_runs SET state=CASE WHEN EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 AND state='failed') "
-        "THEN 'completed_with_errors' ELSE 'completed' END WHERE id=?1 AND state IN ('queued','running') "
-        "AND NOT EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 AND state IN ('queued','running','blocked','interrupted'))");
+        "THEN 'completed_with_errors' ELSE 'completed' END WHERE id=?1 AND state IN ('queued','running','paused') "
+        "AND NOT EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 "
+        "AND state IN ('queued','running','blocked','interrupted','paused'))");
     if (!settle) return std::unexpected(settle.error());
     settle->bind(1, run_id);
     return settle->run();
@@ -186,7 +207,7 @@ Result<void> settle_run(sqlite::Connection& connection, std::int64_t run_id) {
 Result<std::int64_t> ensure_profile(sqlite::Connection& connection, std::string_view profile_name,
                                     const std::vector<std::string>& stages) {
     const nlohmann::json config = {{"name", profile_name}, {"stages", stages}, {"version", 1}};
-    const std::string config_text = detail::to_json_text(config);
+    const std::string config_text = json_fields::dump_json(config);
     const std::string digest = picosha2::hash256_hex_string(config_text);
     auto find = connection.prepare("SELECT id FROM analysis_profiles WHERE digest=?1");
     if (!find) return std::unexpected(find.error());
@@ -262,7 +283,7 @@ Result<Library::AnalysisRunStatus> insert_run(sqlite::Connection& connection, st
     selection_json["stages"] = stages;
     selection_json["force"] = force;
     run->bind(1, uuids::to_string(status.uuid)).bind(2, *profile).bind(3, status.requested_at).bind(4, *revision);
-    run->bind(5, detail::to_json_text(selection_json)).bind(6, enumerated_count);
+    run->bind(5, json_fields::dump_json(selection_json)).bind(6, enumerated_count);
     if (auto inserted = run->run(); !inserted) return std::unexpected(inserted.error());
     status.id = connection.last_insert_rowid();
     return status;
@@ -338,8 +359,8 @@ Result<Library::AnalysisRunStatus> Library::create_analysis_run(const AnalysisRu
         "AND (?5 OR (COALESCE(effective.analysis_flags,0) & ?6)<>?6) ORDER BY sample.id");
     if (!jobs) return std::unexpected(jobs.error());
     jobs->bind(1, status->id).bind(2, stage_key(request.stages));
-    jobs->bind(3, detail::to_json_text(nlohmann::json{{"stages", request.stages}}));
-    jobs->bind(4, detail::to_json_text(nlohmann::json(sample_ids))).bind(5, request.force ? 1 : 0).bind(6, *flags);
+    jobs->bind(3, json_fields::dump_json(nlohmann::json{{"stages", request.stages}}));
+    jobs->bind(4, json_fields::dump_json(nlohmann::json(sample_ids))).bind(5, request.force ? 1 : 0).bind(6, *flags);
     if (auto inserted = jobs->run(); !inserted) return std::unexpected(inserted.error());
     const auto inserted = static_cast<std::int64_t>(writer_.changed_row_count());
 
@@ -391,7 +412,7 @@ Result<Library::AnalysisRunStatus> Library::create_analysis_run_for_root(std::in
                     kRootLiveSamples));
     if (!jobs) return std::unexpected(jobs.error());
     jobs->bind(1, root_id).bind(2, status->id).bind(3, stage_key(stages));
-    jobs->bind(4, detail::to_json_text(nlohmann::json{{"stages", stages}})).bind(5, force ? 1 : 0).bind(6, *flags);
+    jobs->bind(4, json_fields::dump_json(nlohmann::json{{"stages", stages}})).bind(5, force ? 1 : 0).bind(6, *flags);
     if (auto inserted = jobs->run(); !inserted) return std::unexpected(inserted.error());
     const auto inserted = static_cast<std::int64_t>(writer_.changed_row_count());
 
@@ -417,7 +438,11 @@ Result<void> Library::control_run(std::int64_t run_id, RunControl control) {
     std::vector<std::string_view> statements;
     switch (control) {
         case RunControl::Pause:
-            statements = {"UPDATE analysis_runs SET state='paused' WHERE id=?1 AND state IN ('queued','running')"};
+            // Waiting jobs move to `paused`, which takes them out of the jobs_ready lease index;
+            // leased jobs finish (or fail) normally and the run settles once nothing is left.
+            statements = {"UPDATE analysis_runs SET state='paused' WHERE id=?1 AND state IN ('queued','running')",
+                          "UPDATE jobs SET state='paused' WHERE run_id=?1 AND state IN ('queued','interrupted') "
+                          "AND EXISTS(SELECT 1 FROM analysis_runs WHERE id=?1 AND state='paused')"};
             break;
         case RunControl::Resume:
             statements = {"UPDATE analysis_runs SET state='queued' WHERE id=?1 AND state='paused'",
@@ -450,6 +475,8 @@ Result<void> Library::control_run(std::int64_t run_id, RunControl control) {
         block->bind(1, run_id);
         if (auto blocked = block->run(); !blocked) return blocked;
     }
+    if (control != RunControl::Cancel)
+        if (auto settled = settle_run(writer_, run_id); !settled) return settled;
     auto revision = detail::advance_revision(writer_, {.kind = "analysis_control", .details = {{"run_id", run_id}}});
     if (!revision) return std::unexpected(revision.error());
     return commit_revision(transaction, *revision);
@@ -460,10 +487,11 @@ Result<std::vector<Library::AnalysisRunStatus>> Library::list_analysis_runs(std:
     if (!reader) return std::unexpected(reader.error());
     auto statement = reader->connection().prepare(
         "SELECT run.id, run.uuid, profile.name, run.state, run.requested_at, "
-        "COALESCE(sum(job.state='queued'),0), COALESCE(sum(job.state='running'),0), "
+        "COALESCE(sum(job.state IN ('queued','interrupted')),0), COALESCE(sum(job.state='running'),0), "
         "COALESCE(sum(job.state='completed'),0), COALESCE(sum(job.state='failed'),0), "
         "COALESCE(sum(job.state='stale'),0), COALESCE(sum(job.state='cancelled'),0), "
-        "COALESCE(sum(job.state IN ('blocked','interrupted','paused')),0), max(run.enumerated_count-count(job.id),0) "
+        "COALESCE(sum(job.state='blocked'),0), max(run.enumerated_count-count(job.id),0), "
+        "COALESCE(sum(job.state='paused'),0) "
         "FROM analysis_runs run JOIN analysis_profiles profile ON profile.id=run.profile_id "
         "LEFT JOIN jobs job ON job.run_id=run.id GROUP BY run.id ORDER BY run.id DESC LIMIT ?1");
     if (!statement) return std::unexpected(statement.error());
@@ -486,6 +514,7 @@ Result<std::vector<Library::AnalysisRunStatus>> Library::list_analysis_runs(std:
         status.cancelled = row.column_int64(10);
         status.blocked = row.column_int64(11);
         status.skipped = row.column_int64(12);
+        status.paused = row.column_int64(13);
         runs.push_back(std::move(status));
         return {};
     });
@@ -518,44 +547,61 @@ Result<std::optional<Library::JobLease>> Library::lease_next_job(std::chrono::mi
         if (auto settled = settle_run(writer_, run_id); !settled) return std::unexpected(settled.error());
 
     // Oldest run first; within it, priority then the lowest job id whose backoff has elapsed. Only
-    // jobs whose audio is reachable qualify, so an offline drive never holds up other jobs.
+    // jobs whose audio is reachable qualify, so an offline drive never holds up other jobs. The
+    // partial index jobs_ready holds exactly the queued and interrupted jobs in this order, so the
+    // first qualifying row ends the walk; INDEXED BY makes a plan without it fail to prepare
+    // instead of silently sorting every queued job on each lease. Jobs of paused runs are `paused`
+    // and never in the index.
     auto next = writer_.prepare(std::format(
         "SELECT jobs.id, jobs.run_id, jobs.uuid, jobs.sample_id, jobs.content_revision, jobs.checkpoint_json, "
-        "jobs.attempt, run.cancel_epoch, jobs.stage FROM jobs JOIN analysis_runs run ON run.id=jobs.run_id "
+        "jobs.attempt, run.cancel_epoch, jobs.stage FROM jobs INDEXED BY jobs_ready "
+        "JOIN analysis_runs run ON run.id=jobs.run_id "
         "WHERE jobs.state IN ('queued','interrupted') AND run.state IN ('queued','running') "
         "AND (jobs.lease_expires_at IS NULL OR jobs.lease_expires_at<=?1) AND {} "
-        "ORDER BY run.id, jobs.priority DESC, jobs.id LIMIT 1",
+        "ORDER BY jobs.run_id, jobs.priority DESC, jobs.id LIMIT 1",
         detail::kJobSampleReachableSql));
     if (!next) return std::unexpected(next.error());
-    next->bind(1, now);
-    auto has_row = next->next_row();
-    if (!has_row) return std::unexpected(has_row.error());
     std::optional<JobLease> lease;
-    if (*has_row) {
+    std::set<std::int64_t> runs_with_corrupt_jobs;
+    while (!lease) {
+        next->bind(1, now);
+        auto has_row = next->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        if (!*has_row) {
+            next->reset();
+            break;
+        }
         JobLease candidate;
         candidate.job_id = next->column_int64(0);
         candidate.run_id = next->column_int64(1);
         const std::string job_uuid = next->column_text(2);
         candidate.sample_id = next->column_int64(3);
         candidate.content_revision = next->column_int64(4);
-        const auto checkpoint = detail::parse_json(next->column_optional_text(5).value_or("{}"));
+        const auto checkpoint = json_fields::parse_json(next->column_optional_text(5).value_or("{}"));
         candidate.attempt = next->column_int64(6) + 1;
         candidate.cancel_epoch = next->column_int64(7);
         const std::string stage_column = next->column_text(8);
         next->reset();
         auto parsed_uuid = detail::parse_stored_uuid(job_uuid, "job");
-        if (!parsed_uuid) return std::unexpected(parsed_uuid.error());
+        auto stages = json_fields::string_array_field(checkpoint, "stages");
+        if (!stages || stages->empty()) stages = stages_of_stage_column(stage_column);
+        if (!parsed_uuid || !stages || stages->empty() || !required_flags(*stages)) {
+            // A damaged row must not stop the library's analysis: it fails permanently (visible in
+            // the run's counts) in this transaction, and the walk continues with the next job.
+            if (auto failed =
+                    set_job_state(writer_, candidate.job_id, "failed", to_string(ErrorCode::DbCorrupt), std::nullopt);
+                !failed)
+                return std::unexpected(failed.error());
+            runs_with_corrupt_jobs.insert(candidate.run_id);
+            continue;
+        }
         candidate.job_uuid = *parsed_uuid;
-        auto stages = detail::json_string_array_member(checkpoint, "stages");
-        if (!stages || stages->empty())
-            return fail(ErrorCode::DbCorrupt,
-                        std::format("job {} has no stage list ({})", candidate.job_id, stage_column));
         candidate.stages = std::move(*stages);
         candidate.lease_token = uuids::to_string(new_uuid());
         lease = std::move(candidate);
-    } else {
-        next->reset();
     }
+    for (const auto run_id : runs_with_corrupt_jobs)
+        if (auto settled = settle_run(writer_, run_id); !settled) return std::unexpected(settled.error());
     if (lease) {
         auto take = writer_.prepare(
             "UPDATE jobs SET state='running', lease_token=?2, lease_expires_at=?3, attempt=?4, error_code=NULL WHERE "

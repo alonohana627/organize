@@ -29,7 +29,7 @@ PreferencesDialog::PreferencesDialog(const ShortcutBindings& bindings, bool audi
     general_layout->addStretch(1);
 
     auto* shortcuts = new QWidget(this);
-    const auto& definitions = ShortcutCatalog::definitions();
+    const std::vector<ShortcutDefinition> definitions = ShortcutCatalog::definitions();
     shortcut_table_ = new QTableWidget(static_cast<int>(definitions.size()), 2, shortcuts);
     shortcut_table_->setHorizontalHeaderLabels({tr("Command"), tr("Shortcut")});
     shortcut_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -73,7 +73,7 @@ PreferencesDialog::PreferencesDialog(const ShortcutBindings& bindings, bool audi
 }
 
 void PreferencesDialog::load_bindings(const ShortcutBindings& bindings) {
-    const auto& definitions = ShortcutCatalog::definitions();
+    const std::vector<ShortcutDefinition> definitions = ShortcutCatalog::definitions();
     for (std::size_t row = 0; row < definitions.size(); ++row) {
         const auto found = bindings.find(definitions[row].id);
         sequence_edits_[row]->setKeySequence(found != bindings.end() ? found->second
@@ -84,7 +84,7 @@ void PreferencesDialog::load_bindings(const ShortcutBindings& bindings) {
 
 ShortcutBindings PreferencesDialog::bindings() const {
     ShortcutBindings result;
-    const auto& definitions = ShortcutCatalog::definitions();
+    const std::vector<ShortcutDefinition> definitions = ShortcutCatalog::definitions();
     for (std::size_t row = 0; row < definitions.size(); ++row)
         result[definitions[row].id] = sequence_edits_[row]->keySequence();
     return result;
@@ -106,7 +106,7 @@ void PreferencesDialog::check_conflicts() {
         }
         descriptions << QLocale().createSeparatedList(labels);  // "A and B", localized
     }
-    const auto& definitions = ShortcutCatalog::definitions();
+    const std::vector<ShortcutDefinition> definitions = ShortcutCatalog::definitions();
     for (std::size_t row = 0; row < definitions.size(); ++row) {
         QTableWidgetItem* label = shortcut_table_->item(static_cast<int>(row), 0);
         const bool conflict = conflicting.contains(definitions[row].id);

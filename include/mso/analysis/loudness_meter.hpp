@@ -12,7 +12,7 @@ namespace mso::analysis {
 inline constexpr double kSilenceDbfs = -200.0;
 
 /// Converts a linear amplitude to dBFS (20 * log10), floored at kSilenceDbfs.
-double amplitude_to_dbfs(double amplitude) noexcept;
+[[nodiscard]] double amplitude_to_dbfs(double amplitude) noexcept;
 
 /// Streaming sample-peak and RMS meter over every sample of every channel.
 ///
@@ -24,7 +24,7 @@ public:
     void add(std::span<const float> samples) noexcept;
 
     /// Peak and RMS of everything added so far (silence for no samples).
-    LoudnessResult result() const noexcept;
+    [[nodiscard]] LoudnessResult result() const noexcept;
 
 private:
     float peak_magnitude_ = 0.0F;

@@ -23,7 +23,7 @@ public:
         value_.store(code ? static_cast<std::uint8_t>(*code) : kNone, std::memory_order_release);
     }
     /// The most recently published code.
-    std::optional<ErrorCode> load() const noexcept {
+    [[nodiscard]] std::optional<ErrorCode> load() const noexcept {
         const std::uint8_t value = value_.load(std::memory_order_acquire);
         if (value == kNone) {
             return std::nullopt;
@@ -47,9 +47,9 @@ struct TransportGate {
     bool output_enabled = false;
 
     /// Single-word form for the atomic.
-    std::uint64_t packed() const noexcept { return (epoch << 1) | (output_enabled ? 1u : 0u); }
+    [[nodiscard]] std::uint64_t packed() const noexcept { return (epoch << 1) | (output_enabled ? 1u : 0u); }
     /// Inverse of packed().
-    static TransportGate unpacked(std::uint64_t word) noexcept { return {word >> 1, (word & 1u) != 0}; }
+    [[nodiscard]] static TransportGate unpacked(std::uint64_t word) noexcept { return {word >> 1, (word & 1u) != 0}; }
 };
 
 /// What the callback has played, published once per callback through a Seqlock so readers always
@@ -59,10 +59,21 @@ struct PlaybackProgress {
     std::uint64_t consumed_epoch = 0;
     /// Frames consumed from consumed_epoch so far (the decoder thread's buffer accounting).
     std::int64_t consumed_frames = 0;
+    /// Folded source position after the last consumed frame: where the ring's audio continues. Shape
+    /// changes (speed, pitch, mode, loop, seam fades) re-anchor here, so the audio already in the
+    /// device buffer is followed seamlessly instead of being played twice.
+    std::int64_t consumed_position = 0;
     /// Epoch of the frame the listener hears now (consumption delayed by the output latency).
     std::uint64_t audible_epoch = 0;
     /// Folded source position the listener hears now.
     std::int64_t audible_frame = 0;
+};
+
+/// Frames the decoder thread has written to the ring for one epoch, published as a pair so a
+/// reader never matches one epoch's count with another epoch's consumption.
+struct EpochProduction {
+    std::uint64_t epoch = 0;  ///< epoch the count belongs to
+    std::int64_t frames = 0;  ///< frames written for that epoch so far
 };
 
 /// Speed, pitch, mode and loop settings in effect, published by the decoder thread for snapshots.
@@ -75,7 +86,7 @@ struct PlaybackSettings {
     std::int64_t loop_end_frame = 0;              ///< effective loop end; loop inactive when <= start
 };
 
-/// Device facts published by the control thread when an endpoint opens.
+/// Device facts published by the output thread when an endpoint opens.
 struct OutputFacts {
     std::uint32_t sample_rate = 0;              ///< stream rate
     std::uint32_t period_frames = 0;            ///< actual endpoint period
@@ -90,9 +101,10 @@ struct OutputFacts {
 /// Readers tolerate fields from slightly different moments except where a Seqlock or the packed
 /// TransportGate keeps related fields together.
 struct SharedPlaybackState {
-    // ---- written by the control thread (open, device selection)
+    // ---- written by the control thread (open) and the output thread (device events)
 
-    /// Generation of the newest open() request; ahead of active_generation while loading.
+    /// Generation of the newest open() request; ahead of active_generation while loading. Published
+    /// by PlaybackController::request_source together with the request itself.
     alignas(kCacheLineBytes) std::atomic<std::uint64_t> requested_generation{0};
     /// An endpoint is open (Offline counts as one).
     std::atomic<bool> output_available{false};
@@ -108,8 +120,8 @@ struct SharedPlaybackState {
     alignas(kCacheLineBytes) std::atomic<std::uint64_t> transport_gate{0};
     /// Source frame where the current epoch starts (published before transport_gate).
     std::atomic<std::int64_t> epoch_start_frame{0};
-    /// Frames written to the ring for the current epoch (reset before each epoch bump).
-    std::atomic<std::int64_t> epoch_produced_frames{0};
+    /// Frames written to the ring for the current epoch, with that epoch (reset at each epoch bump).
+    Seqlock<EpochProduction> production;
     /// Volume target as linear gain 0..1; the callback smooths toward it per sample.
     std::atomic<float> target_volume{1.0f};
     /// Transport state reported to the UI.
@@ -138,11 +150,19 @@ struct SharedPlaybackState {
     /// Callbacks that starved while playing.
     std::atomic<std::uint64_t> underrun_count{0};
 
-    // ---- set by the device notification thread, cleared by the control thread
+    // ---- set by the device notification thread, cleared by the output thread
 
-    /// The endpoint stopped unexpectedly. Sticky until the control thread opens another device
-    /// (only then, with no device left to notify, is it cleared), so writers never overlap.
+    /// The endpoint stopped unexpectedly, or none could be opened. Sticky until the output thread
+    /// opens another device (only then, with no device left to notify, is it cleared), so writers
+    /// never overlap. While it is set the output thread re-opens an endpoint with backoff.
     alignas(kCacheLineBytes) std::atomic<bool> device_lost{false};
+
+    // ---- set by the output thread, taken by the decoder thread
+
+    /// restart_output_device() asked for the transport to come back exactly as it was (Playing
+    /// included). The decoder thread takes it with the next device configuration; without it a
+    /// source that was playing when the endpoint was lost comes back Paused.
+    std::atomic<bool> resume_on_restore{false};
 };
 
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);

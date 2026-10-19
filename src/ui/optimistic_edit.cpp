@@ -8,15 +8,6 @@ namespace mso::ui {
 
 namespace {
 
-/// Rebuilds SampleRow::tags (display paths joined with ", ") from the tag path list.
-void rebuild_tag_text(search::SampleRow& row) {
-    row.tags.clear();
-    for (const std::string& path : row.tag_paths) {
-        if (!row.tags.empty()) row.tags += ", ";
-        row.tags += path;
-    }
-}
-
 /// Removes the tag `path` (and its id, kept parallel) from the row.
 void remove_tag(search::SampleRow& row, const std::string& path) {
     const auto found = std::ranges::find(row.tag_paths, path);
@@ -44,7 +35,6 @@ void OptimisticEdit::apply(const catalog::EditCommand& command, search::SampleRo
             remove_tag(row, path);
         for (const std::string& path : command.tags_add)
             add_tag(row, path);
-        rebuild_tag_text(row);
     }
     if (command.category) {
         row.category = command.category->value_or(std::string());

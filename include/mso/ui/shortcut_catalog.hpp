@@ -46,8 +46,9 @@ public:
     /// Workspace preference key.
     static constexpr std::string_view kPreferenceKey = UiPreferenceKeys::kShortcuts;
 
-    /// Every customizable command, in the order Preferences lists them.
-    static const std::vector<ShortcutDefinition>& definitions();
+    /// Every customizable command, in the order Preferences lists them. Built on each call, so the
+    /// labels follow the translation installed now (a static table would freeze the first one).
+    static std::vector<ShortcutDefinition> definitions();
     /// The factory binding of every command.
     static ShortcutBindings defaults();
     /// Reads persisted bindings; unknown ids are ignored and missing or malformed entries keep
@@ -61,6 +62,10 @@ public:
     static QString label(const QString& id);
     /// Scope of an action id (Window when unknown).
     static ShortcutScope scope(const QString& id);
+    /// True for one key pressed without Ctrl, Alt or Meta (Shift and keypad keys count as single
+    /// keys): such a shortcut would fire while the user types in a list or tree, so it must be
+    /// scoped to the sample table whatever its command.
+    static bool is_single_key(const QKeySequence& sequence);
 };
 
 }  // namespace mso::ui

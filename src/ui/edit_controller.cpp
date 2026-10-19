@@ -47,7 +47,8 @@ void EditController::apply(const std::vector<SampleKey>& keys, catalog::EditComm
         model_.begin_pending_edit(keys);
     }
 
-    // 2. SQLite catches up in the background, one independent operation per library.
+    // 2. SQLite catches up in the background, one independent operation per library, each behind
+    //    the library's earlier writes.
     const auto groups = group_by_library(keys);
     auto outcome = std::make_shared<MultiLibraryOutcome>();
     outcome->remaining = groups.size();
@@ -56,52 +57,63 @@ void EditController::apply(const std::vector<SampleKey>& keys, catalog::EditComm
         per_library.operation = new_uuid();  // idempotency key of this library's write
         per_library.sample_ids = sample_ids;
         last_edited_library_ = library;
-        gateway_.request_edit(
-            library, per_library, this,
-            [this, outcome, library, keys, removes, done_message](Result<catalog::MutationReceipt> receipt) {
-                if (receipt) {
-                    outcome->applied += receipt->applied;
-                    outcome->conflicted += receipt->conflicted;
-                } else {
-                    outcome->failures << tr("%1: %2").arg(gateway_.library_name(library),
-                                                          DisplayFormat::error(receipt.error()));
-                }
-                emit historyChanged(library);
-                if (--outcome->remaining > 0) return;
+        auto deliver = [this, outcome, library, keys, removes, done_message](Result<catalog::MutationReceipt> receipt) {
+            if (receipt) {
+                outcome->applied += receipt->applied;
+                outcome->conflicted += receipt->conflicted;
+            } else {
+                outcome->failures << tr("%1: %2").arg(gateway_.library_name(library),
+                                                      DisplayFormat::error(receipt.error()));
+            }
+            emit historyChanged(library);
+            if (--outcome->remaining > 0) return;
 
-                // 3. Reconcile with the index: shows catalog-computed values, or reverts a failure.
-                if (removes) {
-                    if (!outcome->failures.isEmpty()) emit reloadRequested();
-                } else {
-                    model_.end_pending_edit(keys);
-                    model_.refresh_rows(keys);
-                }
-                if (!outcome->failures.isEmpty()) {
-                    emit failed(tr("The change was not saved"),
-                                tr("%1 was undone on screen because saving failed:\n%2")
-                                    .arg(done_message, outcome->failures.join(QLatin1Char('\n'))));
-                    return;
-                }
-                QString message =
-                    tr("%1 (%n sample(s))", nullptr, static_cast<int>(outcome->applied)).arg(done_message);
-                if (outcome->conflicted > 0)
-                    message = tr("%1; %n skipped because of conflicts", nullptr, static_cast<int>(outcome->conflicted))
-                                  .arg(message);
-                emit succeeded(message);
-            });
+            // 3. Reconcile with the index: shows catalog-computed values, or reverts a failure.
+            if (removes) {
+                if (!outcome->failures.isEmpty()) emit reloadRequested();
+            } else {
+                model_.end_pending_edit(keys);
+                model_.refresh_rows(keys);
+            }
+            if (!outcome->failures.isEmpty()) {
+                emit failed(tr("The change was not saved"),
+                            tr("%1 was undone on screen because saving failed:\n%2")
+                                .arg(done_message, outcome->failures.join(QLatin1Char('\n'))));
+                return;
+            }
+            QString message = tr("%1 (%n sample(s))", nullptr, static_cast<int>(outcome->applied)).arg(done_message);
+            if (outcome->conflicted > 0)
+                message = tr("%1; %n skipped because of conflicts", nullptr, static_cast<int>(outcome->conflicted))
+                              .arg(message);
+            emit succeeded(message);
+        };
+        enqueue_write(library, [this, library, per_library = std::move(per_library),
+                                deliver = std::move(deliver)](std::function<void()> settled) mutable {
+            gateway_.request_edit(library, per_library, this,
+                                  [deliver = std::move(deliver),
+                                   settled = std::move(settled)](Result<catalog::MutationReceipt> receipt) mutable {
+                                      deliver(std::move(receipt));
+                                      settled();
+                                  });
+        });
     }
 }
 
 void EditController::apply_taxonomy(const uuids::uuid& library, const catalog::TaxonomyCommand& command) {
     last_edited_library_ = library;
-    gateway_.request_taxonomy(library, command, this, [this, library](Result<catalog::MutationReceipt> receipt) {
-        if (!receipt) {
-            emit failed(tr("The change was not applied"), DisplayFormat::error(receipt.error()));
-            return;
-        }
-        emit succeeded(tr("Saved"));
-        emit historyChanged(library);
-        emit structureChanged(library);
+    enqueue_write(library, [this, library, command](std::function<void()> settled) {
+        gateway_.request_taxonomy(
+            library, command, this,
+            [this, library, settled = std::move(settled)](Result<catalog::MutationReceipt> receipt) {
+                if (!receipt) {
+                    emit failed(tr("The change was not applied"), DisplayFormat::error(receipt.error()));
+                } else {
+                    emit succeeded(tr("Saved"));
+                    emit historyChanged(library);
+                    emit structureChanged(library);
+                }
+                settled();
+            });
     });
 }
 
@@ -114,22 +126,49 @@ void EditController::redo(const uuids::uuid& library) {
 }
 
 void EditController::undo_or_redo(const uuids::uuid& library, bool redo) {
-    auto deliver = [this, library, redo](Result<catalog::MutationReceipt> receipt) {
-        emit historyChanged(library);
-        if (!receipt) {
-            const QString title = redo ? tr("Redo failed") : tr("Undo failed");
-            emit failed(title, receipt.error().code == ErrorCode::HistoryConflict
-                                   ? tr("A later edit changed the same values, so nothing was overwritten. "
-                                        "The conflict was recorded for review.")
-                                   : DisplayFormat::error(receipt.error()));
-            return;
-        }
-        emit succeeded(redo ? tr("Redone") : tr("Undone"));
-    };
-    if (redo)
-        gateway_.request_redo(library, this, std::move(deliver));
-    else
-        gateway_.request_undo(library, this, std::move(deliver));
+    enqueue_write(library, [this, library, redo](std::function<void()> settled) {
+        auto deliver = [this, library, redo, settled = std::move(settled)](Result<catalog::MutationReceipt> receipt) {
+            emit historyChanged(library);
+            if (!receipt) {
+                const QString title = redo ? tr("Redo failed") : tr("Undo failed");
+                emit failed(title, receipt.error().code == ErrorCode::HistoryConflict
+                                       ? tr("A later edit changed the same values, so nothing was overwritten. "
+                                            "The conflict was recorded for review.")
+                                       : DisplayFormat::error(receipt.error()));
+            } else {
+                emit succeeded(redo ? tr("Redone") : tr("Undone"));
+            }
+            settled();
+        };
+        if (redo)
+            gateway_.request_redo(library, this, std::move(deliver));
+        else
+            gateway_.request_undo(library, this, std::move(deliver));
+    });
+}
+
+std::size_t EditController::queued_writes(const uuids::uuid& library) const {
+    const auto found = queued_writes_.find(library);
+    return found == queued_writes_.end() ? 0 : found->second.size();
+}
+
+void EditController::enqueue_write(const uuids::uuid& library, Write write) {
+    queued_writes_[library].push_back(std::move(write));
+    if (!writing_libraries_.contains(library)) start_next_write(library);
+}
+
+void EditController::start_next_write(const uuids::uuid& library) {
+    const auto queue = queued_writes_.find(library);
+    if (queue == queued_writes_.end() || queue->second.empty()) {
+        writing_libraries_.erase(library);
+        if (queue != queued_writes_.end()) queued_writes_.erase(queue);
+        return;
+    }
+    Write write = std::move(queue->second.front());
+    queue->second.pop_front();
+    writing_libraries_.insert(library);
+    // Deliveries never run before the request call returns, so `settled` cannot re-enter here.
+    write([this, library] { start_next_write(library); });
 }
 
 }  // namespace mso::ui

@@ -11,10 +11,17 @@
 /// root availability, work done through with_library()) reaches the index through the catalog
 /// outbox on a background thread, and the UI hears about it through coalesced events.
 ///
+/// Memory: the indexes of all open libraries together hold at most
+/// ApplicationOptions::index_row_limit rows. A library that would exceed it (or whose growth
+/// exceeds it) is answered from SQLite instead, with the same results, only slower.
+///
 /// Threading: every method is thread-safe and synchronous. Long work (import, analysis, export,
-/// index loading) runs on background threads owned by the Application and reports through the
-/// event handler, which is invoked on those background threads; a UI must marshal events to its own
-/// thread. Never call blocking methods from a UI thread; run them on a worker (e.g. QtConcurrent).
+/// index loading) runs on background threads owned by the Application. Events are delivered on
+/// whichever thread produced them: usually those background threads, but also the calling thread
+/// of a method that reports while it runs (add_root(), rows() and the edit methods can emit
+/// RootAvailabilityEvent or BackgroundErrorEvent before they return). A UI must marshal events to
+/// its own thread and must not block inside the handler. Never call blocking methods from a UI
+/// thread; run them on a worker (e.g. QtConcurrent).
 #include <chrono>
 #include <compare>
 #include <cstdint>
@@ -22,8 +29,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -109,8 +118,18 @@ struct BackgroundErrorEvent {
     Error error;
 };
 
-using ApplicationEvent = std::variant<ImportProgressEvent, CatalogChangedEvent, RootAvailabilityEvent,
-                                      AnalysisProgressEvent, OperationFinishedEvent, BackgroundErrorEvent>;
+/// Whether a library can be changed in this session changed: a library opened read-only because
+/// another process (usually the CLI) held its lock became writable once that process released it.
+/// The UI tells the user and re-enables editing, importing and analysis for it.
+struct LibraryAccessChangedEvent {
+    uuids::uuid library;
+    bool read_only = false;         ///< the new state
+    bool in_use_elsewhere = false;  ///< another process still holds the lock
+};
+
+using ApplicationEvent =
+    std::variant<ImportProgressEvent, CatalogChangedEvent, RootAvailabilityEvent, AnalysisProgressEvent,
+                 OperationFinishedEvent, BackgroundErrorEvent, LibraryAccessChangedEvent>;
 using EventHandler = std::function<void(const ApplicationEvent&)>;
 
 // ---------------------------------------------------------------- export
@@ -150,6 +169,12 @@ struct ApplicationOptions {
     bool persist_open_libraries = true;
     /// Imports that run at the same time (further imports wait in a queue).
     std::size_t import_threads = 2;
+    /// Most rows the in-memory indexes of all open libraries hold together (the memory budget of
+    /// docs/06; see SampleIndex::kDefaultRowLimit). A library that does not fit is searched in SQLite.
+    std::size_t index_row_limit = SampleIndex::kDefaultRowLimit;
+    /// How long open_library() waits for a library this process is still closing (its last
+    /// background work still holds the lock) before reporting DB_BUSY.
+    std::chrono::milliseconds close_wait{10'000};
     /// Desktop behaviour: create "My Samples" in the workspace when no library exists, rescan every
     /// folder at start-up and whenever it reconnects, and analyze what an import adds (see
     /// automatic_analysis_profile). The CLI and tests leave this off and stay fully explicit.
@@ -163,14 +188,17 @@ struct AnalysisQueueStatus {
     std::string detail;               ///< last worker status or error, for display
 };
 
+/// The application services: libraries, roots, imports, search, edits, analysis and export, shared
+/// by the desktop UI and the CLI. See the file comment for the responsiveness and threading model.
 class Application {
 public:
     static constexpr std::size_t kMaxOpenLibraries = 8;
+
     /// Minimum spacing of CatalogChangedEvent and AnalysisProgressEvent per library.
     static constexpr std::chrono::milliseconds kEventInterval{150};
 
     /// Loads the workspace, starts the background services and (per options) reopens libraries.
-    static Result<std::unique_ptr<Application>> start(const ApplicationOptions& options = {});
+    [[nodiscard]] static Result<std::unique_ptr<Application>> start(const ApplicationOptions& options = {});
     /// Stops background work in dependency order (root monitor, imports, analysis supervisor, index
     /// maintenance), then closes every library.
     ~Application();
@@ -184,24 +212,28 @@ public:
 
     // ------------------------------------------------------------ libraries
     /// Creates a new library folder (empty or absent) and opens it. RESOURCE_LIMIT when eight are open.
-    Result<OpenLibraryInfo> create_library(const std::filesystem::path& directory, std::string_view name);
+    [[nodiscard]] Result<OpenLibraryInfo> create_library(const std::filesystem::path& directory, std::string_view name);
     /// Creates a library under the workspace's Libraries folder (a unique folder name derived
     /// from `name`), so users never have to pick or empty a folder for the catalog.
-    Result<OpenLibraryInfo> create_library_in_workspace(std::string_view name);
+    [[nodiscard]] Result<OpenLibraryInfo> create_library_in_workspace(std::string_view name);
     /// The library new sample folders go to by default: the only/first open writable library,
     /// creating "My Samples" in the workspace when none is open.
-    Result<OpenLibraryInfo> default_library();
+    [[nodiscard]] Result<OpenLibraryInfo> default_library();
     /// True when the folder holds a library (library.json).
     static bool is_library_folder(const std::filesystem::path& directory);
     /// Opens a library. The identity in library.json is checked first: a second library with the
     /// same UUID (a copy must be cloned) or a ninth library is refused before anything is touched.
     /// The library's lock file is then taken; only with the lock is the catalog migrated and
     /// recovered after a crash. When another process holds the lock the library opens read-only
-    /// (OpenLibraryInfo::in_use_elsewhere).
-    Result<OpenLibraryInfo> open_library(const std::filesystem::path& directory);
-    /// Closes a library: it leaves the open set immediately; work still running on it (an import,
-    /// a with_library() call) keeps it alive until that work ends, and its imports are cancelled.
-    Result<void> close_library(const uuids::uuid& library);
+    /// (OpenLibraryInfo::in_use_elsewhere); the root monitor keeps retrying the lock and makes the
+    /// library writable when that process lets go (LibraryAccessChangedEvent). When this process
+    /// is still closing the same library, it waits up to ApplicationOptions::close_wait for that to finish, then
+    /// fails with DB_BUSY (retryable) instead of opening it read-only.
+    [[nodiscard]] Result<OpenLibraryInfo> open_library(const std::filesystem::path& directory);
+    /// Closes a library: it leaves the open set immediately; its imports, its index load and its
+    /// running analysis job are cancelled (the job goes back to the queue), and work still holding
+    /// it (a with_library() call) keeps it alive until that work ends.
+    [[nodiscard]] Result<void> close_library(const uuids::uuid& library);
     /// Every open library.
     std::vector<OpenLibraryInfo> libraries() const;
 
@@ -210,27 +242,33 @@ public:
     /// returning R, and is flattened when `work` already returns a Result. Changes made by `work`
     /// reach the index through the outbox shortly after it returns.
     template <class Work>
-    auto with_library(const uuids::uuid& library, Work&& work) const;
+    [[nodiscard]] auto with_library(const uuids::uuid& library, Work&& work) const;
 
     // ------------------------------------------------------------ roots
     /// Registers a referenced source folder and binds it to its canonical path on this machine.
     /// INVALID_ARGUMENT when the folder is already a root of this library.
-    Result<catalog::RootRecord> add_root(const uuids::uuid& library, const std::filesystem::path& folder,
-                                         std::string_view name = {});
+    [[nodiscard]] Result<catalog::RootRecord> add_root(const uuids::uuid& library, const std::filesystem::path& folder,
+                                                       std::string_view name = {});
     /// Points an existing root at a new local path (e.g. the drive letter changed).
-    Result<void> rebind_root(const uuids::uuid& library, std::int64_t root_id, const std::filesystem::path& folder);
+    [[nodiscard]] Result<void> rebind_root(const uuids::uuid& library, std::int64_t root_id,
+                                           const std::filesystem::path& folder);
     /// Absolute local folder of a root (managed roots live inside the library).
     std::optional<std::filesystem::path> root_path(const uuids::uuid& library, const catalog::RootRecord& root) const;
-    /// Checks every root of the open libraries now (the background monitor does this every 2 s).
+    /// Checks every root of the open libraries now (the background monitor does this every 2 s),
+    /// after re-reading root bindings another process (the CLI) may have added to the workspace.
     void refresh_root_availability();
+    /// Tries again to take the lock of every library opened read-only because another process held
+    /// it, and makes it writable when that succeeds (the root monitor does this every 2 s).
+    void retry_read_only_libraries();
 
     // ------------------------------------------------------------ import
     /// Queues a background scan of one root (at most ApplicationOptions::import_threads run at
     /// once). Progress and completion arrive as events.
-    Result<OperationId> start_import(const uuids::uuid& library, std::int64_t root_id);
+    [[nodiscard]] Result<OperationId> start_import(const uuids::uuid& library, std::int64_t root_id);
     /// Runs a scan on the calling thread (CLI and tests).
-    Result<files::ImportSummary> import_now(const uuids::uuid& library, std::int64_t root_id, std::stop_token stop = {},
-                                            const files::ImportProgressCallback& progress = {});
+    [[nodiscard]] Result<files::ImportSummary> import_now(const uuids::uuid& library, std::int64_t root_id,
+                                                          std::stop_token stop = {},
+                                                          const files::ImportProgressCallback& progress = {});
     /// Requests cooperative cancellation of a queued or running operation.
     void cancel_operation(OperationId operation);
     /// Blocks until the operation has finished (returns at once for an unknown or finished one).
@@ -241,14 +279,16 @@ public:
     /// indexes (folder/tag/category/collection scopes, sorting, paging and row-evaluable filters
     /// in memory; full-text terms via search::matching_ids then memory). Falls back to SQLite while
     /// an index is still loading and for relevance ordering of text terms.
-    Result<search::SearchPage> search(const search::SearchRequest& request,
-                                      std::optional<uuids::uuid> only_library = std::nullopt) const;
+    [[nodiscard]] Result<search::SearchPage> search(const search::SearchRequest& request,
+                                                    std::optional<uuids::uuid> only_library = std::nullopt) const;
     /// Exact count of a request (same sources as search()).
-    Result<search::CountResult> count(const search::SearchRequest& request,
-                                      std::optional<uuids::uuid> only_library = std::nullopt) const;
-    /// Current rows of specific samples (for in-place row refresh); unknown or removed samples are
-    /// skipped. From the index, or SQLite while it is loading.
-    std::vector<search::SampleRow> rows(const std::vector<SampleKey>& keys) const;
+    [[nodiscard]] Result<search::CountResult> count(const search::SearchRequest& request,
+                                                    std::optional<uuids::uuid> only_library = std::nullopt) const;
+    /// Current rows of specific samples (for in-place row refresh), each carrying its SampleKey
+    /// (SampleRow::library and sample_id). Samples that no longer exist, or whose library is not
+    /// open, are omitted; a real failure (the database cannot be read) is an error, never an
+    /// empty result. From the index, or SQLite while it is loading.
+    [[nodiscard]] Result<std::vector<search::SampleRow>> rows(std::span<const SampleKey> keys) const;
     /// Folders of a root with sample counts, from the index (empty while it is loading).
     std::vector<IndexedFolder> folders(const uuids::uuid& library, std::int64_t root_id) const;
     /// True once the library's in-memory index has loaded.
@@ -256,36 +296,42 @@ public:
     /// Applies an edit and patches the in-memory index before returning (so rows() already shows
     /// it); the coalesced CatalogChangedEvent follows. A receipt with `partial` set means only part
     /// of a chunked edit was applied; callers must tell the user.
-    Result<catalog::MutationReceipt> apply_edit(const uuids::uuid& library, const catalog::EditCommand& command);
+    [[nodiscard]] Result<catalog::MutationReceipt> apply_edit(const uuids::uuid& library,
+                                                              const catalog::EditCommand& command);
     /// Applies a taxonomy change (tags, categories, collections) and patches the index.
-    Result<catalog::MutationReceipt> apply_taxonomy(const uuids::uuid& library,
-                                                    const catalog::TaxonomyCommand& command);
+    [[nodiscard]] Result<catalog::MutationReceipt> apply_taxonomy(const uuids::uuid& library,
+                                                                  const catalog::TaxonomyCommand& command);
     /// Undoes the action at the library's history cursor and patches the index. Retrying with the
     /// same `operation` returns the stored receipt instead of undoing a second action.
-    Result<catalog::MutationReceipt> undo(const uuids::uuid& library, const uuids::uuid& operation = new_uuid());
+    [[nodiscard]] Result<catalog::MutationReceipt> undo(const uuids::uuid& library,
+                                                        const uuids::uuid& operation = new_uuid());
     /// Redoes the next action and patches the index (idempotent per `operation`, like undo()).
-    Result<catalog::MutationReceipt> redo(const uuids::uuid& library, const uuids::uuid& operation = new_uuid());
+    [[nodiscard]] Result<catalog::MutationReceipt> redo(const uuids::uuid& library,
+                                                        const uuids::uuid& operation = new_uuid());
     /// Absolute path of a sample's playable location after re-checking it exists right now.
     /// SOURCE_OFFLINE when its root is unbound/unreachable, FILE_MISSING when the file is gone.
-    Result<std::filesystem::path> resolve_playable_path(const uuids::uuid& library, std::int64_t sample_id) const;
+    [[nodiscard]] Result<std::filesystem::path> resolve_playable_path(const uuids::uuid& library,
+                                                                      std::int64_t sample_id) const;
 
     // ------------------------------------------------------------ analysis
     /// Profile queued automatically after an import in automatic mode; empty disables it.
     /// Persisted as the workspace preference "analysis.automatic_profile" (default "Full").
     std::string automatic_analysis_profile() const;
-    Result<void> set_automatic_analysis_profile(std::string_view profile);
+    [[nodiscard]] Result<void> set_automatic_analysis_profile(std::string_view profile);
     /// Built-in profiles: "Waveforms", "Musical", "Duplicates", "Full" (empty for an unknown name).
     static std::vector<std::string> profile_stages(std::string_view profile);
     /// Creates an explicit analysis run over specific samples (the selection is frozen).
-    Result<catalog::Library::AnalysisRunStatus> start_analysis(const uuids::uuid& library, std::string_view profile,
-                                                               const std::vector<std::int64_t>& sample_ids,
-                                                               bool force = false);
+    [[nodiscard]] Result<catalog::Library::AnalysisRunStatus> start_analysis(
+        const uuids::uuid& library, std::string_view profile, const std::vector<std::int64_t>& sample_ids,
+        bool force = false);
     /// Creates an analysis run over every live sample of a root (set-based in the catalog).
-    Result<catalog::Library::AnalysisRunStatus> start_root_analysis(const uuids::uuid& library, std::int64_t root_id,
-                                                                    std::string_view profile, bool force = false);
+    [[nodiscard]] Result<catalog::Library::AnalysisRunStatus> start_root_analysis(const uuids::uuid& library,
+                                                                                  std::int64_t root_id,
+                                                                                  std::string_view profile,
+                                                                                  bool force = false);
     /// Pauses, resumes or cancels one run.
-    Result<void> control_analysis(const uuids::uuid& library, std::int64_t run_id,
-                                  catalog::Library::RunControl control);
+    [[nodiscard]] Result<void> control_analysis(const uuids::uuid& library, std::int64_t run_id,
+                                                catalog::Library::RunControl control);
     /// Pauses or resumes the whole background analysis queue (all libraries). Resuming also
     /// retries a worker that could not be started.
     void set_analysis_paused(bool paused);
@@ -295,8 +341,9 @@ public:
 
     // ------------------------------------------------------------ export
     /// Streams a CSV or JSON export of one library to `destination` (atomic replace).
-    Result<ExportSummary> export_metadata(const uuids::uuid& library, const std::filesystem::path& destination,
-                                          const ExportOptions& options, std::stop_token stop = {}) const;
+    [[nodiscard]] Result<ExportSummary> export_metadata(const uuids::uuid& library,
+                                                        const std::filesystem::path& destination,
+                                                        const ExportOptions& options, std::stop_token stop = {}) const;
 
     /// The machine-local workspace (root bindings, preferences).
     Workspace& workspace();
@@ -313,7 +360,7 @@ private:
     /// Queues the automatic profile for a folder after its import (automatic mode only).
     void queue_automatic_analysis(const uuids::uuid& library, std::int64_t root_id);
     /// Commits through `mutate` and patches the index on the calling thread before returning.
-    Result<catalog::MutationReceipt> mutate_and_patch(
+    [[nodiscard]] Result<catalog::MutationReceipt> mutate_and_patch(
         const uuids::uuid& library, const std::function<Result<catalog::MutationReceipt>(catalog::Library&)>& mutate);
 
     std::unique_ptr<State> state_;

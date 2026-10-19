@@ -1,0 +1,1 @@
+rate:48000 channels:2 bits:24 size:>1MB codec:pcm_s16

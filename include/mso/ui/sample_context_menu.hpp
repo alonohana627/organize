@@ -7,14 +7,17 @@
 #include <QString>
 
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "mso/search/search_service.hpp"
 #include "mso/ui/sample_key.hpp"
 
 class QAction;
+class QMenu;
 class QWidget;
 
 namespace mso::ui {
@@ -37,7 +40,9 @@ struct SampleMenuCommands {
 
 /// Builds and runs the sample context menu. File actions resolve playable paths off the UI thread
 /// and act only when every targeted sample resolved, so nothing is done for part of a selection
-/// without saying so (docs/01 §5.6); they are disabled up front for samples known to be unavailable.
+/// without saying so (docs/01 §5.6); they are disabled up front for samples known to be unavailable
+/// and when some selected rows are not loaded. The menu's actions capture keys (values) only, so
+/// the menu's event loop may change the table freely.
 class SampleContextMenu final : public QObject {
     Q_OBJECT
 
@@ -45,10 +50,14 @@ public:
     /// Menus open over `parent_widget`; `session` and the command actions must outlive this object.
     SampleContextMenu(ApplicationSession& session, SampleMenuCommands commands, QWidget* parent_widget);
 
-    /// Shows the menu for `selection` (loaded selected rows) at `global_position`; `clicked` is the
-    /// row under the pointer (or the current row, from the keyboard).
+    /// Shows the menu for `selection` (the loaded selected rows; `total_selected` counts loaded and
+    /// unloaded ones) at `global_position`; `clicked` is the row under the pointer (or the current
+    /// row, from the keyboard).
     void show(const QPoint& global_position, const std::vector<search::SampleRow>& selection,
-              const search::SampleRow& clicked);
+              std::size_t total_selected, search::SampleRow clicked);
+    /// The menu show() runs, built for the same arguments (tests inspect it without opening it).
+    std::unique_ptr<QMenu> build_menu(const std::vector<search::SampleRow>& selection, std::size_t total_selected,
+                                      const search::SampleRow& clicked);
 
     /// Opens the file manager at `key`'s file.
     void reveal(const SampleKey& key);

@@ -3,25 +3,38 @@
 /// In-memory index of every live sample of one open library (the owner's responsiveness request:
 /// "load the entire tree to memory, update the GUI immediately and SQLite in the background").
 ///
-/// The index holds one search::SampleRow per live sample plus the navigation data needed to
-/// evaluate scopes (tag tree, category paths). It is loaded once per open library on a background
-/// thread (search::for_each_row) and then kept current incrementally from the catalog outbox
+/// The index holds one compact row per live sample plus the navigation data needed to evaluate
+/// scopes (tag tree, category tree, merged-tag aliases). Text that many rows share (root names and
+/// identities, folders and their path keys, formats, codecs, value sources, category paths and tag
+/// sets) is stored once and referenced by number; a full search::SampleRow is assembled only for
+/// rows that are returned. The index is loaded once per open library on a background thread
+/// (search::for_each_row) and then kept current incrementally from the catalog outbox
 /// (catalog::Library::changes_since + search::load_rows for the changed ids). Folder clicks,
-/// sorting, paging and row-evaluable filters are then answered from memory in milliseconds;
-/// only full-text terms and collection membership still ask SQLite for a set of ids.
+/// sorting, paging and row-evaluable filters are then answered from memory in milliseconds; only
+/// full-text terms and collection membership still ask SQLite for a set of ids.
+///
+/// Memory is bounded: load() refuses a library with more than its row limit (RESOURCE_LIMIT), and
+/// the owner then answers that library from SQLite (app::Application does this automatically).
 ///
 /// Ordering is identical to search::SearchService: per sort field, values ascending or descending,
 /// nulls always last, ties by sample id in the sort direction; across libraries ties are broken by
-/// library UUID. Paging uses an opaque cursor holding each library's structural generation and an
-/// offset; it becomes STALE_CURSOR when a library's structure generation moves (rows added or
-/// removed, navigation changed, index reloaded), so callers re-query instead of skipping rows.
+/// library UUID. Paging uses keyset cursors: a cursor records, per library, the sort key and sample
+/// id of the last row it returned, and the next page starts at the first row after that key in the
+/// current order. A row that was not edited is therefore never skipped or repeated, whatever values
+/// change between two pages (ratings, analysis results); a row whose own sort value or filter
+/// membership changes across the cursor appears where its new value puts it (possibly again, or not
+/// at all in this pass), exactly like SearchService's keyset cursors, and the change event lists it
+/// so a view can refresh it in place. A cursor becomes STALE_CURSOR when a library's structure
+/// generation moves (rows added or removed, navigation changed, index reloaded), so a view
+/// re-queries at its anchor and picks up inserted rows.
 ///
-/// Root and folder scopes test the sample's primary location (SampleRow::root_id and the path key
-/// of SampleRow::relative_path, exact on case-sensitive roots), exactly like the SQL scope.
+/// Root and folder scopes test the sample's primary location (its root and the path key of its
+/// folder, exact on case-sensitive roots), exactly like the SQL scope.
 ///
-/// Threading: every method is thread-safe. Readers share a std::shared_mutex; load() and
-/// synchronize() are serialized and never hold the exclusive lock while running SQL, so queries
-/// keep being answered from the previous state during a reload.
+/// Threading: every method is thread-safe. Readers share a std::shared_mutex. synchronize() and the
+/// final step of load() are serialized; neither holds the exclusive lock while running SQL, and a
+/// load streams the library without blocking synchronize(), so queries and edits keep being served
+/// from the previous state while a reload runs.
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -29,6 +42,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "mso/catalog/library.hpp"
@@ -67,6 +81,8 @@ struct IndexChange {
     }
 };
 
+/// The in-memory index of one library: compact rows, cached sort orders and filtered results, kept
+/// current from the catalog outbox. See the file comment for ordering, cursors and threading.
 class SampleIndex {
 public:
     /// Outbox consumer name passed to catalog::Library::acknowledge_changes.
@@ -75,7 +91,11 @@ public:
     static constexpr std::size_t kChangesPerSynchronization = 4096;
     /// Filtered result lists kept per index for paging (bounded, least recently used dropped).
     static constexpr std::size_t kCachedResults = 4;
+    /// Default row limit of load(): about 300 MiB of index at the measured row size (see
+    /// IMPLEMENTATION_STATUS.md), inside docs/06's browse budget with room for the UI and SQLite.
+    static constexpr std::size_t kDefaultRowLimit = 1'000'000;
 
+    /// An empty, not yet ready index of `library`.
     explicit SampleIndex(uuids::uuid library);
     ~SampleIndex();
     SampleIndex(const SampleIndex&) = delete;
@@ -84,16 +104,26 @@ public:
     /// UUID of the indexed library.
     const uuids::uuid& library() const noexcept { return library_; }
 
-    /// (Re)loads every live row of `library` (blocking; run it on a background thread). Queries
-    /// keep using the previous state until the new one is swapped in. CANCELLED when `stop` fires.
-    Result<void> load(catalog::Library& library, std::stop_token stop = {});
+    /// (Re)loads every live row of `library` (blocking; run it on a background thread). Queries and
+    /// synchronize() keep using the previous state until the new one, caught up with everything
+    /// committed meanwhile, is swapped in. CANCELLED when `stop` fires; RESOURCE_LIMIT (the index
+    /// keeps its previous state) when the library has more than `row_limit` live samples; DB_BUSY
+    /// when another load of this index is running.
+    [[nodiscard]] Result<void> load(catalog::Library& library, std::stop_token stop = {},
+                                    std::size_t row_limit = kDefaultRowLimit);
 
     /// Applies the changes committed since the last applied revision (IndexChange::reload_required
     /// asks the caller to schedule load() instead). INDEX_UNAVAILABLE before the first load.
-    Result<IndexChange> synchronize(catalog::Library& library);
+    [[nodiscard]] Result<IndexChange> synchronize(catalog::Library& library);
 
-    /// True once a load() has completed.
+    /// Frees every row and becomes not ready (the owner answers from SQLite from now on, until the
+    /// next successful load()).
+    void clear();
+
+    /// True once a load() has completed (and clear() was not called since).
     bool ready() const noexcept { return ready_.load(std::memory_order_acquire); }
+    /// True while a load() is running.
+    bool loading() const noexcept;
     /// Catalog revision the index reflects.
     std::int64_t revision() const noexcept { return revision_.load(std::memory_order_acquire); }
     /// Current generation counters.
@@ -101,9 +131,9 @@ public:
     /// Number of live rows.
     std::size_t size() const;
 
-    /// Copy of one row; nullopt when the sample is not live (or not loaded yet).
+    /// The row of one sample; nullopt when the sample is not live (or not loaded yet).
     std::optional<search::SampleRow> row(std::int64_t sample_id) const;
-    /// Copies of the rows that exist, in the order of `sample_ids` (missing ids are skipped).
+    /// The rows that exist, in the order of `sample_ids` (missing ids are skipped).
     std::vector<search::SampleRow> rows(std::span<const std::int64_t> sample_ids) const;
     /// Every folder of a root that holds live samples (with its ancestors), sorted by path.
     std::vector<IndexedFolder> folders(std::int64_t root_id) const;
@@ -115,6 +145,8 @@ public:
     /// Whether a request can be answered from indexes. Relevance ordering of text terms needs
     /// SQLite's BM25 ranking, so those requests go to search::SearchService.
     static bool serves(const search::SearchRequest& request);
+    /// The same for a request whose text is already parsed into `query`.
+    static bool serves(const search::Query& query, search::SortField sort);
 
 private:
     friend class detail::IndexedSearch;
@@ -134,12 +166,21 @@ struct IndexedLibrary {
 };
 
 /// Federated, paged search over loaded indexes with SearchService's ordering and coverage
-/// semantics. Every index must be ready() and the request must satisfy SampleIndex::serves().
-Result<search::SearchPage> search_indexes(std::span<const IndexedLibrary> libraries,
-                                          const search::SearchRequest& request);
+/// semantics. The request must satisfy SampleIndex::serves(). INDEX_UNAVAILABLE when an index is
+/// not ready (the caller answers from SQLite instead).
+[[nodiscard]] Result<search::SearchPage> search_indexes(std::span<const IndexedLibrary> libraries,
+                                                        const search::SearchRequest& request);
+/// The same with the request's text already parsed: `query` must be search::parse_query(request.text).
+[[nodiscard]] Result<search::SearchPage> search_indexes(std::span<const IndexedLibrary> libraries,
+                                                        const search::SearchRequest& request,
+                                                        const search::Query& query);
 
-/// Exact count over loaded indexes (same filters as search_indexes).
-Result<search::CountResult> count_indexes(std::span<const IndexedLibrary> libraries,
-                                          const search::SearchRequest& request);
+/// Exact count over loaded indexes (same filters and errors as search_indexes).
+[[nodiscard]] Result<search::CountResult> count_indexes(std::span<const IndexedLibrary> libraries,
+                                                        const search::SearchRequest& request);
+/// The same with the request's text already parsed into `query`.
+[[nodiscard]] Result<search::CountResult> count_indexes(std::span<const IndexedLibrary> libraries,
+                                                        const search::SearchRequest& request,
+                                                        const search::Query& query);
 
 }  // namespace mso::app

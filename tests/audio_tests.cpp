@@ -23,6 +23,7 @@
 #include "mso/audio/detail/command_mailbox.hpp"
 #include "mso/audio/detail/denormal_flush.hpp"
 #include "mso/audio/detail/linear_ramp.hpp"
+#include "mso/audio/detail/output_supervisor.hpp"
 #include "mso/audio/detail/pcm_ring.hpp"
 #include "mso/audio/detail/playback_controller.hpp"
 #include "mso/audio/detail/playback_renderer.hpp"
@@ -34,6 +35,7 @@
 #include "mso/audio/detail/wakeup_signal.hpp"
 #include "mso/audio/fixed_text.hpp"
 #include "mso/audio/preview_engine.hpp"
+#include "test_support.hpp"
 
 namespace {
 
@@ -47,17 +49,11 @@ constexpr std::size_t kSettleFrames = 480;
 /// Generous bound for anything the decoder thread does in response to a command.
 constexpr auto kDeadline = 5000ms;
 
-/// Polls `done` until it holds or `timeout` passes; returns whether it held.
+/// Polls `done` (every millisecond, through test::wait_until) until it holds or `timeout` passes;
+/// returns whether it held.
 template <class Condition>
 bool eventually(Condition done, std::chrono::milliseconds timeout = kDeadline) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (!done()) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return false;
-        }
-        std::this_thread::sleep_for(200us);
-    }
-    return true;
+    return test::wait_until(std::function<bool()>(std::move(done)), timeout, 1ms);
 }
 
 // ---------------------------------------------------------------- synthetic sources
@@ -88,11 +84,16 @@ public:
         gate_open_ = std::move(gate_open);
         return *this;
     }
+    /// Reports `estimate` as an inexact length (VBR-style) while the real end stays where it is.
+    SyntheticDecoder& estimating_length(std::int64_t estimate) {
+        estimated_frames_ = estimate;
+        return *this;
+    }
 
     int channels() const override { return channels_; }
     int sample_rate() const override { return sample_rate_; }
-    std::optional<std::int64_t> total_frames() const override { return total_frames_; }
-    bool frames_exact() const override { return true; }
+    std::optional<std::int64_t> total_frames() const override { return estimated_frames_.value_or(total_frames_); }
+    bool frames_exact() const override { return !estimated_frames_; }
     std::int64_t position() const override { return position_; }
     std::string codec() const override { return "synthetic"; }
 
@@ -140,6 +141,61 @@ private:
     std::optional<std::int64_t> throw_frame_;
     std::int64_t gate_frame_ = 0;
     std::shared_ptr<std::atomic<bool>> gate_open_;
+    std::optional<std::int64_t> estimated_frames_;
+    std::int64_t position_ = 0;
+};
+
+/// A gate a test opens once: threads wait on it, the test releases them.
+struct TestGate {
+    std::atomic<bool> open{false};
+    std::atomic<bool> reached{false};  ///< a thread has arrived at the gate
+
+    void wait() {
+        reached = true;
+        open.wait(false);
+    }
+    void release() {
+        open = true;
+        open.notify_all();
+    }
+};
+
+/// A decoder whose opening (the first channels() call) waits at a gate and can then throw, to hold
+/// the decoder thread inside open() while the test looks at snapshots.
+class GatedOpeningDecoder final : public media::Decoder {
+public:
+    GatedOpeningDecoder(std::shared_ptr<TestGate> gate, bool throws) : gate_(std::move(gate)), throws_(throws) {}
+
+    int channels() const override {
+        if (!opened_) {
+            opened_ = true;
+            gate_->wait();
+            if (throws_) {
+                throw std::runtime_error("synthetic failure while opening");
+            }
+        }
+        return 2;
+    }
+    int sample_rate() const override { return kRate; }
+    std::optional<std::int64_t> total_frames() const override { return kRate; }
+    bool frames_exact() const override { return true; }
+    std::int64_t position() const override { return position_; }
+    std::string codec() const override { return "gated"; }
+    Result<std::size_t> read(float* out, std::size_t frames) override {
+        const auto count = std::min<std::size_t>(frames, static_cast<std::size_t>(kRate - position_));
+        std::fill(out, out + count * 2, 0.25f);
+        position_ += static_cast<std::int64_t>(count);
+        return count;
+    }
+    Result<void> seek(std::int64_t frame) override {
+        position_ = std::clamp<std::int64_t>(frame, 0, kRate);
+        return {};
+    }
+
+private:
+    std::shared_ptr<TestGate> gate_;
+    bool throws_;
+    mutable bool opened_ = false;
     std::int64_t position_ = 0;
 };
 
@@ -472,6 +528,34 @@ TEST_SUITE("audio") {
         CHECK_FALSE(history.audible(1000, 2000).has_value());
     }
 
+    TEST_CASE("PlayheadHistory carries the last heard position over to a new device") {
+        detail::PlayheadHistory history;
+        history.record({100, 1, 1000});
+        history.record({200, 1, 1100});
+        const auto heard = history.audible(250, 100);  // the point recorded at 100
+        REQUIRE(heard.has_value());
+        history.restart(heard);
+        CHECK(history.audible(10, 480)->position == 1000);  // the new device has played nothing yet
+        history.record({300, 2, 5000});
+        CHECK(history.audible(400, 480)->position == 1000);  // its own point is still in its buffer
+        CHECK(history.audible(800, 480)->position == 5000);  // and then it is heard
+        history.restart(std::nullopt);
+        CHECK_FALSE(history.audible(800, 480).has_value());
+    }
+
+    TEST_CASE("OutputRetrySchedule doubles the wait after each failure up to its cap") {
+        const detail::OutputRetrySchedule schedule{500ms, 4000ms};
+        CHECK(schedule.delay_after(0) == 500ms);
+        CHECK(schedule.delay_after(1) == 1000ms);
+        CHECK(schedule.delay_after(2) == 2000ms);
+        CHECK(schedule.delay_after(3) == 4000ms);
+        CHECK(schedule.delay_after(4) == 4000ms);
+        CHECK(schedule.delay_after(1'000'000) == 4000ms);
+        const detail::OutputRetrySchedule inverted{800ms, 100ms};  // a cap below the first wait
+        CHECK(inverted.delay_after(0) == 800ms);
+        CHECK(inverted.delay_after(5) == 800ms);
+    }
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
     TEST_CASE("ScopedDenormalFlush flushes denormals to zero and restores the mode") {
         volatile float tiny = std::numeric_limits<float>::min();  // smallest normal float
@@ -552,9 +636,10 @@ TEST_SUITE("audio") {
         detail::CommandMailbox mailbox;
         constexpr std::int64_t kRounds = 20'000;
         std::atomic<bool> producing{true};
+        bool stop_always_accepted = true;  // written by the producer, read after it finished
         std::jthread producer([&] {
             for (std::int64_t round = 1; round <= kRounds; ++round) {
-                mailbox.post(transport::Stop{});
+                stop_always_accepted = mailbox.post(transport::Stop{}) && stop_always_accepted;
                 while (!mailbox.post(transport::SeekToFrame{round})) {
                     std::this_thread::yield();  // full: wait for the consumer
                 }
@@ -581,6 +666,7 @@ TEST_SUITE("audio") {
             last = taken;
         }
         CHECK(ordered);
+        CHECK(stop_always_accepted);
         REQUIRE(last.has_value());
         REQUIRE(std::holds_alternative<transport::SeekToFrame>(*last));
         CHECK(std::get<transport::SeekToFrame>(*last).source_frame == kRounds);
@@ -670,6 +756,46 @@ TEST_SUITE("audio") {
         CHECK(progress.audible_frame == 512);  // newest callback boundary at least 480 frames back
     }
 
+    TEST_CASE("Renderer declicks an epoch change that falls on a block boundary") {
+        RendererFixture fixture;
+        fixture.publish_gate(1, true);
+        fixture.write_block(1, 0.5f);
+        fixture.render(detail::kPcmBlockFrames);  // ends exactly on the block boundary: no block held
+        // A seek while playing: new epoch, output still on, a block of another level.
+        fixture.publish_gate(2, true);
+        fixture.write_block(2, -0.25f);
+        const auto output = fixture.render(detail::kPcmBlockFrames);
+        // The old level (0.5) decays on top of the new epoch instead of stepping to -0.25. (In the
+        // engine the new epoch also fades in, so the sum stays level; see the seek-while-playing test.)
+        CHECK(output[0] == doctest::Approx(-0.25f + 0.5f));
+        float largest_step = 0.0f;
+        for (std::size_t frame = 1; frame < detail::kPcmBlockFrames; ++frame) {
+            largest_step = std::max(largest_step, std::abs(output[frame * 2] - output[(frame - 1) * 2]));
+        }
+        CHECK(largest_step < 0.01f);
+        CHECK(output[(detail::kPcmBlockFrames - 1) * 2] == -0.25f);  // decay over: the new epoch at full gain
+    }
+
+    TEST_CASE("Renderer reconfigured for a new device drops the old rate and keeps the heard position") {
+        RendererFixture fixture(128);
+        fixture.publish_gate(1, true);
+        for (std::int64_t block = 0; block < 4; ++block) {
+            fixture.write_block(1, 0.5f, block * detail::kPcmBlockFrames);
+        }
+        fixture.render(128);
+        fixture.render(192);  // holds the second block, 64 frames in
+        REQUIRE(fixture.shared.progress.load().audible_frame == 128);
+
+        fixture.renderer.configure(44100, 4410);  // the device switched to 44.1 kHz
+        const auto output = fixture.render(128);
+        CHECK(all_samples_equal(output, 0.0f));      // nothing of the 48 kHz blocks, no decay carried over
+        CHECK(fixture.ring.readable_blocks() == 0);  // the held block went back with the rest
+        CHECK(fixture.shared.underrun_count.load() == 0);
+        const detail::PlaybackProgress progress = fixture.shared.progress.load();
+        CHECK(progress.audible_epoch == 1);  // still where the listener last heard the old device
+        CHECK(progress.audible_frame == 128);
+    }
+
     // ---------------------------------------------------------------- controller
 
     TEST_CASE("Controller recovers from a lost device paused where it was") {
@@ -686,8 +812,8 @@ TEST_SUITE("audio") {
         shared.output_configuration = 1;
 
         detail::PlaybackController controller(ring, shared, mailbox, wakeup, 200);
-        shared.requested_generation = 1;
-        controller.request_source(1, std::unique_ptr<media::Decoder>(constant_source(0.5f)));
+        CHECK(controller.request_source(std::unique_ptr<media::Decoder>(constant_source(0.5f))) == 1);
+        CHECK(shared.requested_generation == 1);
         const auto state_is = [&](PreviewState state) { return eventually([&] { return shared.state == state; }); };
         REQUIRE(state_is(PreviewState::Ready));
 
@@ -703,11 +829,11 @@ TEST_SUITE("audio") {
         CHECK_FALSE(shared.last_error.load().has_value());
 
         // Playing comes back Paused at the position it had.
-        mailbox.post(transport::Play{});
+        REQUIRE(mailbox.post(transport::Play{}));
         wakeup.notify();
         REQUIRE(state_is(PreviewState::Playing));
         std::vector<float> output(4800 * 2);
-        REQUIRE(eventually([&] { return shared.epoch_produced_frames.load() >= 4800; }));
+        REQUIRE(eventually([&] { return shared.production.load().frames >= 4800; }));
         renderer.render(output);
         REQUIRE(shared.progress.load().audible_frame == 4800);
 
@@ -719,9 +845,122 @@ TEST_SUITE("audio") {
         wakeup.notify();
         REQUIRE(state_is(PreviewState::Paused));
         CHECK(shared.epoch_start_frame.load() == 4800);  // never silently back to the start
-        mailbox.post(transport::Play{});
+        REQUIRE(mailbox.post(transport::Play{}));
         wakeup.notify();
         REQUIRE(state_is(PreviewState::Playing));
+    }
+
+    TEST_CASE("Controller re-anchors shape changes at the consumed position and device changes at the audible one") {
+        detail::PcmRing ring(96'000);
+        detail::SharedPlaybackState shared;
+        detail::CommandMailbox mailbox;
+        detail::WakeupSignal wakeup;
+        detail::PlaybackRenderer renderer(ring, shared);
+        renderer.configure(kRate, 2400);  // 50 ms device buffer
+        detail::OutputFacts facts;
+        facts.sample_rate = kRate;
+        shared.output_facts.store(facts);
+        shared.output_available = true;
+        shared.output_configuration = 1;
+
+        detail::PlaybackController controller(ring, shared, mailbox, wakeup, 200);
+        controller.request_source(std::unique_ptr<media::Decoder>(constant_source(0.5f)));
+        REQUIRE(eventually([&] { return shared.state == PreviewState::Ready; }));
+        REQUIRE(mailbox.post(transport::Play{}));
+        wakeup.notify();
+        REQUIRE(eventually([&] { return shared.state == PreviewState::Playing; }));
+
+        // Renders `callbacks` periods of 2400 frames, each once the decoder thread has produced it.
+        std::vector<float> period(2400 * 2);
+        const auto render_periods = [&](int callbacks) {
+            for (int callback = 0; callback < callbacks; ++callback) {
+                const std::uint64_t epoch = detail::TransportGate::unpacked(shared.transport_gate.load()).epoch;
+                const std::int64_t consumed =
+                    shared.progress.load().consumed_epoch == epoch ? shared.progress.load().consumed_frames : 0;
+                REQUIRE(eventually([&] {
+                    const detail::EpochProduction production = shared.production.load();
+                    return production.epoch == epoch && production.frames >= consumed + 2400;
+                }));
+                renderer.render(period);
+            }
+        };
+        render_periods(4);
+        REQUIRE(shared.progress.load().consumed_position == 9600);
+        REQUIRE(shared.progress.load().audible_frame == 7200);  // the last 2400 frames are still in the device
+
+        // A speed change continues right after the audio already in the device: nothing is played twice.
+        REQUIRE(mailbox.post(transport::SetSpeed{2.0}));
+        wakeup.notify();
+        REQUIRE(eventually([&] { return shared.settings.load().speed_ratio == 2.0; }));
+        CHECK(shared.epoch_start_frame.load() == 9600);
+
+        // A new device does not play the old one's buffer: it resumes from what was heard.
+        render_periods(2);  // 4800 frames at 2x: consumed 19,200, heard 14,400
+        REQUIRE(shared.progress.load().consumed_position == 19200);
+        REQUIRE(shared.progress.load().audible_frame == 14400);
+        ++shared.output_configuration;
+        wakeup.notify();
+        REQUIRE(eventually([&] { return shared.epoch_start_frame.load() == 14400; }));
+        CHECK(shared.state == PreviewState::Playing);
+    }
+
+    TEST_CASE("OutputSupervisor re-opens a lost null device by itself, and restart resumes playback") {
+        detail::PcmRing ring(96'000);
+        detail::SharedPlaybackState shared;
+        detail::CommandMailbox mailbox;
+        detail::WakeupSignal decoder_wakeup;
+        detail::PlaybackRenderer renderer(ring, shared);
+        detail::OutputSupervisorOptions options;
+        options.backend = OutputBackend::Null;
+        options.retry = detail::OutputRetrySchedule{200ms, 400ms};
+        auto supervisor = detail::OutputSupervisor::start(options, renderer, shared, decoder_wakeup);
+        REQUIRE(supervisor.has_value());
+        CHECK(shared.output_available);
+        CHECK_FALSE(shared.device_lost);
+        detail::PlaybackController controller(ring, shared, mailbox, decoder_wakeup, 200);
+
+        const auto state_is = [&](PreviewState state) { return eventually([&] { return shared.state == state; }); };
+        controller.request_source(std::unique_ptr<media::Decoder>(constant_source(0.25f)));
+        REQUIRE(state_is(PreviewState::Ready));
+        REQUIRE(mailbox.post(transport::Play{}));
+        decoder_wakeup.notify();
+        REQUIRE(state_is(PreviewState::Playing));
+        REQUIRE(eventually([&] { return shared.progress.load().audible_frame > kRate / 20; }));
+
+        // Unplugged: the endpoint's stop notification reports the loss.
+        const std::uint64_t configuration = shared.output_configuration;
+        (*supervisor)->on_device_lost();
+        CHECK(shared.device_lost);
+        REQUIRE(state_is(PreviewState::Error));
+        CHECK(shared.last_error.load() == ErrorCode::DeviceLost);
+        // The output thread re-opens an endpoint after the first retry delay; playback waits, paused
+        // where it was heard.
+        REQUIRE(eventually([&] { return !shared.device_lost && shared.state == PreviewState::Paused; }));
+        CHECK(shared.output_configuration > configuration);
+        CHECK(shared.epoch_start_frame.load() > 0);
+        CHECK_FALSE(shared.last_error.load().has_value());
+
+        // Lost again, then "Retry": the transport comes back exactly as it was, playing.
+        REQUIRE(mailbox.post(transport::Play{}));
+        decoder_wakeup.notify();
+        REQUIRE(state_is(PreviewState::Playing));
+        (*supervisor)->on_device_lost();
+        REQUIRE(state_is(PreviewState::Error));
+        REQUIRE((*supervisor)->restart().has_value());
+        REQUIRE(state_is(PreviewState::Playing));
+        CHECK_FALSE(shared.device_lost);
+        CHECK_FALSE(shared.resume_on_restore);  // taken with the new configuration
+
+        // A restart of a working endpoint keeps playing; a selection that cannot open changes nothing.
+        REQUIRE((*supervisor)->restart().has_value());
+        const auto missing = (*supervisor)->select(OutputDeviceId{"null:does-not-exist"});
+        REQUIRE_FALSE(missing.has_value());
+        CHECK(missing.error().code == ErrorCode::NotFound);
+        CHECK_FALSE(shared.device_lost);
+        const std::int64_t heard = shared.progress.load().audible_frame;
+        REQUIRE(eventually([&] { return shared.progress.load().audible_frame > heard; }));
+        CHECK(shared.state == PreviewState::Playing);
+        supervisor->reset();  // the device stops before the controller and renderer go away
     }
 }
 
@@ -832,6 +1071,88 @@ TEST_SUITE("audio") {
         auto offline = make_offline_engine();
         CHECK(offline->select_output_device(OutputDeviceId{}).error().code == ErrorCode::InvalidArgument);
         CHECK(offline->list_output_devices()->empty());
+    }
+
+    TEST_CASE("a seek while playing never steps the output") {
+        auto engine = make_offline_engine();
+        open_and_wait_until_ready(*engine, constant_source(0.5f));
+        play(*engine);
+        const std::vector<float> before = pull(*engine, 19 * detail::kPcmBlockFrames);  // ends on a block boundary
+        REQUIRE(before[before.size() - 2] == 0.5f);
+
+        engine->post(transport::SeekToFrame{24000});
+        wait_until(*engine, [](const PreviewSnapshot& snapshot) {
+            return snapshot.position_frames == 24000 && snapshot.buffered_milliseconds >= 100;
+        });
+        const std::vector<float> after = pull(*engine, 1024);
+        float largest_step = std::abs(after[0] - 0.5f);
+        for (std::size_t frame = 1; frame < 1024; ++frame) {
+            largest_step = std::max(largest_step, std::abs(after[frame * 2] - after[(frame - 1) * 2]));
+        }
+        CHECK(largest_step < 0.01f);  // the old level decays while the new one fades in
+        CHECK(after[1023 * 2] == 0.5f);
+        CHECK(engine->snapshot().position_frames == 24000 + 1024);
+    }
+
+    TEST_CASE("a loop past an inexact end shrinks to the real end and keeps the minimum length") {
+        auto engine = make_offline_engine();
+        auto source = constant_source(0.5f, 2, kRate, kRate);  // really one second long...
+        source->estimating_length(2 * kRate);                  // ...estimated at two
+        open_and_wait_until_ready(*engine, std::move(source));
+        engine->post(transport::SetLoop{LoopRegion{kRate - 100, 2 * kRate - 1000}});
+        engine->post(transport::SeekToFrame{kRate - 100});
+        const auto shrunk = wait_until(*engine, [](const PreviewSnapshot& snapshot) {
+            return snapshot.loop.has_value() && snapshot.loop->end_frame == kRate;
+        });
+        constexpr std::int64_t kMinimumLoopFrames = kRate * kMinimumLoopMilliseconds / 1000;
+        CHECK(shrunk.loop == LoopRegion{kRate - kMinimumLoopFrames, kRate});
+    }
+
+    TEST_CASE("a request that fails while opening never shows the next request as failed") {
+        auto engine = make_offline_engine();
+        const auto failing_gate = std::make_shared<TestGate>();
+        const auto next_gate = std::make_shared<TestGate>();
+        REQUIRE(engine->open(std::make_unique<GatedOpeningDecoder>(failing_gate, true)).has_value());
+        REQUIRE(eventually([&] { return failing_gate->reached.load(); }));
+        REQUIRE(engine->open(std::make_unique<GatedOpeningDecoder>(next_gate, false)).has_value());
+
+        failing_gate->release();  // the first request throws while it is being opened
+        REQUIRE(eventually([&] { return next_gate->reached.load(); }));
+        const PreviewSnapshot opening = engine->snapshot();
+        CHECK(opening.generation == 2);
+        CHECK(opening.state == PreviewState::Loading);  // never Error: the failure belongs to generation 1
+        CHECK_FALSE(opening.last_error.has_value());
+
+        next_gate->release();
+        const auto ready =
+            wait_until(*engine, [](const PreviewSnapshot& snapshot) { return snapshot.state == PreviewState::Ready; });
+        CHECK(ready.generation == 2);
+        CHECK_FALSE(ready.last_error.has_value());
+    }
+
+    TEST_CASE("a null engine restarts its output device on request and keeps playing") {
+        PreviewOptions options;
+        options.backend = OutputBackend::Null;
+        auto created = PreviewEngine::create(options);
+        REQUIRE(created.has_value());
+        PreviewEngine& engine = **created;
+        CHECK_FALSE(engine.snapshot().output_device_lost);
+
+        open_and_wait_until_ready(engine, constant_source(0.25f));
+        play(engine);
+        wait_until(engine, [](const PreviewSnapshot& snapshot) { return snapshot.position_frames > 0; });
+        REQUIRE(engine.restart_output_device().has_value());
+        const std::int64_t restarted_at = engine.snapshot().position_frames;
+        CHECK(restarted_at > 0);  // never back to the beginning
+        const PreviewSnapshot after = wait_until(engine, [restarted_at](const PreviewSnapshot& snapshot) {
+            return snapshot.state == PreviewState::Playing && snapshot.position_frames > restarted_at;
+        });
+        CHECK(after.output_device_available);
+        CHECK_FALSE(after.output_device_lost);
+
+        auto offline = make_offline_engine();
+        CHECK(offline->restart_output_device().error().code == ErrorCode::InvalidArgument);
+        CHECK_FALSE(offline->snapshot().output_device_lost);
     }
 
     TEST_CASE("pause holds the position and play resumes from it") {

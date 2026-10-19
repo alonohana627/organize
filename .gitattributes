@@ -16,3 +16,5 @@ deps/manifest.json text eol=lf
 deps/update_deps.py text eol=lf
 deps/miniaudio_impl.c text eol=lf
 deps/.clang-format text eol=lf
+# Fuzz seed corpora are raw inputs (binary and text alike): never convert their bytes.
+tests/fuzz/corpus/** -text

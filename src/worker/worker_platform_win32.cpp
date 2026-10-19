@@ -10,7 +10,10 @@
 #include <atomic>
 #include <format>
 #include <mutex>
+#include <span>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "mso/worker/detail/worker_platform.hpp"
 
@@ -221,9 +224,9 @@ public:
     LPPROC_THREAD_ATTRIBUTE_LIST list() { return reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage_.data()); }
 
 private:
-    std::vector<HANDLE> handles_;
-    std::vector<std::byte> storage_;
-    bool initialized_ = false;
+    std::vector<HANDLE> handles_;     ///< referenced by the attribute list, so owned here
+    std::vector<std::byte> storage_;  ///< the opaque PROC_THREAD_ATTRIBUTE_LIST
+    bool initialized_ = false;        ///< DeleteProcThreadAttributeList is due
 };
 
 /// Quoted executable followed by the flags (and --self-test when requested). Flags are single
@@ -361,7 +364,7 @@ std::uint32_t current_process_id() noexcept {
 }
 
 std::filesystem::path default_worker_executable() {
-    constexpr std::size_t kLongestPath = 32768;
+    constexpr std::size_t kLongestPath = 32768;  ///< Win32 extended-length path limit in UTF-16 units
     std::wstring module_path(MAX_PATH, L'\0');
     while (module_path.size() <= kLongestPath) {
         const DWORD length = GetModuleFileNameW(nullptr, module_path.data(), static_cast<DWORD>(module_path.size()));

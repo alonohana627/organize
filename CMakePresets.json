@@ -38,10 +38,30 @@
       }
     },
     {
+      "name": "fuzz",
+      "displayName": "libFuzzer targets (optimized + AddressSanitizer + UndefinedBehaviorSanitizer, -Werror)",
+      "description": "Builds only the libraries and the fuzz targets in tests/fuzz (no tests, no desktop app). Run them with tools/run_fuzzers.py.",
+      "inherits": "clang-libcxx-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "MSO_SANITIZERS": "address;undefined",
+        "MSO_BUILD_FUZZERS": "ON",
+        "MSO_BUILD_TESTS": "OFF",
+        "MSO_BUILD_GUI": "OFF",
+        "MSO_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
       "name": "ci",
       "displayName": "CI: release; Qt GUI and FFmpeg required",
       "inherits": "release",
       "cacheVariables": { "MSO_REQUIRE_GUI": "ON", "MSO_REQUIRE_FFMPEG": "ON" }
+    },
+    {
+      "name": "ci-debug",
+      "displayName": "CI: debug (libc++ debug hardening) with -Werror; Qt GUI and FFmpeg required",
+      "inherits": "debug",
+      "cacheVariables": { "MSO_WARNINGS_AS_ERRORS": "ON", "MSO_REQUIRE_GUI": "ON", "MSO_REQUIRE_FFMPEG": "ON" }
     },
     {
       "name": "ci-sanitize",
@@ -54,7 +74,9 @@
     { "name": "debug", "configurePreset": "debug" },
     { "name": "release", "configurePreset": "release" },
     { "name": "sanitize", "configurePreset": "sanitize" },
+    { "name": "fuzz", "configurePreset": "fuzz", "targets": ["fuzzers"] },
     { "name": "ci", "configurePreset": "ci" },
+    { "name": "ci-debug", "configurePreset": "ci-debug" },
     { "name": "ci-sanitize", "configurePreset": "ci-sanitize" }
   ],
   "testPresets": [
@@ -69,6 +91,7 @@
     { "name": "release", "inherits": "test-base", "configurePreset": "release" },
     { "name": "sanitize", "inherits": "test-base", "configurePreset": "sanitize" },
     { "name": "ci", "inherits": "test-base", "configurePreset": "ci" },
+    { "name": "ci-debug", "inherits": "test-base", "configurePreset": "ci-debug" },
     { "name": "ci-sanitize", "inherits": "test-base", "configurePreset": "ci-sanitize" }
   ]
 }

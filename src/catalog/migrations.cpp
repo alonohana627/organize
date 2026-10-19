@@ -263,6 +263,24 @@ CREATE INDEX jobs_sample ON jobs(sample_id,state);
 CREATE INDEX command_receipts_state ON command_receipts(state,updated_at);
 )SQL";
 
+// Second review round (2026-10-19). Leasing walks `jobs_ready` in lease order (oldest run, priority,
+// id) instead of sorting every queued job per lease. Paused runs keep their unfinished jobs in the
+// `paused` state, so they leave that index; runs that were paused before this build are converted,
+// and paused runs with nothing left to do settle. finish_scan finds a scan's gaps through
+// `scan_frontier_state`; `directory_key` is the gap directory's path key, so a denied subtree is
+// matched by key on case-insensitive roots (NULL for rows written before this migration).
+static constexpr std::string_view kMigration6 = R"SQL(
+CREATE INDEX jobs_ready ON jobs(run_id,priority DESC,id) WHERE state IN ('queued','interrupted');
+CREATE INDEX scan_frontier_state ON scan_frontier(scan_id,state);
+ALTER TABLE scan_frontier ADD COLUMN directory_key TEXT;
+UPDATE jobs SET state='paused' WHERE state IN ('queued','interrupted')
+ AND run_id IN (SELECT id FROM analysis_runs WHERE state='paused');
+UPDATE analysis_runs SET state=CASE WHEN EXISTS(SELECT 1 FROM jobs WHERE jobs.run_id=analysis_runs.id
+ AND jobs.state='failed') THEN 'completed_with_errors' ELSE 'completed' END
+ WHERE state='paused' AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.run_id=analysis_runs.id
+ AND jobs.state IN ('queued','running','blocked','interrupted','paused'));
+)SQL";
+
 const std::vector<Migration>& migrations() {
     static const std::vector<Migration> list = [] {
         std::vector<Migration> shipped{
@@ -271,6 +289,7 @@ const std::vector<Migration>& migrations() {
             {3, "file operations, duplicate edges", kMigration3, {}},
             {4, "index for missing-location lookups", kMigration4, {}},
             {5, "history state, job sample and receipt indexes", kMigration5, {}},
+            {6, "ready-job and scan-gap indexes, paused jobs, gap directory keys", kMigration6, {}},
         };
         for (auto& migration : shipped) {
             // Hash with LF line ends whatever the checkout did, so a CRLF working copy can never

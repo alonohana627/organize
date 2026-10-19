@@ -16,7 +16,8 @@
 define_property(GLOBAL PROPERTY MSO_MODULES BRIEF_DOCS "Declared first-party modules")
 
 # Records the modules `module` builds on (for the include-graph check) without creating a target.
-# Used directly for executables (ui, worker) and by mso_module() for libraries.
+# Used directly for the desktop application (ui, whose Qt target is created separately) and by
+# mso_module() for libraries.
 function(mso_declare_module module)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "" "" "MODULES")
   set_property(GLOBAL APPEND PROPERTY MSO_MODULES ${module})

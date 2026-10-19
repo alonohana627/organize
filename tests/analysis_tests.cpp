@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "mso/analysis/analysis.hpp"
+#include "mso/analysis/byte_hash.hpp"
 #include "mso/analysis/chroma_accumulator.hpp"
 #include "mso/analysis/decoded_stream_analysis.hpp"
 #include "mso/analysis/key_estimator.hpp"
@@ -666,8 +667,8 @@ TEST_SUITE("analysis") {
 
         MemoryDecoder decoder(stereo, 2, kSampleRate);
         ProgressReporter reporter{ProgressCallback{}};
-        AnalysisRequest request = request_for({Stage::Waveform, Stage::Loudness, Stage::Tempo, Stage::Key,
-                                               Stage::PcmHash, Stage::ByteHash, Stage::Waveform});
+        AnalysisRequest request =
+            request_for({Stage::Waveform, Stage::Loudness, Stage::Tempo, Stage::Key, Stage::PcmHash, Stage::ByteHash});
         request.waveform_bins = 100;
         const Result<AnalysisReport> report =
             analyze_decoded_stream(decoder, request, {}, ProgressPhase(reporter, 0, 1));
@@ -1172,6 +1173,48 @@ TEST_SUITE("analysis") {
         AnalysisRequest request = request_for({Stage::ByteHash});
         request.file = directory.path();
         CHECK(error_code(analyze_file(request, {})) == ErrorCode::InvalidArgument);
+    }
+
+    TEST_CASE("a request that lists a stage twice is refused, as the worker protocol refuses it") {
+        AnalysisRequest request = request_for({Stage::Loudness, Stage::Key, Stage::Loudness});
+        const auto refused = validate_request(request);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ErrorCode::InvalidArgument);
+        CHECK(refused.error().safe_detail.find("loudness") != std::string::npos);
+
+        MemoryDecoder decoder(std::vector<float>(100, 0.1F), 1, 44100);
+        ProgressReporter reporter{ProgressCallback{}};
+        CHECK(error_code(analyze_decoded_stream(decoder, request, {}, ProgressPhase(reporter, 0, 1))) ==
+              ErrorCode::InvalidArgument);
+        CHECK(error_code(analyze_file(request, {})) == ErrorCode::InvalidArgument);
+
+        request.stages = {Stage::Loudness, Stage::Key};
+        CHECK(validate_request(request).has_value());
+    }
+
+    TEST_CASE("byte hashing tells a missing file from one whose existence cannot be checked") {
+        ScratchDirectory directory("analysis-byte-hash");
+        ProgressReporter reporter{ProgressCallback{}};
+        const ProgressPhase phase(reporter, 0, 1);
+
+        const auto missing = hash_file_bytes(directory.file("missing.bin"), 0, {}, phase);
+        REQUIRE_FALSE(missing.has_value());
+        CHECK(missing.error().code == ErrorCode::FileMissing);
+        CHECK_FALSE(missing.error().retryable);
+
+        // When the existence check itself fails, the file is unreachable, not known to be gone, so
+        // the failure is the retryable SOURCE_OFFLINE. Windows: a share that does not exist on the
+        // local SMB server (ERROR_BAD_NET_NAME, answered locally in milliseconds, like a share that
+        // went offline). POSIX: a name longer than any file system allows (ENAMETOOLONG).
+#ifdef _WIN32
+        const std::filesystem::path unreachable_file(L"//127.0.0.1/mso-no-such-share/sample.bin");
+#else
+        const auto unreachable_file = directory.file(std::string(300, 'n') + ".bin");
+#endif
+        const auto unreachable = hash_file_bytes(unreachable_file, 0, {}, phase);
+        REQUIRE_FALSE(unreachable.has_value());
+        CHECK(unreachable.error().code == ErrorCode::SourceOffline);
+        CHECK(unreachable.error().retryable);
     }
 
 }  // TEST_SUITE

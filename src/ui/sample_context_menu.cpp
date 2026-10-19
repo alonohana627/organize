@@ -19,46 +19,59 @@ SampleContextMenu::SampleContextMenu(ApplicationSession& session, SampleMenuComm
     : QObject(parent_widget), session_(session), commands_(commands), parent_widget_(parent_widget) {}
 
 void SampleContextMenu::show(const QPoint& global_position, const std::vector<search::SampleRow>& selection,
-                             const search::SampleRow& clicked) {
+                             std::size_t total_selected, search::SampleRow clicked) {
     if (selection.empty()) return;
+    const std::unique_ptr<QMenu> menu = build_menu(selection, total_selected, clicked);
+    menu->exec(global_position);
+}
+
+std::unique_ptr<QMenu> SampleContextMenu::build_menu(const std::vector<search::SampleRow>& selection,
+                                                     std::size_t total_selected, const search::SampleRow& clicked) {
     std::vector<SampleKey> keys;
     bool all_available = true;
     for (const auto& sample : selection) {
         keys.push_back({sample.library, sample.sample_id});
         all_available = all_available && sample.availability == search::RowAvailability::Available;
     }
+    const bool whole_selection_loaded = total_selected <= selection.size();
     const SampleKey clicked_key{clicked.library, clicked.sample_id};
     const bool clicked_available = clicked.availability == search::RowAvailability::Available;
     const QString unavailable_reason = tr("Unavailable: the source folder is offline or the file is missing");
+    const QString unloaded_reason = tr("Some selected samples are not loaded; select fewer samples to copy them all");
     const auto count = static_cast<int>(selection.size());
 
-    QMenu menu(parent_widget_);
-    menu.setToolTipsVisible(true);
-    menu.addAction(commands_.play);
-    menu.addSeparator();
+    auto menu = std::make_unique<QMenu>(parent_widget_);
+    menu->setToolTipsVisible(true);
+    menu->addAction(commands_.play);
+    menu->addSeparator();
     QAction* reveal_action =
-        menu.addAction(FileManager::reveal_action_text(), this, [this, clicked_key] { reveal(clicked_key); });
+        menu->addAction(FileManager::reveal_action_text(), this, [this, clicked_key] { reveal(clicked_key); });
+    reveal_action->setEnabled(clicked_available);
+    if (!clicked_available) reveal_action->setToolTip(unavailable_reason);
     QAction* copy_path_action =
-        menu.addAction(tr("Copy %n path(s)", nullptr, count), this, [this, keys] { copy_paths(keys); });
+        menu->addAction(tr("Copy %n path(s)", nullptr, count), this, [this, keys] { copy_paths(keys); });
     QAction* copy_file_action =
-        menu.addAction(tr("Copy %n file(s)", nullptr, count), this, [this, keys] { copy_files(keys); });
-    for (QAction* action : {reveal_action, copy_path_action, copy_file_action}) {
-        const bool enabled = action == reveal_action ? clicked_available : all_available;
-        action->setEnabled(enabled);
-        if (!enabled) action->setToolTip(unavailable_reason);
+        menu->addAction(tr("Copy %n file(s)", nullptr, count), this, [this, keys] { copy_files(keys); });
+    for (QAction* action : {copy_path_action, copy_file_action}) {
+        // Copying only the loaded part of the selection would silently leave samples out.
+        action->setEnabled(all_available && whole_selection_loaded);
+        if (!whole_selection_loaded)
+            action->setToolTip(unloaded_reason);
+        else if (!all_available)
+            action->setToolTip(unavailable_reason);
     }
-    menu.addSeparator();
-    QMenu* rating = menu.addMenu(tr("Rating"));
+    menu->addSeparator();
+    QMenu* rating = menu->addMenu(tr("Rating"));
     for (QAction* action : commands_.ratings)
         rating->addAction(action);
-    menu.addAction(commands_.toggle_favorite);
-    QMenu* analysis = menu.addMenu(tr("Analyze"));
+    menu->addAction(commands_.toggle_favorite);
+    QMenu* analysis = menu->addMenu(tr("Analyze"));
     analysis->addAction(commands_.analyze_waveforms);
     analysis->addAction(commands_.analyze_musical);
     analysis->addAction(commands_.analyze_duplicates);
-    menu.addSeparator();
-    menu.addAction(commands_.remove_from_library);
-    menu.exec(global_position);
+    menu->addSeparator();
+    menu->addAction(commands_.remove_from_library);
+    return menu;
 }
 
 void SampleContextMenu::resolve_paths(const std::vector<SampleKey>& keys,

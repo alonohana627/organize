@@ -37,7 +37,7 @@ public:
     void add(std::span<const float> interleaved_samples);
 
     /// Finalizes and returns the lowercase hex digest. The hasher must not be used afterwards.
-    std::string finish();
+    [[nodiscard]] std::string finish();
 
 private:
     class Digest;  ///< the picosha2 streaming state

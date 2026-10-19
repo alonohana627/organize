@@ -15,6 +15,8 @@ namespace mso::analysis {
 /// regardless of the frame size. The FFT plan (factorization and twiddle factors) and every
 /// buffer are built once in the constructor and reused frame after frame; the only per-frame
 /// allocation left is the one scratch array pocketfft's real transform allocates internally.
+/// Removing it would need a recorded patch to vendored pocketfft; one small aligned allocation per
+/// frame costs far less than the transform it serves, so it is kept.
 class MagnitudeSpectrum {
 public:
     /// @param frame_size samples per frame; values below 2 are raised to 2.
@@ -41,20 +43,20 @@ public:
 private:
     class Plan;  ///< the pocketfft real-transform plan, kept out of this header
 
-    std::unique_ptr<Plan> plan_;
-    std::vector<float> window_;
+    std::unique_ptr<Plan> plan_;           ///< built once per frame size
+    std::vector<float> window_;            ///< periodic Hann window, frame_size() samples
     std::vector<float> transform_buffer_;  ///< windowed input, then pocketfft's packed half-complex output
-    std::vector<float> magnitudes_;
-    float normalization_ = 1.0F;
+    std::vector<float> magnitudes_;        ///< what compute() returns: bin_count() values
+    float normalization_ = 1.0F;           ///< 2 / sum(window), so a full-scale sine reads about 1.0
 };
 
 /// Biased autocorrelation sum(x[n] * x[n + lag]) for lags 0 .. signal.size()-1, computed with a
 /// zero-padded FFT so it costs O(n log n) instead of O(n^2). Called once per tempo estimate, so
 /// it builds its plan per call.
-std::vector<double> autocorrelation(std::span<const double> signal);
+[[nodiscard]] std::vector<double> autocorrelation(std::span<const double> signal);
 
 /// Power of two closest (in log terms) to `target`, clamped to [minimum, maximum]. Returns
 /// `minimum` for a target that is not above 1 (including NaN).
-std::size_t nearest_power_of_two(double target, std::size_t minimum, std::size_t maximum) noexcept;
+[[nodiscard]] std::size_t nearest_power_of_two(double target, std::size_t minimum, std::size_t maximum) noexcept;
 
 }  // namespace mso::analysis

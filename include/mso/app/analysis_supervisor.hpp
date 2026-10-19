@@ -13,14 +13,17 @@
 /// cancelled (the worker client terminates the process if the cancel is not acknowledged) and the
 /// job is failed as retryable. The lease is not renewed while a cancel is pending. A worker that cannot be started is
 /// retried with exponential backoff; a missing worker executable pauses the queue at once and is reported through
-/// status().
+/// status(). A library that is being closed is abandoned: its running job is cancelled and returned to its queue,
+/// so the supervisor never keeps a closed library (and its lock) alive.
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -30,13 +33,16 @@
 
 namespace mso::app {
 
+/// Runs the durable analysis queue of the open libraries through mso-worker (see the file comment).
 class AnalysisSupervisor {
 public:
     /// Supplies the libraries to serve and resolves a sample's playable path; receives progress
     /// and errors. Called on the supervisor thread.
     struct Hooks {
         std::function<std::vector<std::shared_ptr<catalog::Library>>()> libraries;
-        std::function<Result<std::filesystem::path>(catalog::Library&, std::int64_t sample_id)> resolve_path;
+        /// The playable file of a sample whose catalog detail was just read.
+        std::function<Result<std::filesystem::path>(catalog::Library&, const catalog::SampleDetail& sample)>
+            resolve_path;
         std::function<void(catalog::Library&, const std::string& worker_status)> on_progress;
         /// A catalog transition or worker step failed; `context` says which.
         std::function<void(catalog::Library*, const std::string& context, const Error& error)> on_error;
@@ -72,12 +78,20 @@ public:
     AnalysisSupervisor(const AnalysisSupervisor&) = delete;
     AnalysisSupervisor& operator=(const AnalysisSupervisor&) = delete;
 
-    /// Pauses or resumes leasing. Resuming clears a worker-unavailable state and the backoff.
+    /// Pauses or resumes leasing. Resuming clears a worker-unavailable state and ends a backoff wait.
     void set_paused(bool paused);
+    /// True while leasing is paused.
     bool paused() const { return paused_.load(); }
+    /// The current queue state.
     Status status() const;
-    /// Wakes the loop immediately (after a new run was created or resumed).
+    /// Wakes the idle loop immediately (after a new run was created or resumed). A backoff wait
+    /// after worker start failures is not cut short by this; only resuming does that.
     void notify();
+    /// Stops serving a library that is being closed: no new job of it is leased, and its running
+    /// job is cancelled and returned to the queue within one event poll.
+    void abandon_library(const uuids::uuid& library);
+    /// Serves a library again (it was opened again after abandon_library()).
+    void serve_library(const uuids::uuid& library);
 
 private:
     void run(std::stop_token stop);
@@ -90,6 +104,10 @@ private:
                                std::stop_token stop);
     /// Reports a failed catalog transition through Hooks::on_error.
     void report(catalog::Library* library, const std::string& context, const Result<void>& outcome) const;
+    /// Reports a failed lease once per distinct message and library (the loop retries every pass).
+    void report_lease_error(catalog::Library& library, const Error& error);
+    /// True when `library` was abandoned (being closed).
+    bool abandoned(const catalog::Library& library) const;
     void set_detail(std::string detail);
 
     std::filesystem::path worker_executable_;
@@ -102,7 +120,12 @@ private:
     std::string detail_;
     std::mutex wake_mutex_;
     std::condition_variable_any wake_;
-    bool wake_requested_ = false;
+    bool wake_requested_ = false;   ///< notify(): ends an idle wait
+    bool retry_requested_ = false;  ///< resume: ends a backoff wait too
+    mutable std::mutex libraries_mutex_;
+    std::set<uuids::uuid> abandoned_;  ///< libraries being closed
+    /// Last lease error reported per library (cleared by a successful lease).
+    std::map<uuids::uuid, std::string> last_lease_errors_;
     struct WorkerSlot;
     std::unique_ptr<WorkerSlot> worker_;
     std::jthread thread_;  ///< last member: started after everything above exists

@@ -79,12 +79,22 @@ std::int64_t FfmpegInput::seek(void* opaque, std::int64_t offset, int whence) {
     return target;
 }
 
+int FfmpegInput::deadline_passed(void* opaque) {
+    return static_cast<const FfmpegInput*>(opaque)->past_deadline() ? 1 : 0;
+}
+
+bool FfmpegInput::past_deadline() const noexcept {
+    return deadline_ && std::chrono::steady_clock::now() >= *deadline_;
+}
+
 Result<std::unique_ptr<FfmpegInput>> FfmpegInput::open(ReadAtFunction read_at, std::uint64_t size,
-                                                       std::int64_t probe_bytes) {
+                                                       std::int64_t probe_bytes,
+                                                       std::optional<std::chrono::steady_clock::time_point> deadline) {
     // Failures are reported through Result; FFmpeg must not write to the console of a GUI app.
     static std::once_flag logging_silenced;
     std::call_once(logging_silenced, [] { av_log_set_level(AV_LOG_QUIET); });
     std::unique_ptr<FfmpegInput> input(new FfmpegInput(std::move(read_at), size));
+    input->deadline_ = deadline;
     auto* buffer = static_cast<unsigned char*>(av_malloc(kIoBufferSize));
     if (buffer == nullptr) return fail(ErrorCode::ResourceLimit, "cannot allocate FFmpeg I/O buffer");
     input->io_ = avio_alloc_context(buffer, kIoBufferSize, 0, input.get(), &FfmpegInput::read_packet, nullptr,
@@ -99,6 +109,7 @@ Result<std::unique_ptr<FfmpegInput>> FfmpegInput::open(ReadAtFunction read_at, s
     input->format_->flags |= AVFMT_FLAG_CUSTOM_IO;
     input->format_->io_open = &refuse_nested_open;
     input->format_->probesize = std::max<std::int64_t>(probe_bytes, 32);
+    if (deadline) input->format_->interrupt_callback = AVIOInterruptCB{&FfmpegInput::deadline_passed, input.get()};
 
     AVDictionary* options = nullptr;
     av_dict_set(&options, "protocol_whitelist", "file", 0);
@@ -108,6 +119,8 @@ Result<std::unique_ptr<FfmpegInput>> FfmpegInput::open(ReadAtFunction read_at, s
     if (status < 0) {
         input->format_ = nullptr;  // freed by avformat_open_input on failure
         if (input->read_error_) return std::unexpected(*input->read_error_);
+        if (status == AVERROR_EXIT || input->past_deadline())
+            return fail(ErrorCode::ProbeLimit, "probe time limit reached");
         if (status == AVERROR_INVALIDDATA) return fail(ErrorCode::UnsupportedCodec, "not a recognised audio file");
         return fail(ErrorCode::CorruptAudio,
                     std::format("FFmpeg could not open the file: {}", ffmpeg_error_text(status)));
@@ -120,6 +133,7 @@ Result<std::unique_ptr<FfmpegInput>> FfmpegInput::open(ReadAtFunction read_at, s
 Result<void> FfmpegInput::find_stream_info() {
     const int status = avformat_find_stream_info(format_, nullptr);
     if (read_error_) return std::unexpected(*read_error_);
+    if (status == AVERROR_EXIT || past_deadline()) return fail(ErrorCode::ProbeLimit, "probe time limit reached");
     if (status < 0) {
         return fail(ErrorCode::CorruptAudio,
                     std::format("FFmpeg could not analyse the streams: {}", ffmpeg_error_text(status)));

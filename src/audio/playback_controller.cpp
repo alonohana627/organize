@@ -7,7 +7,7 @@
 #include <new>
 
 #include "mso/audio/detail/denormal_flush.hpp"
-#include "mso/audio/detail/overloaded.hpp"
+#include "mso/domain/overloaded.hpp"
 
 namespace mso::audio::detail {
 namespace {
@@ -36,15 +36,22 @@ PlaybackController::~PlaybackController() {
     thread_.join();
 }
 
-void PlaybackController::request_source(std::uint64_t generation, SourceOrigin origin) {
+std::uint64_t PlaybackController::request_source(SourceOrigin origin) {
     std::optional<SourceRequest> superseded;
+    std::uint64_t generation = 0;
     {
-        const std::scoped_lock lock(request_mutex_);
+        const std::scoped_lock lock(request_mutex_);  // the only step that can throw
+        // Published under the lock, after the request is in place: the decoder thread adopts the
+        // request and its generation together, and a failed hand-off never leaves a generation
+        // "loading" forever. Moving the request in cannot throw.
+        generation = shared_.requested_generation.load(std::memory_order_relaxed) + 1;
         superseded = std::move(pending_request_);
         pending_request_ = SourceRequest{generation, std::move(origin)};
+        shared_.requested_generation.store(generation, std::memory_order_release);
     }
     superseded.reset();  // a superseded decoder may close a file: never under the lock
     wakeup_.notify();
+    return generation;
 }
 
 // ---------------------------------------------------------------- thread body
@@ -61,6 +68,9 @@ void PlaybackController::run(std::stop_token stop) {
         } catch (const std::bad_alloc&) {
             fail_from_exception(ErrorCode::ResourceLimit);
         } catch (const std::exception&) {
+            fail_from_exception(ErrorCode::Internal);
+        } catch (...) {
+            // Final barrier: a decoder or library may throw anything; the thread must survive it.
             fail_from_exception(ErrorCode::Internal);
         }
     }
@@ -81,9 +91,12 @@ bool PlaybackController::run_pass() {
 void PlaybackController::fail_from_exception(ErrorCode code) noexcept {
     // The exception's message is not kept: copying it could throw again. The code says what happened.
     fail_source(code);
-    // A request that threw while being opened must not leave the snapshot in Loading forever.
-    shared_.active_generation.store(shared_.requested_generation.load(std::memory_order_acquire),
-                                    std::memory_order_release);
+    // A request that threw while being opened must not leave the snapshot in Loading forever. Only
+    // that request is settled: a newer one still waiting keeps loading and is adopted next pass.
+    if (adopting_generation_) {
+        shared_.active_generation.store(*adopting_generation_, std::memory_order_release);
+        adopting_generation_.reset();
+    }
 }
 
 // ---------------------------------------------------------------- sources
@@ -97,6 +110,7 @@ void PlaybackController::adopt_requested_source() {
     if (!request) {
         return;
     }
+    adopting_generation_ = request->generation;
 
     set_output_enabled(false);
     stream_.reset();
@@ -122,6 +136,7 @@ void PlaybackController::adopt_requested_source() {
         set_state(PreviewState::Error);
     }
     shared_.active_generation.store(request->generation, std::memory_order_release);
+    adopting_generation_.reset();
 }
 
 Result<std::unique_ptr<SourceStream>> PlaybackController::open_stream(SourceOrigin origin) {
@@ -178,7 +193,10 @@ void PlaybackController::follow_output_device() {
     }
     seen_output_configuration_ = configuration;
     output_rate_ = shared_.output_facts.load().sample_rate;
-    restart_at(audible_frame());  // re-render for the new rate from the audible position
+    // The old device's buffer is not heard on the new one: re-render from the audible position.
+    restart_at(audible_frame());
+    // Taken with every configuration, so a request made while nothing was lost never lingers.
+    const bool resume = shared_.resume_on_restore.exchange(false, std::memory_order_acq_rel);
     if (state_before_device_loss_ && !shared_.device_lost.load(std::memory_order_acquire)) {
         const PreviewState previous = *state_before_device_loss_;
         state_before_device_loss_.reset();
@@ -186,8 +204,11 @@ void PlaybackController::follow_output_device() {
             shared_.last_error.store(std::nullopt);
         }
         if (stream_) {
-            // Never resume by itself on a new endpoint: playback comes back paused where it was.
+            // Never resume by itself on a new endpoint: playback comes back paused where it was...
             set_state(previous == PreviewState::Playing ? PreviewState::Paused : previous);
+            if (resume && previous == PreviewState::Playing) {
+                play();  // ...unless restart_output_device() asked for the transport exactly as it was
+            }
         }
     }
 }
@@ -273,7 +294,7 @@ void PlaybackController::set_loop(const std::optional<LoopRegion>& region) {
         return;  // nothing changes: keep the buffered audio
     }
     shape_.loop = requested;
-    restart_at(audible_frame());
+    reshape();
 }
 
 void PlaybackController::set_speed(double ratio) {
@@ -282,7 +303,7 @@ void PlaybackController::set_speed(double ratio) {
         return;
     }
     shape_.speed_permille = speed_permille;
-    restart_at(audible_frame());
+    reshape();
 }
 
 void PlaybackController::set_pitch(double semitones) {
@@ -292,7 +313,7 @@ void PlaybackController::set_pitch(double semitones) {
     }
     shape_.pitch_semitones = pitch;
     if (shape_.mode == PlaybackMode::IndependentTempoPitch) {
-        restart_at(audible_frame());  // Varispeed keeps the setting for later without touching audio
+        reshape();  // Varispeed keeps the setting for later without touching audio
     }
 }
 
@@ -302,7 +323,7 @@ void PlaybackController::set_playback_mode(PlaybackMode mode) {
         return;
     }
     shape_.mode = mode;
-    restart_at(audible_frame());
+    reshape();
 }
 
 void PlaybackController::set_seam_fades(bool enabled) {
@@ -311,7 +332,7 @@ void PlaybackController::set_seam_fades(bool enabled) {
     }
     shape_.seam_fades = enabled;
     if (shape_.loop) {
-        restart_at(audible_frame());  // only loop seams are affected
+        reshape();  // only loop seams are affected
     }
 }
 
@@ -356,7 +377,7 @@ bool PlaybackController::produce() {
         const bool end_of_stream = slot->header->end_of_stream;
         produced_frames_ += slot->header->frame_count;
         ring_.commit_write();
-        shared_.epoch_produced_frames.store(produced_frames_, std::memory_order_release);
+        shared_.production.store(EpochProduction{gate_.epoch, produced_frames_});
         if (end_of_stream) {
             end_of_stream_written_ = true;
             return false;
@@ -376,11 +397,18 @@ void PlaybackController::restart_at(std::int64_t source_frame) {
     begin_epoch(stream_->anchor_frame());
 }
 
+void PlaybackController::reshape() {
+    // The audio already handed to the device plays out in the old shape; the new shape continues
+    // exactly where it ends. Re-anchoring at the audible position instead would repeat the device
+    // buffer (40-60 ms) on every change, and changes faster than that would keep restarting.
+    restart_at(consumed_frame());
+}
+
 void PlaybackController::begin_epoch(std::int64_t start_frame) noexcept {
     ++gate_.epoch;
     produced_frames_ = 0;
     end_of_stream_written_ = false;
-    shared_.epoch_produced_frames.store(0, std::memory_order_relaxed);
+    shared_.production.store(EpochProduction{gate_.epoch, 0});
     shared_.epoch_start_frame.store(start_frame, std::memory_order_relaxed);
     shared_.transport_gate.store(gate_.packed(), std::memory_order_release);
 }
@@ -414,6 +442,14 @@ std::int64_t PlaybackController::audible_frame() const noexcept {
     const PlaybackProgress progress = shared_.progress.load();
     if (progress.audible_epoch == gate_.epoch) {
         return progress.audible_frame;
+    }
+    return shared_.epoch_start_frame.load(std::memory_order_relaxed);
+}
+
+std::int64_t PlaybackController::consumed_frame() const noexcept {
+    const PlaybackProgress progress = shared_.progress.load();
+    if (progress.consumed_epoch == gate_.epoch) {
+        return progress.consumed_position;
     }
     return shared_.epoch_start_frame.load(std::memory_order_relaxed);
 }

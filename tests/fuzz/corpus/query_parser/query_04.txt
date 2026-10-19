@@ -1,0 +1,1 @@
+format:flac rating:>=4 favorite:true

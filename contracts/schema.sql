@@ -214,6 +214,7 @@ CREATE TABLE scan_sessions (
 CREATE TABLE scan_frontier (
  scan_id INTEGER NOT NULL REFERENCES scan_sessions(id), relative_directory TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('queued','running','complete','denied','failed')),
+ directory_key TEXT,  -- path key of relative_directory for the root's case sensitivity (migration 6)
  PRIMARY KEY(scan_id,relative_directory)
 ) STRICT;
 CREATE TABLE catalog_outbox (
@@ -248,5 +249,12 @@ CREATE TRIGGER sample_search_au AFTER UPDATE ON sample_search BEGIN
  INSERT INTO sample_fts(rowid,name,path,tags,category,notes,embedded)
  VALUES(new.sample_id,new.name,new.path,new.tags,new.category,new.notes,new.embedded);
 END;
+-- Indexes added by later migrations (src/catalog/migrations.cpp, migrations 4-6).
+CREATE INDEX locations_missing_by_size ON locations(byte_size) WHERE state='missing';
+CREATE INDEX history_actions_state ON history_actions(state,id);
+CREATE INDEX jobs_sample ON jobs(sample_id,state);
+CREATE INDEX command_receipts_state ON command_receipts(state,updated_at);
+CREATE INDEX jobs_ready ON jobs(run_id,priority DESC,id) WHERE state IN ('queued','interrupted');
+CREATE INDEX scan_frontier_state ON scan_frontier(scan_id,state);
 PRAGMA user_version=1;
 COMMIT;

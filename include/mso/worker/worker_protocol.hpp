@@ -41,11 +41,13 @@ namespace mso::worker {
 
 // ---------------------------------------------------------------- protocol constants
 
+/// First four bytes of every frame.
 inline constexpr std::array<std::uint8_t, 4> kFrameMagic{'M', 'S', 'O', 'W'};
 /// Peers must agree on the major version; a minor bump only adds optional members.
 /// Minor 1 added Heartbeat::task_progress.
 inline constexpr std::uint16_t kProtocolMajor = 1;
-inline constexpr std::uint16_t kProtocolMinor = 1;
+inline constexpr std::uint16_t kProtocolMinor = 1;  ///< see kProtocolMajor
+/// Size of the fixed frame header (see the layout at the top of this file).
 inline constexpr std::size_t kFrameHeaderBytes = 20;
 /// Payloads above this are rejected from the header alone, before any allocation.
 inline constexpr std::uint32_t kMaximumPayloadBytes = 1024 * 1024;
@@ -76,7 +78,7 @@ public:
     virtual ~ByteSource() = default;
     /// Reads at least one byte into `destination` unless the stream ended, in which case it
     /// returns 0. Errors mean the channel is unusable.
-    virtual Result<std::size_t> read_some(std::span<std::uint8_t> destination) = 0;
+    [[nodiscard]] virtual Result<std::size_t> read_some(std::span<std::uint8_t> destination) = 0;
 };
 
 /// Blocking sink of bytes, such as a pipe. Implementations need not be thread-safe.
@@ -84,22 +86,30 @@ class ByteSink {
 public:
     virtual ~ByteSink() = default;
     /// Writes every byte or fails; a partial write leaves the channel unusable.
-    virtual Result<void> write_all(std::span<const std::uint8_t> bytes) = 0;
+    [[nodiscard]] virtual Result<void> write_all(std::span<const std::uint8_t> bytes) = 0;
 };
 
 /// Serializes one frame. Fails with INVALID_ARGUMENT when the payload exceeds kMaximumPayloadBytes.
-Result<std::vector<std::uint8_t>> encode_frame(std::uint64_t request_sequence, std::string_view payload);
+[[nodiscard]] Result<std::vector<std::uint8_t>> encode_frame(std::uint64_t request_sequence, std::string_view payload);
 
 /// Validates magic, protocol major and payload length of a raw header. Returns PARSE_ERROR for
 /// anything malformed, so an oversized length is refused before its payload is allocated.
-Result<FrameHeader> parse_frame_header(std::span<const std::uint8_t, kFrameHeaderBytes> bytes);
+[[nodiscard]] Result<FrameHeader> parse_frame_header(std::span<const std::uint8_t, kFrameHeaderBytes> bytes);
 
 /// Reads the next frame. Returns nullopt when the stream ends cleanly on a frame boundary and
 /// PARSE_ERROR for a garbled, oversized or truncated frame.
-Result<std::optional<Frame>> read_frame(ByteSource& source);
+[[nodiscard]] Result<std::optional<Frame>> read_frame(ByteSource& source);
+
+/// Decodes every frame in `bytes`, in order, through read_frame(), exactly as a peer would read
+/// them from its pipe: the whole buffer must be complete frames. PARSE_ERROR for the first garbled,
+/// oversized or truncated frame (a buffer that ends inside a frame included). The frame layer's
+/// entry point for fuzzing on raw bytes; a fuzz target passes each payload on to
+/// decode_supervisor_message() and decode_worker_message(). Payload memory is bounded by
+/// kMaximumPayloadBytes per frame.
+[[nodiscard]] Result<std::vector<Frame>> decode_frames(std::span<const std::uint8_t> bytes);
 
 /// Encodes and writes one frame.
-Result<void> write_frame(ByteSink& sink, std::uint64_t request_sequence, std::string_view payload);
+[[nodiscard]] Result<void> write_frame(ByteSink& sink, std::uint64_t request_sequence, std::string_view payload);
 
 // ---------------------------------------------------------------- messages: supervisor -> worker
 
@@ -179,7 +189,7 @@ struct TaskFence {
     std::string profile_digest;
 
     /// The fence of `task`.
-    static TaskFence of(const AnalyzeTask& task);
+    [[nodiscard]] static TaskFence of(const AnalyzeTask& task);
     bool operator==(const TaskFence&) const = default;
 };
 
@@ -213,7 +223,7 @@ struct TaskFailed {
     std::string safe_detail;
 
     /// The failure as an ordinary Error.
-    Error to_error() const;
+    [[nodiscard]] Error to_error() const;
 };
 
 /// Everything the supervisor sends.
@@ -225,36 +235,36 @@ using WorkerMessage = std::variant<Handshake, Heartbeat, Progress, TaskResult, T
 
 /// JSON payload of a message. INVALID_ARGUMENT for text that is not valid UTF-8 or a non-finite
 /// number, RESOURCE_LIMIT when memory runs out; no exception escapes.
-Result<std::string> encode_message(const SupervisorMessage& message);
+[[nodiscard]] Result<std::string> encode_message(const SupervisorMessage& message);
 /// JSON payload of a message; errors as for the supervisor overload.
-Result<std::string> encode_message(const WorkerMessage& message);
+[[nodiscard]] Result<std::string> encode_message(const WorkerMessage& message);
 
 /// Parses and validates a payload, including validate_task() for an AnalyzeTask. Every schema or
 /// range violation is PARSE_ERROR; no exception escapes.
-Result<SupervisorMessage> decode_supervisor_message(std::string_view payload);
+[[nodiscard]] Result<SupervisorMessage> decode_supervisor_message(std::string_view payload);
 /// Parses and validates a payload, including validate_result() for a TaskResult and the [0, 1]
 /// range of Progress. Every schema or range violation is PARSE_ERROR; no exception escapes.
-Result<WorkerMessage> decode_worker_message(std::string_view payload);
+[[nodiscard]] Result<WorkerMessage> decode_worker_message(std::string_view payload);
 
 /// Checks the invariants of a task (identities, bounds, stage list, output path). The worker
 /// applies it on receipt and the supervisor before sending. INVALID_ARGUMENT on violation.
-Result<void> validate_task(const AnalyzeTask& task);
+[[nodiscard]] Result<void> validate_task(const AnalyzeTask& task);
 
 /// Checks that every value of a result is in range: loudness levels, tempo within the reported
 /// BPM range, confidences in [0, 1], SHA-256 digests as 64 lowercase hex digits, non-negative
 /// counts and evidence, a bounded warning list, and a waveform segment whose header fields are
 /// consistent and whose byte length matches its bin count. The symmetric counterpart of
 /// validate_task(); INVALID_ARGUMENT on violation.
-Result<void> validate_result(const TaskResult& result);
+[[nodiscard]] Result<void> validate_result(const TaskResult& result);
 
 /// The analysis request a task describes.
-analysis::AnalysisRequest to_analysis_request(const AnalyzeTask& task);
+[[nodiscard]] analysis::AnalysisRequest to_analysis_request(const AnalyzeTask& task);
 
 /// The algorithm version of every analysis stage, keyed by stage name: what a worker built from
 /// this source tree reports in its handshake and what the supervisor requires.
-std::map<std::string, std::string> current_algorithm_versions();
+[[nodiscard]] std::map<std::string, std::string> current_algorithm_versions();
 
 /// Inverse of mso::to_string(ErrorCode).
-std::optional<ErrorCode> parse_error_code(std::string_view text) noexcept;
+[[nodiscard]] std::optional<ErrorCode> parse_error_code(std::string_view text) noexcept;
 
 }  // namespace mso::worker

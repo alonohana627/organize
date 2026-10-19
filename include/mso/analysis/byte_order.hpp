@@ -15,7 +15,7 @@ namespace mso::analysis {
 
 /// The `sizeof(T)` little-endian bytes of `value`.
 template <std::unsigned_integral T>
-constexpr std::array<std::uint8_t, sizeof(T)> little_endian_bytes(T value) noexcept {
+[[nodiscard]] constexpr std::array<std::uint8_t, sizeof(T)> little_endian_bytes(T value) noexcept {
     std::array<std::uint8_t, sizeof(T)> bytes{};
     for (std::size_t index = 0; index < sizeof(T); ++index)
         bytes[index] = static_cast<std::uint8_t>(value >> (8 * index));
@@ -39,7 +39,7 @@ void append_little_endian(std::vector<std::uint8_t>& bytes, T value) {
 
 /// Reads a little-endian value from exactly `sizeof(T)` bytes.
 template <std::unsigned_integral T>
-constexpr T load_little_endian(std::span<const std::uint8_t, sizeof(T)> source) noexcept {
+[[nodiscard]] constexpr T load_little_endian(std::span<const std::uint8_t, sizeof(T)> source) noexcept {
     T value = 0;
     for (std::size_t index = 0; index < sizeof(T); ++index)
         value = static_cast<T>(value | static_cast<T>(static_cast<T>(source[index]) << (8 * index)));

@@ -5,8 +5,8 @@
 #include <sstream>
 
 #include "mso/app/file_lock.hpp"
-#include "mso/app/json_fields.hpp"
 #include "mso/catalog/durable_file.hpp"
+#include "mso/domain/json_fields.hpp"
 
 #ifdef _WIN32
 #include <windows.h>  // GetEnvironmentVariableW
@@ -77,7 +77,31 @@ std::filesystem::path Workspace::default_directory() {
 }
 
 Workspace::Workspace(Workspace&& other) noexcept
-    : directory_(std::move(other.directory_)), document_(std::move(other.document_)) {}
+    : directory_(std::move(other.directory_)), document_(std::move(other.document_)), stamp_(other.stamp_) {}
+
+std::optional<Workspace::FileStamp> Workspace::current_stamp() const {
+    const auto file = directory_ / kFileName;
+    std::error_code error;
+    const auto write_time = std::filesystem::last_write_time(file, error);
+    if (error) return std::nullopt;
+    const auto size = std::filesystem::file_size(file, error);
+    if (error) return std::nullopt;
+    return FileStamp{write_time, size};
+}
+
+Result<bool> Workspace::reload_if_changed() {
+    std::lock_guard lock(mutex_);
+    const auto stamp = current_stamp();
+    if (!stamp || stamp == stamp_) return false;
+    // The file is replaced by an atomic rename, so it can be read without the inter-process lock.
+    Document latest;
+    auto state = read_file(latest);
+    if (!state) return std::unexpected(state.error());
+    if (*state != FileState::Readable) return false;
+    document_ = std::move(latest);
+    stamp_ = stamp;
+    return true;
+}
 
 Result<Workspace::FileState> Workspace::read_file(Document& document) const {
     const auto file = directory_ / kFileName;
@@ -92,31 +116,31 @@ Result<Workspace::FileState> Workspace::read_file(Document& document) const {
     contents << in.rdbuf();
     const auto parsed = nlohmann::json::parse(contents.str(), nullptr, false);
     if (parsed.is_discarded() || !parsed.is_object()) return FileState::Unreadable;
-    const auto version = integer_field(parsed, "version");
+    const auto version = json_fields::integer_field(parsed, "version");
     if (!version) return FileState::Unreadable;
     if (*version > kVersion) return FileState::Newer;
 
     Document read;
-    if (const auto* libraries = array_field(parsed, "libraries")) {
+    if (const auto* libraries = json_fields::array_field(parsed, "libraries")) {
         for (const auto& entry : *libraries) {
-            const auto uuid = uuids::uuid::from_string(string_field(entry, "uuid").value_or(""));
-            const auto directory = string_field(entry, "directory");
+            const auto uuid = uuids::uuid::from_string(json_fields::string_field(entry, "uuid").value_or(""));
+            const auto directory = json_fields::string_field(entry, "directory");
             if (!uuid || !directory) continue;  // wrong shape: skip the entry, keep the rest
-            read.libraries.push_back(KnownLibrary{*uuid, string_field(entry, "name").value_or(""),
+            read.libraries.push_back(KnownLibrary{*uuid, json_fields::string_field(entry, "name").value_or(""),
                                                   path_from_utf8(*directory),
-                                                  boolean_field(entry, "open").value_or(false)});
+                                                  json_fields::boolean_field(entry, "open").value_or(false)});
         }
     }
-    if (const auto* bindings = array_field(parsed, "root_bindings")) {
+    if (const auto* bindings = json_fields::array_field(parsed, "root_bindings")) {
         for (const auto& entry : *bindings) {
-            const auto library = uuids::uuid::from_string(string_field(entry, "library").value_or(""));
-            const auto root = uuids::uuid::from_string(string_field(entry, "root").value_or(""));
-            const auto path = string_field(entry, "path");
+            const auto library = uuids::uuid::from_string(json_fields::string_field(entry, "library").value_or(""));
+            const auto root = uuids::uuid::from_string(json_fields::string_field(entry, "root").value_or(""));
+            const auto path = json_fields::string_field(entry, "path");
             if (!library || !root || !path) continue;
             read.bindings.push_back(RootBinding{*library, *root, path_from_utf8(*path)});
         }
     }
-    if (const auto* preferences = object_field(parsed, "preferences")) read.preferences = *preferences;
+    if (const auto* preferences = json_fields::object_field(parsed, "preferences")) read.preferences = *preferences;
     document = std::move(read);
     return FileState::Readable;
 }
@@ -134,6 +158,7 @@ Result<Workspace> Workspace::load(const std::filesystem::path& directory) {
     if (!lock) return std::unexpected(lock.error());
     auto state = workspace.read_file(workspace.document_);
     if (!state) return std::unexpected(state.error());
+    if (*state == FileState::Readable) workspace.stamp_ = workspace.current_stamp();
     if (*state == FileState::Unreadable || *state == FileState::Newer) {
         // Never block start-up on a damaged or newer workspace file: keep it aside, start fresh.
         // The renamed copy keeps every byte, so nothing written by a newer version is lost.
@@ -159,14 +184,17 @@ Result<void> Workspace::update(const std::function<bool(Document&)>& change) {
         return fail(ErrorCode::SchemaTooNew, "workspace.json was rewritten by a newer version of the application");
     if (!change(latest)) {
         document_ = std::move(latest);
+        if (*state == FileState::Readable) stamp_ = current_stamp();
         return {};
     }
-    const std::string text = dump_json(serialize(latest.libraries, latest.bindings, latest.preferences), 2);
+    const std::string text =
+        json_fields::dump_json(serialize(latest.libraries, latest.bindings, latest.preferences), 2);
     // Uniquely named temporary sibling, flushed to stable storage, renamed over the file, directory
     // entry flushed (POSIX): a crash leaves either the old or the new file, never a torn one.
     if (auto written = catalog::write_file_atomically(directory_ / kFileName, text); !written)
         return std::unexpected(written.error());
     document_ = std::move(latest);
+    stamp_ = current_stamp();
     return {};
 }
 
@@ -177,6 +205,7 @@ std::vector<KnownLibrary> Workspace::known_libraries() const {
 
 Result<void> Workspace::remember_library(const KnownLibrary& library) {
     return update([&](Document& document) {
+        if (std::ranges::find(document.libraries, library) != document.libraries.end()) return false;  // as recorded
         std::erase_if(document.libraries, [&](const KnownLibrary& known) { return known.uuid == library.uuid; });
         document.libraries.push_back(library);
         return true;

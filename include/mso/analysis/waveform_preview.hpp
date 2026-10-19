@@ -22,7 +22,8 @@ namespace mso::analysis {
 /// Errors: INVALID_ARGUMENT for `bins` outside [1, kMaximumWaveformBins], CANCELLED, the decoder's
 /// errors (FILE_MISSING, ACCESS_DENIED, UNSUPPORTED_CODEC, CORRUPT_AUDIO, ...), RESOURCE_LIMIT
 /// when memory runs out and INTERNAL for any other failure.
-Result<WaveformOverview> compute_waveform_overview(const std::filesystem::path& file, int bins, std::stop_token stop,
-                                                   const ProgressCallback& progress = {});
+[[nodiscard]] Result<WaveformOverview> compute_waveform_overview(const std::filesystem::path& file, int bins,
+                                                                 std::stop_token stop,
+                                                                 const ProgressCallback& progress = {});
 
 }  // namespace mso::analysis

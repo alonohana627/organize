@@ -12,6 +12,6 @@ namespace mso::catalog {
 
 /// Atomically and durably replaces `target` with `contents` (FlushFileBuffers + MoveFileExW with
 /// MOVEFILE_WRITE_THROUGH on Windows; fsync of the file, rename, fsync of the directory on POSIX).
-Result<void> write_file_atomically(const std::filesystem::path& target, std::string_view contents);
+[[nodiscard]] Result<void> write_file_atomically(const std::filesystem::path& target, std::string_view contents);
 
 }  // namespace mso::catalog

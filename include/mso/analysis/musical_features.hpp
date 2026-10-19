@@ -34,9 +34,9 @@ public:
     std::int64_t frames_analyzed() const noexcept { return frames_analyzed_; }
 
     /// Tempo of the analyzed audio; nullopt when tempo analysis was not requested.
-    std::optional<TempoResult> tempo() const;
+    [[nodiscard]] std::optional<TempoResult> tempo() const;
     /// Key of the analyzed audio; nullopt when key analysis was not requested.
-    std::optional<KeyResult> key() const;
+    [[nodiscard]] std::optional<KeyResult> key() const;
 
 private:
     int channels_;

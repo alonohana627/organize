@@ -44,7 +44,7 @@ struct PlaybackShape {
 class SourceStream {
 public:
     /// Takes ownership of an opened decoder. Fails with UNSUPPORTED_CODEC for unusable formats.
-    static Result<std::unique_ptr<SourceStream>> create(std::unique_ptr<media::Decoder> decoder);
+    [[nodiscard]] static Result<std::unique_ptr<SourceStream>> create(std::unique_ptr<media::Decoder> decoder);
 
     ~SourceStream();
     SourceStream(const SourceStream&) = delete;
@@ -61,44 +61,46 @@ public:
 
     /// Starts a new segment at `source_frame` (clamped to the source) with `shape`, producing audio
     /// for a device at `output_rate`. Resets the resampler; fades in only when starting mid-signal.
-    Result<void> restart(std::int64_t source_frame, const PlaybackShape& shape, std::uint32_t output_rate);
+    [[nodiscard]] Result<void> restart(std::int64_t source_frame, const PlaybackShape& shape,
+                                       std::uint32_t output_rate);
 
     /// Frame where the current segment started (the decoder's actual landing position after a seek).
     std::int64_t anchor_frame() const noexcept { return clock_.anchor_frame(); }
 
     /// Loop region in effect after clamping to the source and lengthening to the minimum, or nullopt.
-    /// Its end moves to the real end of the source when a loop reaches past an inexact length.
-    std::optional<LoopRegion> effective_loop() const noexcept;
+    /// Its end moves to the real end of the source when a loop reaches past an inexact length (and
+    /// its start moves back when that would leave less than the minimum).
+    [[nodiscard]] std::optional<LoopRegion> effective_loop() const noexcept;
 
     /// Fills one ring block: up to kPcmBlockFrames stereo frames into `stereo_samples` and every
     /// header field except the epoch. Marks end_of_stream once the source is exhausted.
     /// A decoder failure (file vanished, corrupt data) is returned unchanged.
-    Result<void> render_block(PcmBlockHeader& header, std::span<float> stereo_samples);
+    [[nodiscard]] Result<void> render_block(PcmBlockHeader& header, std::span<float> stereo_samples);
 
 private:
     explicit SourceStream(std::unique_ptr<media::Decoder> decoder);
 
     /// Fills `stereo_output` with converted (folded + resampled) audio; fewer frames at the end.
-    Result<std::size_t> convert_into(std::span<float> stereo_output);
+    [[nodiscard]] Result<std::size_t> convert_into(std::span<float> stereo_output);
     /// Fills `stereo_output` with time-stretched audio; returns the frames that carry sound.
-    Result<std::size_t> stretch_into(std::span<float> stereo_output);
+    [[nodiscard]] Result<std::size_t> stretch_into(std::span<float> stereo_output);
     /// Creates (or reuses) the stretcher and primes it so output starts aligned with the anchor.
-    Result<void> prime_stretcher(const PlaybackShape& shape, std::uint32_t output_rate);
+    [[nodiscard]] Result<void> prime_stretcher(const PlaybackShape& shape, std::uint32_t output_rate);
     /// Records the stretcher input converted so far; once the source has run out, fixes the output
     /// frame at which the stretched sound ends.
     void account_stretch_input(std::size_t converted, std::size_t requested) noexcept;
     /// Normalizes a requested loop: clamped to the source, at least kMinimumLoopMilliseconds long.
-    std::optional<LoopRegion> normalized_loop(const std::optional<LoopRegion>& requested) const;
+    [[nodiscard]] std::optional<LoopRegion> normalized_loop(const std::optional<LoopRegion>& requested) const;
     /// Decodes the next chunk into staged_, wrapping the loop and applying the selected fades.
-    Result<void> refill_staging();
+    [[nodiscard]] Result<void> refill_staging();
     /// Seeks back to the loop start and continues from where the decoder actually lands.
-    Result<void> wrap_to_loop_start();
+    [[nodiscard]] Result<void> wrap_to_loop_start();
     /// Applies the mid-signal fade-in and, with seam fades, the seam fade-out to staged_.
     void apply_fades() noexcept;
     /// Frames of the staged chunk not yet fed to the converter.
     std::size_t staged_frames_remaining() const noexcept { return staged_frames_ - staged_offset_; }
     /// total_frames() when exact, else nullopt.
-    std::optional<std::int64_t> exact_total_frames() const;
+    [[nodiscard]] std::optional<std::int64_t> exact_total_frames() const;
 
     std::unique_ptr<media::Decoder> decoder_;     ///< the source
     std::unique_ptr<StereoConverter> converter_;  ///< fold + resample for the current segment

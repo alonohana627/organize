@@ -13,6 +13,7 @@ class AboutDialog final : public QDialog {
     Q_OBJECT
 
 public:
+    /// The dialog, filled from the generated dependency list.
     explicit AboutDialog(QWidget* parent = nullptr);
 
     /// The dialog's HTML body (also used by tests to check that every dependency is listed).

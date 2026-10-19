@@ -24,7 +24,7 @@ Exit codes:
 | 0 | Success |
 | 1 | Error |
 | 2 | Usage error |
-| 3 | Partial result, for example an offline library or failed jobs |
+| 3 | Partial result, for example an offline library, or jobs that failed, were blocked or were paused |
 | 130 | Interrupted (Ctrl+C) |
 
 Output and waiting:
@@ -33,12 +33,18 @@ Output and waiting:
   one JSON document.
 - Progress lines are printed only to a terminal, never with `--json`.
 - `analyze` waits for its runs, but it cannot hang. It stops on any of these:
-  - a paused queue;
-  - a missing worker;
+  - a paused queue, including a missing worker or a worker that keeps failing to start (a single
+    failed start is retried);
   - `--timeout`;
-  - 15 minutes without a finished job;
+  - 35 minutes without a finished job (longer than the 30-minute limit of one job);
   - Ctrl+C, which also cancels its runs.
+
+  Jobs of a run that was paused elsewhere (for example in the app) are reported as paused, with exit
+  code 3.
 - `--worker` points at a specific `mso-worker`.
+- Ctrl+C stops a command cleanly and keeps the work already committed. Press it a second time to end
+  `mso` at once.
 
 While the desktop app has a library open, `mso` opens that library read-only, so commands that change
-it fail. Close the app or use another library.
+it fail, `backup` included. Close the app or use another library. The other way round, the app opens a
+library read-only while `mso` is changing it, and makes it writable again by itself once `mso` is done.

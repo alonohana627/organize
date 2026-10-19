@@ -36,7 +36,7 @@ From the build tree the executables need the MSYS2 runtime DLLs (Qt, FFmpeg, lib
 
 ```powershell
 $env:PATH = "C:\msys64\clang64\bin;$env:PATH"
-& "C:\Users\user\organize\build\release\MusicSampleOrganizer.exe"
+& ".\build\release\MusicSampleOrganizer.exe"    # from the repository folder
 ```
 
 ```sh
@@ -58,19 +58,28 @@ is offline). CI starts the installed app with only `C:\Windows\System32` on `PAT
 
 To install on another PC, build an installer from the same install rules (`cmake/Packaging.cmake`).
 It needs the [WiX Toolset 3.x](https://github.com/wixtoolset/wix3/releases): unpack
-`wix314-binaries.zip` anywhere and point `WIX` at that folder, or put it on `PATH`.
+`wix314-binaries.zip` anywhere and put that folder on `PATH`, or point `WIX` at it (CI installs the
+Chocolatey package `wixtoolset` 3.14.1 and sets `WIX`). Build it from the MSYS2 CLANG64 shell: the
+install step asks MSYS2's `pacman` which package each bundled DLL comes from.
 
 ```sh
-export WIX="C:\Users\<you>\AppData\Local\wix314\bin"     # folder with candle.exe and light.exe
+export PATH="/c/Users/<you>/AppData/Local/wix314/bin:$PATH"  # folder with candle.exe and light.exe
 cmake --preset release && cmake --build --preset release
 cpack --config build/release/CPackConfig.cmake -B build/release/package
 ```
 
-This produces `build/release/package/MusicSampleOrganizer-<version>-windows-x64.msi` (about 140 MB:
-the app, `mso`, `mso-worker`, Qt, FFmpeg and libc++). It installs per machine into
-`Program Files\Music Sample Organizer`, adds Start menu and desktop shortcuts, shows the GPL as its
-license page, and replaces an older version when a newer one is installed. To check its contents
-without installing, run `msiexec /a <file>.msi /qn TARGETDIR=<folder>`.
+This produces `build/release/package/MusicSampleOrganizer-<version>-windows-x64.msi` with the app,
+`mso`, `mso-worker`, Qt, FFmpeg, libc++ and every DLL they load. The installer is **per machine**
+(`CPACK_WIX_INSTALL_SCOPE perMachine`; it asks for administrator rights): it installs into
+`Program Files\Music Sample Organizer`, adds Start menu and desktop shortcuts for all users and one
+uninstall entry, shows the GPL as its license page, and replaces an older version when a newer one is
+installed. It ships the licenses with the program: `share\doc\MusicSampleOrganizer\` holds `LICENSE`,
+`THIRD_PARTY_NOTICES.txt` (every bundled library with its license text, and where to get the source
+of Qt and FFmpeg) and the README; `share\licenses\<package>\` holds the license files of each MSYS2
+package a bundled DLL comes from, listed in `share\licenses\PACKAGES.txt`. To check its contents
+without installing, run `msiexec /a <file>.msi /qn TARGETDIR=<folder>`. Verified so far: the package
+builds and its WiX sources say `InstallScope="perMachine"`; installing on a clean PC is not verified
+yet (`IMPLEMENTATION_STATUS.md`).
 
 Switches: `--workspace <dir>` (a separate workspace instead of `%LOCALAPPDATA%\MusicSampleOrganizer`),
 `--exit-when-ready` (start-up smoke test) and `--screenshot <file.png>` (save the main window after
@@ -81,9 +90,10 @@ headless. On first start the desktop app creates the library "My Samples" under
 ## Linux — prepared, not yet verified
 
 The code keeps platform specifics behind small interfaces (`#ifdef _WIN32` with POSIX branches:
-file identity, worker process spawning and limits, audio backends). Setup on Ubuntu 24.04 (CI runs
-the same steps except the Qt build: its Linux jobs configure with `-DMSO_BUILD_GUI=OFF -DMSO_REQUIRE_GUI=OFF`
-and test the core, the CLI and the worker; the desktop app is tested on Windows):
+file identity, worker process spawning and limits, audio backends). The owner's focus is Windows; the
+Linux CI job is parked, and its last run (39229983572) compiled the core, the CLI and the worker but
+failed three test entries (see `docs/DEVELOPING.md`). Setup on Ubuntu 24.04 (the parked CI job uses the
+same steps without the Qt build, configuring with `-DMSO_BUILD_GUI=OFF -DMSO_REQUIRE_GUI=OFF`):
 
 ```sh
 # clang, libc++ and libc++abi from the apt.llvm.org repository (key fingerprint checked; no piped script)
@@ -118,10 +128,14 @@ Audio output uses PulseAudio (including PipeWire's pulse server) with an ALSA fa
 | `debug` | Debug | libc++ debug hardening (`_LIBCPP_HARDENING_MODE_DEBUG`) |
 | `release` | RelWithDebInfo | `-Werror`; optimized with symbols |
 | `sanitize` | Debug | AddressSanitizer + UndefinedBehaviorSanitizer, `-Werror` |
-| `ci`, `ci-sanitize` | as `release` / `sanitize` | `MSO_REQUIRE_GUI` and `MSO_REQUIRE_FFMPEG` |
+| `fuzz` | RelWithDebInfo | libFuzzer targets only (`tests/fuzz/`), ASan + UBSan, libc++ extensive hardening, no tests or GUI |
+| `ci`, `ci-debug`, `ci-sanitize` | as `release` / `debug` (+ `-Werror`) / `sanitize` | `MSO_REQUIRE_GUI` and `MSO_REQUIRE_FFMPEG` |
 
-Each has a matching build and test preset; build output goes to `build/<preset>/`. The sanitizer
-presets also work on Windows (MSYS2 ships the ASan/UBSan runtimes).
+Each has a matching build preset, and each except `fuzz` a test preset; build output goes to
+`build/<preset>/`. The sanitizer presets work on Windows (MSYS2 CLANG64 ships the ASan and UBSan
+runtimes; there is no ThreadSanitizer for Windows). CTest prepends the toolchain's `bin` folder to
+`PATH` and, in sanitizer builds, sets `ASAN_SYMBOLIZER_PATH` to the `llvm-symbolizer` next to clang, so
+`ctest` works from any shell and sanitizer reports show file and line.
 
 ## CMake options
 
@@ -135,6 +149,7 @@ presets also work on Windows (MSYS2 ships the ASan/UBSan runtimes).
 | `MSO_WARNINGS_AS_ERRORS` | OFF (ON in `release`, `sanitize`, `ci*`) | `-Werror` for project code |
 | `MSO_SANITIZERS` | empty | `address`, `undefined` or `address;undefined` for the whole build |
 | `MSO_TEST_TIMEOUT` | 300 | CTest timeout per entry in seconds (at least 900 with sanitizers) |
+| `MSO_BUILD_FUZZERS` | OFF (ON in `fuzz`) | Instrument the build for libFuzzer and build `tests/fuzz/`; needs `address` in `MSO_SANITIZERS` |
 
 ## Tests
 
@@ -143,6 +158,7 @@ CTest entries are generated from the sources: one per `TEST_SUITE("<name>")` (la
 `ui-unlisted-suites`) that runs every case outside those suites, and `include-graph` (label `lint`),
 which checks that each module includes only the modules it declares in `CMakeLists.txt`. A suite added
 after the last configure still runs in its catch-all; a named entry that matches no test case fails.
+The number of entries is therefore the number of suites plus three; `ctest -N` lists them.
 
 ```sh
 ctest --preset debug -L core          # all Qt-free tests
@@ -151,11 +167,34 @@ build/debug/tests/mso_tests.exe --test-suite=catalog
 QT_QPA_PLATFORM=offscreen MSO_AUDIO_BACKEND=null build/debug/mso_ui_tests.exe
 ```
 
+## Fuzzing
+
+`tests/fuzz/` holds one libFuzzer target per piece of code that reads damaged or unusual input: the
+media probe once per container family (`fuzz_probe_riff`, `_flac`, `_mpeg_id3`, `_ogg`, `_mp4`, `_asf`,
+`_ape`, through `media::probe_memory`), `fuzz_stb_vorbis` (the vendored Vorbis decoder: open, decode,
+seek), `fuzz_worker_protocol` (frames and messages on the worker's pipe), `fuzz_query_parser` (query
+text and the in-memory matcher) and `fuzz_cursor` (paging cursors of the SQL search and the in-memory
+index). Each has a small seed corpus in `tests/fuzz/corpus/<name>/`, including regression inputs of
+past findings.
+
+```sh
+cmake --preset fuzz && cmake --build --preset fuzz
+python tools/run_fuzzers.py                          # every target 60 s, 4 at a time (as CI)
+python tools/run_fuzzers.py --seconds 600 stb_vorbis # one target, longer
+build/fuzz/tests/fuzz/fuzz_stb_vorbis.exe build/fuzz/fuzz-artifacts/stb_vorbis/crash-...   # replay a finding
+```
+
+A crash, sanitizer report, hang (25 s per input), or memory use above 2 GB fails the run and saves the
+input under `build/fuzz/fuzz-artifacts/<name>/`. On Windows, clang's driver does not accept
+`-fsanitize=fuzzer` for the MinGW target, so `cmake/ProjectOptions.cmake` passes the equivalent
+coverage flags and links MSYS2's `libclang_rt.fuzzer-x86_64.a` directly.
+
 ## Dependencies
 
 See [`deps/README.md`](../deps/README.md) for every vendored library, its version, license and purpose.
 `python deps/update_deps.py --check` verifies the vendored files offline (pinned commits and digests,
 post-patch content hashes, no stray files); `python deps/update_deps.py <name>` re-fetches one. Local
 changes to a dependency live as patches under `patches/<name>/`. The configure step generates
-`mso/generated/dependencies.hpp` (target `mso::generated`: every dependency with its license text, for
-the About box) from `deps/manifest.json`.
+`mso/generated/dependencies.hpp` (target `mso::generated`: every shipped dependency with its license
+text, for the About box and `mso --version`) and `THIRD_PARTY_NOTICES.txt` (installed next to
+`LICENSE`) from `deps/manifest.json`.

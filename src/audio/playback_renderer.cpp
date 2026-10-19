@@ -20,17 +20,29 @@ PlaybackRenderer::PlaybackRenderer(PcmRing& ring, SharedPlaybackState& shared) n
     : ring_(ring), shared_(shared), volume_gain_(1.0f, 1.0f) {}
 
 void PlaybackRenderer::configure(std::uint32_t output_rate, std::uint32_t latency_frames) noexcept {
+    // The previous device's output frames and latency mean nothing to this one. Until this device
+    // has played through its own latency, the position last heard on the previous one stands.
+    playhead_history_.restart(playhead_history_.audible(output_frames_, latency_frames_));
+
     output_rate_ = output_rate;
     latency_frames_ = latency_frames;
     transport_gain_.set_step(LinearRamp::step_for(output_rate, kTransportFadeMilliseconds));
     volume_gain_.set_step(LinearRamp::step_for(output_rate, kVolumeGlideMilliseconds));
     decay_length_ = std::max<std::uint32_t>(
         1, static_cast<std::uint32_t>(static_cast<double>(output_rate) * kDeclickDecayMilliseconds / 1000.0));
-    decay_remaining_ = std::min(decay_remaining_, decay_length_);
+    // The device starts from silence: no decay carries over from the previous device, and audio that
+    // is still enabled re-enters the signal mid-way, so it fades in.
+    decay_remaining_ = 0;
+    previous_frame_had_audio_ = false;
+    last_output_ = {};
+    if (output_enabled_) {
+        transport_gain_.restart_from(0.0f);
+    }
 }
 
 void PlaybackRenderer::render(std::span<float> stereo_output) noexcept {
     adopt_gate(TransportGate::unpacked(shared_.transport_gate.load(std::memory_order_acquire)));
+    release_superseded_held_block();  // e.g. a block rendered for the previous device's rate
     volume_gain_.set_target(shared_.target_volume.load(std::memory_order_relaxed));
     dropped_foreign_rate_ = false;
 
@@ -83,11 +95,10 @@ void PlaybackRenderer::render(std::span<float> stereo_output) noexcept {
 void PlaybackRenderer::adopt_gate(TransportGate gate) noexcept {
     if (gate.epoch != epoch_) {
         epoch_ = gate.epoch;
-        if (current_block_ && is_superseded(*current_block_->header)) {
-            ring_.pop_front();
-            current_block_.reset();
-            cut_audio();
-        }
+        release_superseded_held_block();
+        // Every epoch change moves to another place in the source (or to silence), whether or not a
+        // block is held and wherever in the callback it happens: the old signal decays, never steps.
+        cut_audio();
         // Blocks are in production order, so every superseded block sits in front of the current ones.
         for (auto block = ring_.front(); block && is_superseded(*block->header); block = ring_.front()) {
             ring_.pop_front();
@@ -123,11 +134,13 @@ bool PlaybackRenderer::read_frame(float& left, float& right) noexcept {
             if (!block) {
                 return false;
             }
-            if (block->header->epoch > epoch_) {
+            // Copied first: adopting the gate may release this very block back to the producer.
+            const std::uint64_t block_epoch = block->header->epoch;
+            if (block_epoch > epoch_) {
                 // Written after this callback began: the decoder thread published the gate before the
                 // block, so adopting it now brings the matching output switch along.
                 adopt_gate(TransportGate::unpacked(shared_.transport_gate.load(std::memory_order_acquire)));
-                if (block->header->epoch > epoch_ || !consuming()) {
+                if (block_epoch > epoch_ || !consuming()) {
                     // Not yet announced (never happens with a well-behaved producer), or the new state
                     // stopped output: consume nothing of it in this frame.
                     return false;
@@ -177,6 +190,13 @@ void PlaybackRenderer::finish_block() noexcept {
     current_block_.reset();
 }
 
+void PlaybackRenderer::release_superseded_held_block() noexcept {
+    if (current_block_ && is_superseded(*current_block_->header)) {
+        ring_.pop_front();
+        current_block_.reset();
+    }
+}
+
 void PlaybackRenderer::cut_audio() noexcept {
     if (!previous_frame_had_audio_) {
         return;
@@ -191,6 +211,7 @@ void PlaybackRenderer::publish_progress() noexcept {
     PlaybackProgress progress;
     progress.consumed_epoch = position_epoch_;
     progress.consumed_frames = epoch_frames_played_;
+    progress.consumed_position = position_frame_;
     if (const auto heard = playhead_history_.audible(output_frames_, latency_frames_)) {
         progress.audible_epoch = heard->epoch;
         progress.audible_frame = heard->position;

@@ -3,6 +3,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QLocale>
 #include <QPushButton>
 #include <QStringList>
 #include <QTreeWidget>
@@ -60,6 +61,7 @@ JobsPanel::JobsPanel(QWidget* parent) : QWidget(parent) {
     clear_button_ = new QPushButton(tr("Clear finished"), this);
     worker_label_ = new QLabel(this);
     worker_label_->setWordWrap(true);
+    worker_label_->setTextFormat(Qt::PlainText);  // library names and file names are user text
     worker_label_->setAccessibleName(tr("Analysis worker status"));
 
     connect(cancel_button_, &QPushButton::clicked, this, [this] {
@@ -148,14 +150,14 @@ void JobsPanel::update_import(const app::ImportProgressEvent& event) {
     const files::ImportProgress& progress = event.progress;
     // Discovery continues while committing, so the total grows; it is labeled "found so far".
     set_progress(item, progress.files_committed, progress.files_discovered);
-    QString status =
-        tr("%1 imported, %2 found so far, %3 directories")
-            .arg(DisplayFormat::count(progress.files_committed), DisplayFormat::count(progress.files_discovered),
-                 DisplayFormat::count(progress.directories_scanned));
-    if (progress.probe_failures > 0) status += tr(", %1 unreadable").arg(DisplayFormat::count(progress.probe_failures));
+    // Each part is a whole phrase for translators; the locale joins them into one list.
+    QStringList parts{tr("%1 imported").arg(DisplayFormat::count(progress.files_committed)),
+                      tr("%1 found so far").arg(DisplayFormat::count(progress.files_discovered)),
+                      tr("%1 directories").arg(DisplayFormat::count(progress.directories_scanned))};
+    if (progress.probe_failures > 0) parts << tr("%1 unreadable").arg(DisplayFormat::count(progress.probe_failures));
     if (progress.inaccessible_directories > 0)
-        status += tr(", %1 inaccessible folders").arg(DisplayFormat::count(progress.inaccessible_directories));
-    item->setText(StatusColumn, status);
+        parts << tr("%1 inaccessible folders").arg(DisplayFormat::count(progress.inaccessible_directories));
+    item->setText(StatusColumn, QLocale().createSeparatedList(parts));
     item->setToolTip(StatusColumn, DisplayFormat::from_utf8(progress.current_directory));
 }
 
@@ -198,14 +200,18 @@ void JobsPanel::update_analysis(const app::AnalysisProgressEvent& event, const Q
             item->setData(TaskColumn, RunRole, static_cast<qlonglong>(run.id));
         }
         const std::int64_t done = run.completed + run.failed + run.skipped + run.cancelled;
-        const std::int64_t total = done + run.queued + run.running + run.blocked;
+        const std::int64_t total = done + run.queued + run.running + run.blocked + run.paused;
         set_progress(item, done, total);
         const QString state = DisplayFormat::from_utf8(run.state);
         item->setData(TaskColumn, StateRole, state);
-        item->setText(StatusColumn, tr("%1 — %2 done, %3 failed, %4 skipped, %5 queued, %6 running")
-                                        .arg(state, DisplayFormat::count(run.completed),
-                                             DisplayFormat::count(run.failed), DisplayFormat::count(run.skipped),
-                                             DisplayFormat::count(run.queued), DisplayFormat::count(run.running)));
+        QStringList counts{tr("%1 done").arg(DisplayFormat::count(run.completed)),
+                           tr("%1 failed").arg(DisplayFormat::count(run.failed)),
+                           tr("%1 skipped").arg(DisplayFormat::count(run.skipped)),
+                           tr("%1 queued").arg(DisplayFormat::count(run.queued)),
+                           tr("%1 running").arg(DisplayFormat::count(run.running))};
+        if (run.paused > 0) counts << tr("%1 paused").arg(DisplayFormat::count(run.paused));
+        if (run.blocked > 0) counts << tr("%1 waiting for their files").arg(DisplayFormat::count(run.blocked));
+        item->setText(StatusColumn, tr("%1 — %2").arg(state, QLocale().createSeparatedList(counts)));
     }
     // Runs the Application no longer reports have ended; dismissals of such runs can be forgotten.
     for (auto& [key, item] : analysis_runs_) {
@@ -220,12 +226,16 @@ void JobsPanel::update_analysis(const app::AnalysisProgressEvent& event, const Q
     });
 
     worker_status_[event.library] = {library_name, DisplayFormat::from_utf8(event.worker_status)};
+    update_worker_label();
+    prune_finished_rows();
+    update_buttons();
+}
+
+void JobsPanel::update_worker_label() {
     QStringList lines;
     for (const auto& [library, status] : worker_status_)
         if (!status.second.isEmpty()) lines << tr("%1: %2").arg(status.first, status.second);
     worker_label_->setText(lines.join(QLatin1Char('\n')));
-    prune_finished_rows();
-    update_buttons();
 }
 
 void JobsPanel::prune_finished_rows() {
@@ -281,6 +291,20 @@ void JobsPanel::finish_local_task(std::uint64_t task, const QString& summary, bo
     found->second->setText(StatusColumn, succeeded ? tr("Done. %1").arg(summary) : tr("Failed: %1").arg(summary));
     found->second->setToolTip(StatusColumn, summary);
     local_cancellers_.erase(task);
+    prune_finished_rows();
+    update_buttons();
+}
+
+void JobsPanel::retain_libraries(const std::vector<uuids::uuid>& open) {
+    const auto is_open = [&open](const uuids::uuid& library) { return std::ranges::find(open, library) != open.end(); };
+    for (auto& [key, item] : analysis_runs_) {
+        if (is_open(key.first) || is_finished_state(item->data(TaskColumn, StateRole).toString())) continue;
+        item->setData(TaskColumn, StateRole, QStringLiteral("finished"));
+        item->setText(StatusColumn, tr("Library closed"));
+    }
+    std::erase_if(dismissed_runs_, [&is_open](const RunKey& key) { return !is_open(key.first); });
+    std::erase_if(worker_status_, [&is_open](const auto& entry) { return !is_open(entry.first); });
+    update_worker_label();
     prune_finished_rows();
     update_buttons();
 }

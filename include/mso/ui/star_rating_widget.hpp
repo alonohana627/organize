@@ -13,6 +13,7 @@ class StarRatingWidget final : public QWidget {
     Q_OBJECT
 
 public:
+    /// Five empty stars.
     explicit StarRatingWidget(QWidget* parent = nullptr);
 
     int rating() const { return rating_; }

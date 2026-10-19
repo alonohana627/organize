@@ -37,15 +37,16 @@ $M play "$F/Drums/Kick 01.wav" --backend null   # decode and play without an aud
 The CLI is explicit: it analyzes only on `analyze`. The desktop app runs the same pipeline
 automatically (default library, rescans, the `Full` profile after each import). `--worker <path>`
 selects a specific `mso-worker` (default: the one next to `mso`). `analyze` cannot hang: it stops on
-a paused queue, a missing worker, `--timeout`, 15 minutes without a finished job, or Ctrl+C.
+a paused queue (a missing worker or one that keeps failing to start pauses it), `--timeout`, 35
+minutes without a finished job, or Ctrl+C; a second Ctrl+C ends `mso` at once.
 
 Check exit codes, not only output: 0 ok, 1 error, 2 usage, 3 partial result, 130 interrupted. While the
 desktop app has a library open, the CLI opens it read-only (`library.lock`) and commands that write
 fail; use a scratch library.
 
 For scale, `mso bench <new-lib> --rows 100000 --repetitions 30` measures catalog inserts and search
-latency on synthetic metadata (no audio), through SQLite and through the in-memory index; use a release
-build and record results in `IMPLEMENTATION_STATUS.md`.
+latency on synthetic metadata (no audio), through SQLite and through the in-memory index, and the
+index's memory per row; use a release build and record results in `IMPLEMENTATION_STATUS.md`.
 
 ## 3. Things to look for
 

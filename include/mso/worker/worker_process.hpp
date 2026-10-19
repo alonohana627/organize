@@ -43,12 +43,14 @@ namespace mso::worker {
 // ---------------------------------------------------------------- OS plumbing (both sides)
 
 #ifdef _WIN32
-using NativeHandle = void*;  ///< Win32 HANDLE
-inline constexpr NativeHandle kNoNativeHandle = nullptr;
+using NativeHandle = void*;                               ///< Win32 HANDLE
+inline constexpr NativeHandle kNoNativeHandle = nullptr;  ///< the empty handle value
+/// File name of the worker executable, next to the application.
 inline constexpr std::string_view kWorkerExecutableName = "mso-worker.exe";
 #else
-using NativeHandle = int;  ///< POSIX file descriptor
-inline constexpr NativeHandle kNoNativeHandle = -1;
+using NativeHandle = int;                            ///< POSIX file descriptor
+inline constexpr NativeHandle kNoNativeHandle = -1;  ///< the empty descriptor value
+/// File name of the worker executable, next to the application.
 inline constexpr std::string_view kWorkerExecutableName = "mso-worker";
 #endif
 
@@ -71,12 +73,12 @@ public:
     bool valid() const noexcept;
     explicit operator bool() const noexcept { return valid(); }
     /// Gives up ownership without closing.
-    NativeHandle release() noexcept;
+    [[nodiscard]] NativeHandle release() noexcept;
     /// Closes the current handle (if any) and takes ownership of `handle`.
     void reset(NativeHandle handle = kNoNativeHandle) noexcept;
 
 private:
-    NativeHandle handle_ = kNoNativeHandle;
+    NativeHandle handle_ = kNoNativeHandle;  ///< owned; kNoNativeHandle when empty
 };
 
 /// Blocking byte stream over a pipe or file it does not own. A broken pipe reads as end of
@@ -85,17 +87,17 @@ class HandleStream final : public ByteSource, public ByteSink {
 public:
     explicit HandleStream(NativeHandle handle) noexcept : handle_(handle) {}
 
-    Result<std::size_t> read_some(std::span<std::uint8_t> destination) override;
-    Result<void> write_all(std::span<const std::uint8_t> bytes) override;
+    [[nodiscard]] Result<std::size_t> read_some(std::span<std::uint8_t> destination) override;
+    [[nodiscard]] Result<void> write_all(std::span<const std::uint8_t> bytes) override;
 
 private:
-    NativeHandle handle_;
+    NativeHandle handle_;  ///< not owned
 };
 
 /// The calling process's standard input (not owned).
-NativeHandle standard_input_handle() noexcept;
+[[nodiscard]] NativeHandle standard_input_handle() noexcept;
 /// The calling process's standard output (not owned).
-NativeHandle standard_output_handle() noexcept;
+[[nodiscard]] NativeHandle standard_output_handle() noexcept;
 
 /// The operating system's identifier of the calling process.
 std::uint32_t current_process_id() noexcept;
@@ -103,13 +105,14 @@ std::uint32_t current_process_id() noexcept;
 /// The worker executable (kWorkerExecutableName) in the directory of the running executable. When
 /// that directory cannot be determined, the bare name, which WorkerProcess resolves against the
 /// current directory.
-std::filesystem::path default_worker_executable();
+[[nodiscard]] std::filesystem::path default_worker_executable();
 
 /// Writes `bytes` so that `destination` only ever holds a complete file: a sibling ".partial"
 /// file is written and flushed to stable storage, then renamed over the destination. The
 /// temporary file is removed on failure. Errors: DISK_FULL, ACCESS_DENIED, FILE_MISSING (no such
 /// directory) or INTERNAL.
-Result<void> write_file_atomically(const std::filesystem::path& destination, std::span<const std::uint8_t> bytes);
+[[nodiscard]] Result<void> write_file_atomically(const std::filesystem::path& destination,
+                                                 std::span<const std::uint8_t> bytes);
 
 // ---------------------------------------------------------------- supervisor client
 
@@ -198,7 +201,7 @@ public:
     /// the child cannot start or never completes a valid handshake (wrong process, protocol or
     /// algorithm versions, self-test mode not as requested), RESOURCE_LIMIT when the mandatory
     /// confinement cannot be applied and INVALID_ARGUMENT for bad options.
-    static Result<std::unique_ptr<WorkerProcess>> start(WorkerOptions options);
+    [[nodiscard]] static Result<std::unique_ptr<WorkerProcess>> start(WorkerOptions options);
 
     /// Shuts the worker down within shutdown_grace, then kills it.
     ~WorkerProcess();
@@ -222,22 +225,22 @@ public:
 
     /// Sends one task. Fails with INVALID_ARGUMENT for an invalid task or while another task is
     /// in flight, and WORKER_CRASH when the worker is not running.
-    Result<void> submit(const AnalyzeTask& task);
+    [[nodiscard]] Result<void> submit(const AnalyzeTask& task);
 
     /// Requests cooperative cancellation of the task in flight. If its outcome does not arrive
     /// within cancel_grace the worker is terminated and the task reported as CANCELLED.
     /// NOT_FOUND when `job_id` is not the task in flight.
-    Result<void> cancel(const uuids::uuid& job_id, std::int64_t cancel_epoch);
+    [[nodiscard]] Result<void> cancel(const uuids::uuid& job_id, std::int64_t cancel_epoch);
 
     /// Waits up to `timeout` for the next event; nullopt on timeout.
-    std::optional<WorkerEvent> next_event(std::chrono::milliseconds timeout);
+    [[nodiscard]] std::optional<WorkerEvent> next_event(std::chrono::milliseconds timeout);
 
     /// Graceful stop: sends Shutdown and waits up to shutdown_grace before terminating. A task
     /// in flight is reported as CANCELLED. Idempotent.
     void shutdown();
 
     /// Stops the current process (if any) and spawns a fresh one with the same options.
-    Result<void> restart();
+    [[nodiscard]] Result<void> restart();
 
 private:
     class Session;     ///< one spawned child process and its I/O threads
@@ -245,9 +248,9 @@ private:
 
     explicit WorkerProcess(WorkerOptions options);
 
-    WorkerOptions options_;
-    std::unique_ptr<EventQueue> events_;
-    std::unique_ptr<Session> session_;
+    WorkerOptions options_;               ///< reused by restart()
+    std::unique_ptr<EventQueue> events_;  ///< outlives every Session, so no event is lost on restart
+    std::unique_ptr<Session> session_;    ///< the current process; null before start or after a failed restart
 };
 
 }  // namespace mso::worker

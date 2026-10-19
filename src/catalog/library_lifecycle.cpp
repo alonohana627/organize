@@ -34,16 +34,16 @@ Result<LibraryManifest> read_manifest(const std::filesystem::path& file) {
     if (!in) return fail(ErrorCode::NotFound, std::format("no library manifest at {}", path_to_utf8(file)));
     std::stringstream contents;
     contents << in.rdbuf();
-    const auto document = detail::parse_json(contents.str());
+    const auto document = json_fields::parse_json(contents.str());
     if (document.is_discarded() || !document.is_object())
         return fail(ErrorCode::DbCorrupt, "library.json is not valid JSON");
     LibraryManifest manifest;
-    const auto uuid_text = detail::json_string_member(document, "library_uuid");
+    const auto uuid_text = json_fields::string_field(document, "library_uuid");
     const auto uuid = uuid_text ? uuids::uuid::from_string(*uuid_text) : std::nullopt;
     if (!uuid) return fail(ErrorCode::DbCorrupt, "library.json has no valid library_uuid");
     manifest.uuid = *uuid;
-    manifest.name = detail::json_string_member(document, "name").value_or("");
-    const auto format_version = detail::json_integer_member(document, "format_version");
+    manifest.name = json_fields::string_field(document, "name").value_or("");
+    const auto format_version = json_fields::integer_field(document, "format_version");
     if (!format_version || *format_version < 0 || *format_version > 1'000'000)
         return fail(ErrorCode::DbCorrupt, "library.json has no valid format_version");
     manifest.format_version = static_cast<int>(*format_version);
@@ -319,6 +319,7 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& dire
         if (auto tracking = detail::prepare_change_tracking(library->writer_); !tracking)
             return std::unexpected(tracking.error());
         if (auto recovered = library->recover_after_crash(); !recovered) return std::unexpected(recovered.error());
+        if (auto rekeyed = library->refresh_normalized_keys(); !rekeyed) return std::unexpected(rekeyed.error());
     }
     if (auto identity = library->load_cached_identity(); !identity) return std::unexpected(identity.error());
     return library;
@@ -376,8 +377,6 @@ Result<void> Library::recover_after_crash() {
         !partial)
         return partial;
     recovery_.partial_history_actions = writer_.changed_row_count();
-    if (auto cleared = writer_.execute_script("UPDATE history_state SET active_action_id=NULL"); !cleared)
-        return cleared;
     // A chunked edit interrupted mid-way: its receipt says so, and a retry resumes or reports it.
     if (auto receipts = writer_.execute_script("UPDATE command_receipts SET state='partial' WHERE state='running'");
         !receipts)
@@ -394,11 +393,85 @@ Result<void> Library::recover_after_crash() {
             "AND EXISTS(SELECT 1 FROM jobs WHERE jobs.run_id=analysis_runs.id AND jobs.state='interrupted')");
         !runs)
         return runs;
+    // Jobs of paused runs wait as `paused` (out of the jobs_ready lease index) until Resume.
+    if (auto paused_jobs =
+            writer_.execute_script("UPDATE jobs SET state='paused' WHERE state IN ('queued','interrupted') "
+                                   "AND run_id IN (SELECT id FROM analysis_runs WHERE state='paused')");
+        !paused_jobs)
+        return paused_jobs;
     if (auto claims = writer_.execute_script("DELETE FROM analysis_claims"); !claims) return claims;
 
     if (auto committed = transaction.commit(); !committed) return committed;
     sweep_staging(directory_ / kStagingDirectory);
     return {};
+}
+
+Result<void> Library::refresh_normalized_keys() {
+    const std::lock_guard lock(writer_mutex_);
+    auto statement = writer_.prepare("SELECT normalization_version FROM library_state WHERE singleton=1");
+    if (!statement) return std::unexpected(statement.error());
+    auto has_row = statement->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    if (!*has_row) return fail(ErrorCode::DbCorrupt, "library_state row is missing");
+    const std::string stored_version = statement->column_text(0);
+    statement->reset();
+    if (stored_version == kFoldVersion) return {};
+
+    // Keys under a unique index move in two passes: changing rows first get a unique placeholder
+    // ('\x01' and the row id, which no folded name or path produces), so swapping two keys never
+    // trips the index; a collision in the second pass is real.
+    constexpr std::array<std::string_view, 12> kRekeyStatements = {
+        "UPDATE samples SET name_key=fold_key(display_name) WHERE name_key IS NOT fold_key(display_name)",
+        "UPDATE categories SET name_key=char(1)||id WHERE name_key IS NOT fold_key(name)",
+        "UPDATE categories SET name_key=fold_key(name) WHERE name_key IS NOT fold_key(name)",
+        "UPDATE tags SET name_key=char(1)||id WHERE name_key IS NOT fold_key(name)",
+        "UPDATE tags SET name_key=fold_key(name) WHERE name_key IS NOT fold_key(name)",
+        "UPDATE folders SET path_key=char(1)||id WHERE path_key IS NOT "
+        "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=folders.root_id))",
+        "UPDATE folders SET path_key=path_key(relative_path,(SELECT case_sensitive FROM roots "
+        "WHERE roots.id=folders.root_id)) WHERE substr(path_key,1,1)=char(1)",
+        "UPDATE locations SET path_key=char(1)||id WHERE path_key IS NOT "
+        "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=locations.root_id))",
+        "UPDATE locations SET path_key=path_key(relative_path,(SELECT case_sensitive FROM roots "
+        "WHERE roots.id=locations.root_id)) WHERE substr(path_key,1,1)=char(1)",
+        "UPDATE scan_frontier SET directory_key=path_key(relative_directory,(SELECT root.case_sensitive FROM "
+        "scan_sessions session JOIN roots root ON root.id=session.root_id WHERE session.id=scan_frontier.scan_id)) "
+        "WHERE directory_key IS NOT NULL",
+        "UPDATE review_items SET state='resolved' WHERE kind='normalization_conflict' AND state='open'",
+        "UPDATE library_state SET normalization_version=?1 WHERE singleton=1",
+    };
+    std::optional<Error> collision;
+    {
+        sqlite::WriteTransaction transaction(writer_);
+        if (auto began = transaction.begin(); !began) return began;
+        for (const auto sql : kRekeyStatements) {
+            auto rekey = writer_.prepare(sql);
+            if (!rekey) return std::unexpected(rekey.error());
+            if (sql.find("?1") != std::string_view::npos) rekey->bind(1, kFoldVersion);
+            if (auto ran = rekey->run(); !ran) {
+                if (!rekey->failed_on_unique_constraint()) return ran;
+                collision = ran.error();
+                break;
+            }
+        }
+        if (!collision) return transaction.commit();
+    }  // the collided attempt rolls back here: the old keys stay consistent with each other
+
+    // Two names or paths that the stored keys kept apart would share a key now. Nothing is merged
+    // silently: the old keys stay (the next open tries again) and one open review item says why.
+    sqlite::WriteTransaction transaction(writer_);
+    if (auto began = transaction.begin(); !began) return began;
+    auto existing =
+        writer_.query_int64("SELECT count(*) FROM review_items WHERE kind='normalization_conflict' AND state='open'");
+    if (!existing) return std::unexpected(existing.error());
+    if (*existing == 0)
+        if (auto reviewed = detail::add_review_item(
+                writer_, "normalization_conflict", std::nullopt,
+                nlohmann::json{
+                    {"stored_version", stored_version}, {"version", kFoldVersion}, {"detail", collision->safe_detail}});
+            !reviewed)
+            return reviewed;
+    return transaction.commit();
 }
 
 Result<void> Library::load_cached_identity() {
@@ -477,15 +550,29 @@ Result<std::filesystem::path> Library::create_backup(std::string_view reason) {
 }
 
 Result<std::string> Library::integrity_report() {
+    // The whole-database checks run on a reader snapshot, so imports and edits keep writing meanwhile
+    // instead of waiting on the writer mutex.
+    std::string integrity;
+    std::size_t violation_count = 0;
+    {
+        auto reader = acquire_reader();
+        if (!reader) return std::unexpected(reader.error());
+        auto& connection = reader->connection();
+        sqlite::ReadTransaction snapshot(connection);
+        if (auto began = snapshot.begin(); !began) return std::unexpected(began.error());
+        auto checked = connection.integrity_check();
+        if (!checked) return std::unexpected(checked.error());
+        integrity = std::move(*checked);
+        auto violations = connection.foreign_key_violations();
+        if (!violations) return std::unexpected(violations.error());
+        violation_count = violations->size();
+    }
+    // PRAGMA integrity_check does not compare an external-content FTS5 index with its content
+    // table; FTS5's own 'integrity-check' command does, but it is an INSERT and so needs the writer.
     const std::lock_guard lock(writer_mutex_);
-    auto integrity = writer_.integrity_check();
-    if (!integrity) return std::unexpected(integrity.error());
-    auto violations = writer_.foreign_key_violations();
-    if (!violations) return std::unexpected(violations.error());
     auto fts = writer_.execute_script("INSERT INTO sample_fts(sample_fts, rank) VALUES('integrity-check', 1)");
-    std::string report = std::format("integrity: {}; foreign keys: {} violation(s); search index: {}", *integrity,
-                                     violations->size(), fts ? "ok" : fts.error().safe_detail);
-    return report;
+    return std::format("integrity: {}; foreign keys: {} violation(s); search index: {}", integrity, violation_count,
+                       fts ? "ok" : fts.error().safe_detail);
 }
 
 Result<void> Library::rebuild_search_index() {

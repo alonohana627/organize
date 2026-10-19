@@ -23,10 +23,12 @@ struct UiPreferenceKeys {
     static constexpr std::string_view kAuditionOnSelection = "preview.audition_on_selection";
     /// Preview volume in decibels.
     static constexpr std::string_view kPreviewVolume = "preview.volume_db";
+    /// Preview output endpoint (audio::OutputDeviceId text); absent or empty follows the system default.
+    static constexpr std::string_view kPreviewOutputDevice = "preview.output_device";
 
     /// Every key above, preloaded into ApplicationSession's cache at start-up.
-    static constexpr std::array<std::string_view, 5> kAll = {kShortcuts, kCurrentLayout, kLayoutPresets,
-                                                             kAuditionOnSelection, kPreviewVolume};
+    static constexpr std::array<std::string_view, 6> kAll = {
+        kShortcuts, kCurrentLayout, kLayoutPresets, kAuditionOnSelection, kPreviewVolume, kPreviewOutputDevice};
 };
 
 }  // namespace mso::ui

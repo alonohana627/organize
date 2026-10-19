@@ -16,11 +16,13 @@ namespace mso::audio::detail {
 /// they see the same even version before and after copying, yielding while a write is in progress.
 /// The value is stored as atomic 64-bit words, so concurrent access is free of data races
 /// (Boehm, "Can seqlocks get along with programming language memory models?", 2012).
-/// No vendored library provides this; it is kept to the minimum the engine needs.
+/// No vendored library provides a seqlock (a deliberate exception to owner rule 1, recorded in
+/// IMPLEMENTATION_STATUS.md); it is kept to the minimum the engine needs.
 template <class Value>
 class Seqlock {
     static_assert(std::is_trivially_copyable_v<Value>, "Seqlock copies values bytewise");
-    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free, "the version counter must never lock");
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free, "the value words must never lock");
 
 public:
     Seqlock() noexcept { store(Value{}); }
@@ -42,7 +44,7 @@ public:
     }
 
     /// A consistent copy of the most recently published value.
-    Value load() const noexcept {
+    [[nodiscard]] Value load() const noexcept {
         std::array<std::uint64_t, kWords> raw{};
         for (;;) {
             const std::uint32_t version_before = version_.load(std::memory_order_acquire);

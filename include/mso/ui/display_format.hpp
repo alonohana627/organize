@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "mso/catalog/types.hpp"
 #include "mso/domain/core.hpp"
@@ -80,6 +81,8 @@ public:
     static QString error(const Error& error);
     /// Thousands-separated integer in the user's locale.
     static QString count(std::int64_t value);
+    /// A sample's tag paths as one line ("Drums/Kick, Loops"), for the Tags column.
+    static QString tag_list(const std::vector<std::string>& tag_paths);
 };
 
 }  // namespace mso::ui

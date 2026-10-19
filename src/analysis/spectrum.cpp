@@ -66,8 +66,14 @@ std::span<const float> MagnitudeSpectrum::compute(std::span<const float> head, s
 
     // Unpack the half-complex layout: bin k > 0 is (r_k, i_k) at positions 2k-1 and 2k.
     magnitudes_[0] = std::abs(transform_buffer_[0]) * normalization_;
-    for (std::size_t bin = 1; 2 * bin < length; ++bin)
-        magnitudes_[bin] = std::hypot(transform_buffer_[2 * bin - 1], transform_buffer_[2 * bin]) * normalization_;
+    // sqrt of the squared sum in double instead of std::hypot: squares of finite floats cannot
+    // overflow a double (even for a crafted file with huge float samples), and hypot's
+    // overflow-safe scaling costs several times as much on this per-bin hot path.
+    for (std::size_t bin = 1; 2 * bin < length; ++bin) {
+        const double real = transform_buffer_[2 * bin - 1];
+        const double imaginary = transform_buffer_[2 * bin];
+        magnitudes_[bin] = static_cast<float>(std::sqrt(real * real + imaginary * imaginary)) * normalization_;
+    }
     if (length % 2 == 0) magnitudes_[length / 2] = std::abs(transform_buffer_[length - 1]) * normalization_;
     return magnitudes_;
 }

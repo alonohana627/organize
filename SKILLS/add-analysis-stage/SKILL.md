@@ -15,10 +15,16 @@ fencing (lease, cancel epoch, content revision).
    `decoded_stream_analysis.cpp` (bounded memory, deterministic, honours the stop token). Use pocketfft
    for spectra (`include/mso/analysis/spectrum.hpp`). Add the stage to `Stage`, `to_string`/`parse_stage`, a version string in
    `AlgorithmVersions` (bump it, e.g. `tempo-flux-autocorr-2` → `-3`, whenever results change, so old
-   results are re-analyzed), and a field in `AnalysisReport`.
+   results are re-analyzed), and a field in `AnalysisReport`. Report progress and work units only
+   through the `ProgressPhase` you are given (`ProgressReporter` throttles to 10 Hz; the worker
+   forwards every fraction it receives, so a second throttle must not be added). A request lists
+   each stage at most once (`validate_request`, mirrored by the protocol's `validate_task`), and
+   every new function that returns `mso::Result` is declared `[[nodiscard]]`.
 2. **Protocol** (`include/mso/worker/worker_protocol.hpp`, `src/worker/worker_protocol.cpp`): serialise
-   the new report field in `TaskResult` (strict decoding: wrong types are `PARSE_ERROR`). Bump the
-   protocol minor version (1.1 today). Long stages must keep advancing the progress counter: the
+   the new report field in `TaskResult` (strict decoding: wrong types are `PARSE_ERROR`) and range-check
+   it in `validate_result` (a worker sending an out-of-range value is a protocol violation). Bump the
+   protocol minor version (1.1 today). A new resource bound belongs in `WorkerLimits`; the supervisor
+   refuses a handshake whose limits differ from its own. Long stages must keep advancing the progress counter: the
    supervisor treats a task whose heartbeat `task_progress` does not move for `task_stall_deadline`
    (60 s) as hung, cancels it, then terminates the worker (a retryable `WORKER_CRASH`).
 3. **Supervisor** (`src/app/analysis_supervisor.cpp`): copy the result into
@@ -37,6 +43,9 @@ fencing (lease, cancel epoch, content revision).
    `tests/test_support.hpp`: `test::write_wav`, `test::sine_samples`); "unknown" cases must return no
    value rather than a guess; a catalog test that a re-analysis never overrides a user value; protocol
    round trips and worker process behaviour in `tests/worker_tests.cpp` (suite `worker`; the worker's
-   `--self-test-fault` modes exist only for these tests).
+   `--self-test-fault` modes exist only for these tests). Run both suites under the `sanitize` preset
+   too (AddressSanitizer + UBSan; on Windows put `C:\msys64\clang64\bin` on `PATH` and set
+   `ASAN_SYMBOLIZER_PATH` to its `llvm-symbolizer.exe`): the worker's 2 GiB job-object memory cap
+   leaves ample room for ASan on Windows (peak commit measured at about 86 MiB).
 
 Be honest in docs: synthetic tests prove mechanics, not real-world accuracy.

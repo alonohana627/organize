@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <format>
+#include <limits>
 #include <map>
 
 #include <nlohmann/json.hpp>
 
+#include "mso/domain/json_fields.hpp"
 #include "mso/domain/taxonomy.hpp"
 #include "mso/search/detail/predicate_support.hpp"
 #include "mso/search/query_compiler.hpp"
@@ -50,8 +52,9 @@ std::optional<SortField> parse_sort_field(std::string_view text) noexcept {
 
 namespace {
 
-/// Version of the cursor token layout; version 2 added the library set to the fingerprint.
-constexpr int kCursorVersion = 2;
+/// Version of the cursor token layout; version 2 added the library set to the fingerprint,
+/// version 3 replaced the relevance offset with per-library ranks consumed.
+constexpr int kCursorVersion = 3;
 
 /// SQL expression for each sort field; text sorts compare normalized keys.
 std::string_view sort_expression(SortField field) {
@@ -118,8 +121,8 @@ struct LibraryPosition {
 
 /// A decoded continuation token.
 struct DecodedCursor {
-    std::map<std::string, LibraryPosition> positions;  ///< by library UUID text (metadata sorts)
-    std::size_t offset = 0;                            ///< rows already delivered (relevance)
+    std::map<std::string, LibraryPosition> positions;   ///< by library UUID text (metadata sorts)
+    std::map<std::string, std::size_t> ranks_consumed;  ///< by library UUID text: ranked rows delivered (relevance)
 };
 
 /// Identifies the result set a cursor belongs to: query, scope, order and the set of libraries.
@@ -135,12 +138,11 @@ std::string query_fingerprint(const SearchRequest& request, std::span<catalog::L
     for (const auto* library : libraries)
         library_set.push_back(uuids::to_string(library->uuid()));
     std::ranges::sort(library_set);
-    return picosha2::hash256_hex_string(nlohmann::json{
-        {"text", request.text},
-        {"scope", scope},
-        {"sort", to_string(request.sort)},
-        {"descending", request.descending},
-        {"libraries", library_set}}.dump());
+    return picosha2::hash256_hex_string(json_fields::dump_json(nlohmann::json{{"text", request.text},
+                                                                              {"scope", scope},
+                                                                              {"sort", to_string(request.sort)},
+                                                                              {"descending", request.descending},
+                                                                              {"libraries", library_set}}));
 }
 
 /// Reads a cursor without ever throwing: any malformed or foreign token is STALE_CURSOR.
@@ -148,40 +150,37 @@ Result<DecodedCursor> decode_cursor(const std::optional<Cursor>& cursor, const s
     DecodedCursor decoded;
     if (!cursor) return decoded;
     const auto stale = [] { return fail(ErrorCode::StaleCursor, "the result set changed; refresh the view"); };
-    const auto document = nlohmann::json::parse(cursor->token, nullptr, false);
-    if (!document.is_object()) return stale();
-    const auto version = document.find("v");
-    const auto query = document.find("q");
-    if (version == document.end() || !version->is_number_integer() || version->get<std::int64_t>() != kCursorVersion ||
-        query == document.end() || !query->is_string() || query->get_ref<const std::string&>() != fingerprint)
+    const auto document = json_fields::parse_json(cursor->token);
+    if (json_fields::integer_field(document, "v") != kCursorVersion ||
+        json_fields::string_field(document, "q") != fingerprint)
         return stale();
-    if (const auto offset = document.find("offset"); offset != document.end()) {
-        if (!offset->is_number_unsigned()) return stale();
-        decoded.offset = offset->get<std::size_t>();
+    if (const auto* ranked = json_fields::member_field(document, "ranked")) {
+        if (!ranked->is_object()) return stale();
+        for (const auto& [library, consumed] : ranked->items()) {
+            const auto count = json_fields::integer_value(consumed);
+            if (!count || *count < 0) return stale();
+            decoded.ranks_consumed.emplace(library, static_cast<std::size_t>(*count));
+        }
     }
-    const auto libraries = document.find("libraries");
-    if (libraries == document.end()) return decoded;
+    const auto* libraries = json_fields::member_field(document, "libraries");
+    if (libraries == nullptr) return decoded;
     if (!libraries->is_object()) return stale();
     for (const auto& [library, state] : libraries->items()) {
-        if (!state.is_object()) return stale();
-        const auto partition = state.find("p");
-        const auto value = state.find("v");
-        const auto last_id = state.find("id");
-        const auto started = state.find("started");
-        const auto exhausted = state.find("done");
-        if (partition == state.end() || !partition->is_number_integer() || value == state.end() ||
-            !(value->is_null() || value->is_number_integer() || value->is_string()) || last_id == state.end() ||
-            !last_id->is_number_integer() || started == state.end() || !started->is_boolean() ||
-            exhausted == state.end() || !exhausted->is_boolean())
+        const auto partition = json_fields::integer_field(state, "p");
+        const auto* value = json_fields::member_field(state, "v");
+        const auto last_id = json_fields::integer_field(state, "id");
+        const auto started = json_fields::boolean_field(state, "started");
+        const auto exhausted = json_fields::boolean_field(state, "done");
+        if (!partition || (*partition != 0 && *partition != 1) || value == nullptr ||
+            !(value->is_null() || value->is_number_integer() || value->is_string()) || !last_id || !started ||
+            !exhausted)
             return stale();
         LibraryPosition position;
-        const auto partition_value = partition->get<std::int64_t>();
-        if (partition_value != 0 && partition_value != 1) return stale();
-        position.partition = static_cast<int>(partition_value);
+        position.partition = static_cast<int>(*partition);
         position.value = *value;
-        position.last_id = last_id->get<std::int64_t>();
-        position.started = started->get<bool>();
-        position.exhausted = exhausted->get<bool>();
+        position.last_id = *last_id;
+        position.started = *started;
+        position.exhausted = *exhausted;
         decoded.positions.emplace(library, std::move(position));
     }
     return decoded;
@@ -204,16 +203,20 @@ Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& conne
         std::string folder_key = scope.folder ? path_key(*scope.folder, case_sensitive) : std::string();
         while (folder_key.ends_with('/'))
             folder_key.pop_back();
-        std::string part = std::format("EXISTS(SELECT 1 FROM locations sl WHERE sl.id={} AND sl.root_id=?",
-                                       detail::kPrimaryLocationIdSql);
-        out.parameters.emplace_back(*scope.root_id);
+        // The primary location lies in the root (and below the folder), as for `folder:`.
+        SqlPredicate condition;
+        condition.sql = "fl.root_id=?";
+        condition.parameters.emplace_back(*scope.root_id);
         if (!folder_key.empty()) {
             const std::string prefix = folder_key + '/';
-            part += " AND sl.path_key>=? AND sl.path_key<?";
-            out.parameters.emplace_back(prefix);
-            out.parameters.emplace_back(detail::prefix_upper_bound(prefix));
+            condition.sql += " AND fl.path_key>=? AND fl.path_key<?";
+            condition.parameters.emplace_back(prefix);
+            condition.parameters.emplace_back(detail::prefix_upper_bound(prefix));
         }
-        parts.push_back(part + ')');
+        auto filtered = primary_location_filter(connection, condition);
+        if (!filtered) return std::unexpected(filtered.error());
+        parts.push_back(std::move(filtered->sql));
+        out.parameters.insert(out.parameters.end(), filtered->parameters.begin(), filtered->parameters.end());
     }
     if (scope.collection_id) {
         auto collection = compile_collection(*scope.collection_id, connection);
@@ -296,8 +299,8 @@ Result<std::vector<OrderedKey>> fetch_library_keys(catalog::Library& library, co
             expression, filter->query.sql, filter->scope.sql, keyset, direction);
         auto statement = connection.prepare(sql);
         if (!statement) return std::unexpected(statement.error());
-        int next = bind_parameters(*statement, filter->query.parameters, 1);
-        next = bind_parameters(*statement, filter->scope.parameters, next);
+        int next = bind_parameters(*statement, filter->scope.parameters,
+                                   bind_parameters(*statement, filter->query.parameters, 1));
         if (resume && partition == 0) {
             const nlohmann::json& value = position.value;
             for (int repeat = 0; repeat < 2; ++repeat) {
@@ -385,9 +388,21 @@ struct RankedKey {
     double fused_score = 0;   ///< 1 / (k + rank within its library)
 };
 
+/// Global relevance order: text hits first, then fused score, library UUID and id. Within one
+/// library it follows the library's own ranking (text hits are ranked first there too, and the
+/// fused score falls with the rank), so per-library suffixes merge into the global continuation.
+bool ranks_before(const RankedKey& left, const RankedKey& right) {
+    if (left.text_match != right.text_match) return left.text_match;
+    if (left.fused_score != right.fused_score) return left.fused_score > right.fused_score;
+    if (left.library != right.library) return left.library < right.library;
+    return left.sample_id < right.sample_id;
+}
+
 /// Relevance sort: per library, the top kRelevanceDepth matches of the full filter, full-text hits
 /// by BM25 first; libraries are fused by reciprocal rank, text hits ahead of rows that matched
-/// only through a non-text branch (`kick OR tag:Drums`), which rank by name.
+/// only through a non-text branch (`kick OR tag:Drums`), which rank by name. The cursor records how
+/// many ranked rows of each library were delivered, so rows of a library whose hydration failed
+/// are retried on the next page (as metadata sorts do) instead of being skipped.
 Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries, const SearchRequest& request,
                                     const Query& query, const DecodedCursor& cursor, std::size_t page_size,
                                     const std::string& fingerprint) {
@@ -399,6 +414,7 @@ Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries
 
     SearchPage page;
     std::vector<RankedKey> fused;
+    std::map<uuids::uuid, std::size_t> ranked_counts;  ///< ranked rows per library that answered
     for (auto* library : libraries) {
         const auto identity = library->identity();
         LibraryCoverage coverage{identity.uuid, identity.name, true, std::nullopt};
@@ -424,8 +440,8 @@ Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries
             auto statement = reader->connection().prepare(sql);
             if (!statement) return std::unexpected(statement.error());
             statement->bind(1, match);
-            int next = bind_parameters(*statement, filter->query.parameters, 2);
-            next = bind_parameters(*statement, filter->scope.parameters, next);
+            const int next = bind_parameters(*statement, filter->scope.parameters,
+                                             bind_parameters(*statement, filter->query.parameters, 2));
             statement->bind(next, static_cast<std::int64_t>(SearchService::kRelevanceDepth + 1));
             std::vector<RankedKey> keys;
             while (true) {
@@ -446,35 +462,45 @@ Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries
                 page.relevance_window_limited = true;
                 ranked->resize(SearchService::kRelevanceDepth);
             }
-            fused.insert(fused.end(), ranked->begin(), ranked->end());
+            // Only this library's rows not delivered yet; its ranking order is the global one.
+            const auto consumed = cursor.ranks_consumed.find(uuids::to_string(identity.uuid));
+            const std::size_t skipped =
+                std::min(consumed != cursor.ranks_consumed.end() ? consumed->second : 0, ranked->size());
+            ranked_counts[identity.uuid] = ranked->size();
+            fused.insert(fused.end(), ranked->begin() + static_cast<std::ptrdiff_t>(skipped), ranked->end());
         }
         page.coverage.push_back(std::move(coverage));
     }
-    std::ranges::stable_sort(fused, [](const RankedKey& left, const RankedKey& right) {
-        if (left.text_match != right.text_match) return left.text_match;
-        if (left.fused_score != right.fused_score) return left.fused_score > right.fused_score;
-        if (left.library != right.library) return left.library < right.library;
-        return left.sample_id < right.sample_id;
-    });
+    std::ranges::stable_sort(fused, ranks_before);
+    if (fused.size() > page_size) fused.resize(page_size);
 
-    const std::size_t first = std::min(cursor.offset, fused.size());
-    const std::size_t last = std::min(first + page_size, fused.size());
     std::vector<PageEntry> entries;
-    for (std::size_t index = first; index < last; ++index)
-        entries.push_back({fused[index].library, fused[index].sample_id});
-    hydrate_page(libraries, entries, page.coverage, page.rows);
     std::map<std::pair<uuids::uuid, std::int64_t>, double> scores;
-    for (std::size_t index = first; index < last; ++index)
-        scores.emplace(std::pair{fused[index].library, fused[index].sample_id},
-                       fused[index].text_match ? fused[index].fused_score : 0.0);
+    for (const auto& key : fused) {
+        entries.push_back({key.library, key.sample_id});
+        scores.emplace(std::pair{key.library, key.sample_id}, key.text_match ? key.fused_score : 0.0);
+    }
+    const auto failed = hydrate_page(libraries, entries, page.coverage, page.rows);
     for (auto& row : page.rows)
         row.relevance = scores[{row.library, row.sample_id}];
-    if (last < fused.size())
-        page.next = Cursor{nlohmann::json{
-            {"v", kCursorVersion},
-            {"q", fingerprint},
-            {"libraries", nlohmann::json::object()},
-            {"offset", last}}.dump()};
+
+    // Advance each library by the rows delivered from it; a library whose rows could not be
+    // hydrated keeps its count so the next page retries them.
+    std::map<std::string, std::size_t> next_consumed = cursor.ranks_consumed;
+    for (const auto& key : fused)
+        if (!std::ranges::contains(failed, key.library)) ++next_consumed[uuids::to_string(key.library)];
+    bool more = false;
+    for (const auto& [library, count] : ranked_counts) {
+        const auto found = next_consumed.find(uuids::to_string(library));
+        more = more || (found != next_consumed.end() ? found->second : 0) < count;
+    }
+    if (more) {
+        nlohmann::json ranked_state = nlohmann::json::object();
+        for (const auto& [library, consumed] : next_consumed)
+            ranked_state[library] = consumed;
+        page.next = Cursor{json_fields::dump_json(
+            nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"ranked", std::move(ranked_state)}})};
+    }
     return page;
 }
 
@@ -544,9 +570,26 @@ Result<SearchPage> metadata_search(std::span<catalog::Library* const> libraries,
                           {"id", position.last_id},
                           {"started", position.started},
                           {"done", position.exhausted}};
-        page.next = Cursor{nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"libraries", state}}.dump()};
+        page.next = Cursor{
+            json_fields::dump_json(nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"libraries", state}})};
     }
     return page;
+}
+
+/// Checks every multi-segment `tag:`/`category:` value of a query the way the catalog will
+/// (split_taxonomy_path), so text that can never compile is refused before it is stored as a
+/// smart collection: INVALID_ARGUMENT, the same error a search with that text reports.
+Result<void> validate_taxonomy_paths(const QueryNode& node) {
+    for (const auto& child : node.children)
+        if (auto valid = validate_taxonomy_paths(*child); !valid) return valid;
+    if (node.kind != QueryNode::Kind::Predicate) return {};
+    const auto& predicate = node.predicate;
+    if (predicate.field != Field::Tag && predicate.field != Field::Category) return {};
+    if (predicate.text.find('/') == std::string::npos) return {};
+    if (auto segments = split_taxonomy_path(predicate.text); !segments)
+        return fail(ErrorCode::InvalidArgument, std::format("{}:{} is not a valid path: {}", to_string(predicate.field),
+                                                            predicate.text, segments.error().safe_detail));
+    return {};
 }
 
 }  // namespace
@@ -554,23 +597,38 @@ Result<SearchPage> metadata_search(std::span<catalog::Library* const> libraries,
 // ---------------------------------------------------------------- free functions
 
 Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const SearchRequest& request) {
+    return matching_ids(library, request, std::numeric_limits<std::size_t>::max());
+}
+
+Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const SearchRequest& request,
+                                               std::size_t maximum_ids) {
     auto query = parse_query(request.text);
     if (!query) return std::unexpected(query.error());
     auto reader = library.acquire_reader();
     if (!reader) return std::unexpected(reader.error());
     auto filter = compile_filter(*query, request.scope, reader->connection());
     if (!filter) return std::unexpected(filter.error());
+    const bool bounded = maximum_ids != std::numeric_limits<std::size_t>::max();
     auto statement = reader->connection().prepare(
         std::format("SELECT s.id FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
-                    "WHERE s.deleted=0 AND ({}) AND ({}) ORDER BY s.id",
-                    filter->query.sql, filter->scope.sql));
+                    "WHERE s.deleted=0 AND ({}) AND ({}) ORDER BY s.id{}",
+                    filter->query.sql, filter->scope.sql, bounded ? " LIMIT ?" : ""));
     if (!statement) return std::unexpected(statement.error());
-    bind_parameters(*statement, filter->scope.parameters, bind_parameters(*statement, filter->query.parameters, 1));
+    const int next =
+        bind_parameters(*statement, filter->scope.parameters, bind_parameters(*statement, filter->query.parameters, 1));
+    if (bounded) {
+        // One row more than allowed tells "exactly the limit" from "too many".
+        statement->bind(next,
+                        static_cast<std::int64_t>(
+                            std::min<std::size_t>(maximum_ids, std::numeric_limits<std::int64_t>::max() - 1) + 1));
+    }
     std::vector<std::int64_t> ids;
     while (true) {
         auto has_row = statement->next_row();
         if (!has_row) return std::unexpected(has_row.error());
         if (!*has_row) break;
+        if (ids.size() == maximum_ids)
+            return fail(ErrorCode::ResourceLimit, std::format("more than {} samples match", maximum_ids));
         ids.push_back(statement->column_int64(0));
     }
     return ids;
@@ -581,6 +639,7 @@ Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const 
 Result<void> SearchService::validate(std::string_view text) const {
     auto parsed = parse_query(text);
     if (!parsed) return std::unexpected(parsed.error());
+    if (parsed->root) return validate_taxonomy_paths(*parsed->root);
     return {};
 }
 

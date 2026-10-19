@@ -8,6 +8,7 @@
 /// demuxers are allowed. A file containing a URL therefore cannot cause any network access.
 #ifdef MSO_HAVE_FFMPEG
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -31,11 +32,15 @@ using ReadAtFunction = std::function<Result<std::size_t>(std::uint64_t offset, s
 /// Owns an AVFormatContext reading through a custom AVIOContext.
 class FfmpegInput {
 public:
-    /// Opens a demuxer over `read_at`. `probe_bytes` bounds FFmpeg's format probing.
+    /// Opens a demuxer over `read_at`. `probe_bytes` bounds FFmpeg's format probing. With a
+    /// `deadline`, FFmpeg's own loops (stream analysis decodes packets) are interrupted once it
+    /// passes, so CPU work is bounded by time as well as by the bytes the callback hands out.
     /// Errors: the callback's own error when it failed (e.g. ProbeLimit), UnsupportedCodec when no
-    /// allowed demuxer recognises the data, CorruptAudio for damaged headers.
-    static Result<std::unique_ptr<FfmpegInput>> open(ReadAtFunction read_at, std::uint64_t size,
-                                                     std::int64_t probe_bytes);
+    /// allowed demuxer recognises the data, CorruptAudio for damaged headers, ProbeLimit when the
+    /// deadline interrupted the open.
+    [[nodiscard]] static Result<std::unique_ptr<FfmpegInput>> open(
+        ReadAtFunction read_at, std::uint64_t size, std::int64_t probe_bytes,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
     FfmpegInput(const FfmpegInput&) = delete;
     FfmpegInput& operator=(const FfmpegInput&) = delete;
@@ -47,8 +52,9 @@ public:
     AVStream* audio_stream() const noexcept;
     /// Reads packets until every stream's parameters and durations are known, within the probe
     /// size given to open(). Errors: the read callback's error (e.g. ProbeLimit) when it failed,
-    /// CorruptAudio when FFmpeg could not analyse the streams.
-    Result<void> find_stream_info();
+    /// ProbeLimit when the deadline given to open() interrupted it, CorruptAudio when FFmpeg could
+    /// not analyse the streams.
+    [[nodiscard]] Result<void> find_stream_info();
     /// The error the read callback last reported, if any. A callback failure is not always fatal
     /// to FFmpeg (it may report a short stream instead), so callers check this after every step.
     const std::optional<Error>& read_error() const noexcept { return read_error_; }
@@ -60,11 +66,16 @@ private:
     static int read_packet(void* opaque, std::uint8_t* buffer, int buffer_size);
     /// AVIOContext seek callback (also answers AVSEEK_SIZE).
     static std::int64_t seek(void* opaque, std::int64_t offset, int whence);
+    /// AVIOInterruptCB callback: non-zero once the deadline has passed.
+    static int deadline_passed(void* opaque);
+    /// True when a deadline was given and has passed.
+    [[nodiscard]] bool past_deadline() const noexcept;
 
     ReadAtFunction read_at_;
     std::uint64_t size_ = 0;
     std::uint64_t position_ = 0;
     std::optional<Error> read_error_;
+    std::optional<std::chrono::steady_clock::time_point> deadline_;  ///< interrupts FFmpeg's loops
     AVIOContext* io_ = nullptr;
     AVFormatContext* format_ = nullptr;
 };

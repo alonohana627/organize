@@ -16,6 +16,7 @@ class NotificationBar final : public QFrame {
     Q_OBJECT
 
 public:
+    /// A hidden bar; show_error() shows it.
     explicit NotificationBar(QWidget* parent = nullptr);
 
     /// Shows `title` in bold and `details` below it, replacing any earlier message.
@@ -28,8 +29,8 @@ public:
 private:
     /// Widgets (owned through Qt's parent tree).
     QLabel* icon_label_ = nullptr;
-    QLabel* text_label_ = nullptr;
-    QToolButton* close_button_ = nullptr;
+    QLabel* text_label_ = nullptr;         ///< title and details
+    QToolButton* close_button_ = nullptr;  ///< dismisses the message
 };
 
 }  // namespace mso::ui

@@ -70,12 +70,13 @@ Result<void> probe_with_ffmpeg(BoundedFileReader& reader, ProbeResult& result) {
         [&reader](std::uint64_t offset, std::span<std::uint8_t> destination) {
             return reader.read_into(offset, destination);
         },
-        reader.file_size(), probe_bytes);
+        reader.file_size(), probe_bytes, reader.deadline());
     if (!input) return std::unexpected(input.error());
     result.format = demuxer_short_name((*input)->context()->iformat->name);
 
-    // Stream analysis fills durations and codec parameters the header alone does not state. It
-    // reads within the same byte budget; running out leaves a partial result with what is known.
+    // Stream analysis fills durations and codec parameters the header alone does not state; it may
+    // decode a few packets. It reads within the same byte budget and is interrupted at the probe's
+    // deadline; running out of either leaves a partial result with what is known.
     const Result<void> analysed = (*input)->find_stream_info();
     if (!analysed && analysed.error().code != ErrorCode::ProbeLimit) return analysed;
 

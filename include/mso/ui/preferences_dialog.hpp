@@ -36,10 +36,10 @@ private:
 
     /// Widgets (owned through Qt's parent tree).
     QCheckBox* audition_check_ = nullptr;
-    QTableWidget* shortcut_table_ = nullptr;
+    QTableWidget* shortcut_table_ = nullptr;         ///< one row per command
     std::vector<QKeySequenceEdit*> sequence_edits_;  ///< parallel to ShortcutCatalog::definitions()
-    QLabel* conflict_label_ = nullptr;
-    QDialogButtonBox* buttons_ = nullptr;
+    QLabel* conflict_label_ = nullptr;               ///< names conflicting shortcuts
+    QDialogButtonBox* buttons_ = nullptr;            ///< OK (disabled on conflicts) and Cancel
 };
 
 }  // namespace mso::ui

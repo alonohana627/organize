@@ -14,15 +14,21 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <optional>
+#include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "mso/analysis/analysis.hpp"
 #include "mso/domain/core.hpp"
+#include "mso/worker/detail/worker_platform.hpp"
 #include "mso/worker/worker_process.hpp"
 #include "mso/worker/worker_protocol.hpp"
 #include "test_support.hpp"
@@ -283,6 +289,32 @@ TEST_SUITE("worker") {
         SUBCASE("random bytes") {
             expect_parse_error(std::vector<std::uint8_t>(64, 0xA5));
         }
+    }
+
+    TEST_CASE("decode_frames reads a buffer of frames exactly as a pipe reader would") {
+        std::vector<std::uint8_t> bytes = frame_bytes(1, R"({"type":"shutdown"})");
+        const auto second = frame_bytes(7, "");
+        bytes.insert(bytes.end(), second.begin(), second.end());
+
+        const auto frames = worker::decode_frames(bytes);
+        REQUIRE(frames.has_value());
+        REQUIRE(frames->size() == 2);
+        CHECK((*frames)[0].request_sequence == 1);
+        CHECK((*frames)[0].payload == R"({"type":"shutdown"})");
+        CHECK((*frames)[1].request_sequence == 7);
+        CHECK((*frames)[1].payload.empty());
+
+        const auto empty = worker::decode_frames({});
+        REQUIRE(empty.has_value());
+        CHECK(empty->empty());
+
+        // A buffer that ends inside the second frame, and garbage, are parse errors.
+        const auto truncated = worker::decode_frames(std::span(bytes).first(bytes.size() - 1));
+        REQUIRE_FALSE(truncated.has_value());
+        CHECK(truncated.error().code == ErrorCode::ParseError);
+        const auto garbage = worker::decode_frames(std::vector<std::uint8_t>(64, 0xA5));
+        REQUIRE_FALSE(garbage.has_value());
+        CHECK(garbage.error().code == ErrorCode::ParseError);
     }
 
     TEST_CASE("encode_frame refuses payloads above 1 MiB") {
@@ -556,7 +588,8 @@ TEST_SUITE("worker") {
     }
 
     TEST_CASE("an invalid handshake keeps the worker from starting") {
-        for (const std::string_view fault : {"wrong-process-id", "message-before-handshake", "stale-algorithm"}) {
+        for (const std::string_view fault :
+             {"wrong-process-id", "message-before-handshake", "stale-algorithm", "foreign-limits"}) {
             CAPTURE(fault);
             const auto error = expect_start_failure(self_test_options(fault));
             CHECK(error.code == ErrorCode::WorkerCrash);
@@ -595,6 +628,19 @@ TEST_SUITE("worker") {
         const auto exited = expect_event<worker::WorkerExited>(*process, 10s);
         REQUIRE(exited.failure.has_value());
         CHECK(exited.failure->safe_detail.find("protocol violation") != std::string::npos);
+    }
+
+    TEST_CASE("a waveform segment with more bins than the task asked for is a protocol violation") {
+        ScratchDirectory scratch("worker-excess-bins");
+        auto process = start_worker(self_test_options("excess-waveform-bins"));
+        const auto task = make_task(0.1, {analysis::Stage::Waveform}, scratch.file("excess.seg"));
+        REQUIRE(process->submit(task).has_value());
+        const auto failure = expect_event<worker::TaskFailed>(*process, 10s);
+        CHECK(failure.code == ErrorCode::WorkerCrash);
+        CHECK(failure.fence == worker::TaskFence::of(task));
+        const auto exited = expect_event<worker::WorkerExited>(*process, 10s);
+        REQUIRE(exited.failure.has_value());
+        CHECK(exited.failure->safe_detail.find("more bins") != std::string::npos);
     }
 
     TEST_CASE("self-test task reports progress and publishes a complete waveform segment") {
@@ -693,6 +739,25 @@ TEST_SUITE("worker") {
         REQUIRE(exited.failure.has_value());
         CHECK(exited.failure->code == ErrorCode::WorkerCrash);
         CHECK_FALSE(process->is_running());
+    }
+
+    TEST_CASE("a worker whose task is stuck still exits by itself soon after Shutdown") {
+        auto options = self_test_options("stall-task");
+        options.shutdown_grace = 20s;  // far beyond the worker's own deadline for its task thread
+        auto process = start_worker(options);
+        const auto task = make_task(60.0);
+        REQUIRE(process->submit(task).has_value());
+        // The task thread is blocked once the heartbeat reports the task as active.
+        REQUIRE(mso::test::wait_until([&] { return process->task_activity().has_value(); }, 10s));
+
+        const auto started = std::chrono::steady_clock::now();
+        process->shutdown();
+        CHECK(std::chrono::steady_clock::now() - started < options.shutdown_grace);
+        const auto failure = expect_event<worker::TaskFailed>(*process, 5s);
+        CHECK(failure.code == ErrorCode::Cancelled);
+        const auto exited = expect_event<worker::WorkerExited>(*process, 5s);
+        CHECK_FALSE(exited.failure.has_value());
+        CHECK(exited.exit_code == 0);  // its own clean exit, not the supervisor's termination
     }
 
     TEST_CASE("a stalled task that honors cancellation fails retryably and the worker keeps running") {
@@ -797,6 +862,43 @@ TEST_SUITE("worker") {
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ErrorCode::WorkerCrash);
     }
+
+#ifdef _WIN32
+    TEST_CASE("cancel_blocked_read aborts a read that the worker's death did not end") {
+        // A worker that never writes (no handshake, no heartbeats) leaves the reader blocked, just
+        // like a pipe that another process inherited and keeps open after the worker died.
+        auto options = self_test_options("no-handshake");
+        auto child = worker::platform::ChildProcess::spawn(mso::test::worker_executable(), options);
+        REQUIRE_MESSAGE(child.has_value(), (child ? std::string() : child.error().message()));
+        auto& process = **child;
+
+        std::atomic<bool> read_returned{false};
+        std::optional<mso::Result<std::size_t>> read_result;
+        std::jthread reader([&] {
+            process.register_reader_thread();
+            worker::HandleStream channel(process.from_child());
+            std::array<std::uint8_t, 16> buffer{};
+            read_result = channel.read_some(buffer);
+            read_returned = true;
+        });
+        // The cancel only hits a read already in progress, so it is repeated until one lands.
+        const bool unblocked = mso::test::wait_until(
+            [&] {
+                process.cancel_blocked_read();
+                return read_returned.load();
+            },
+            10s);
+        if (!unblocked) process.terminate();  // ends the read, so a failed check cannot hang the run
+        REQUIRE(unblocked);
+        reader.join();
+        REQUIRE(read_result.has_value());
+        REQUIRE_FALSE(read_result->has_value());
+        CHECK(read_result->error().code == ErrorCode::WorkerCrash);
+        CHECK_FALSE(process.wait_for_exit(0ms).has_value());  // the worker itself is still alive
+        process.terminate();
+        CHECK(process.wait_for_exit(5s).has_value());
+    }
+#endif
 
     TEST_CASE("a missing worker executable fails to start") {
         auto options = self_test_options();

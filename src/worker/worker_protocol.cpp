@@ -27,11 +27,11 @@ namespace {
 
 // ---------------------------------------------------------------- frame layout
 
-constexpr std::size_t kMagicOffset = 0;
-constexpr std::size_t kMajorOffset = 4;
-constexpr std::size_t kMinorOffset = 6;
-constexpr std::size_t kLengthOffset = 8;
-constexpr std::size_t kSequenceOffset = 12;
+constexpr std::size_t kMagicOffset = 0;      ///< 4 bytes "MSOW"
+constexpr std::size_t kMajorOffset = 4;      ///< uint16 protocol major
+constexpr std::size_t kMinorOffset = 6;      ///< uint16 protocol minor
+constexpr std::size_t kLengthOffset = 8;     ///< uint32 payload length
+constexpr std::size_t kSequenceOffset = 12;  ///< uint64 request sequence
 
 /// The `sizeof(T)` header bytes of a field at `offset`.
 template <class T, std::size_t Offset>
@@ -44,6 +44,22 @@ template <class T, std::size_t Offset>
 std::span<const std::uint8_t, sizeof(T)> field(std::span<const std::uint8_t, kFrameHeaderBytes> header) {
     return header.subspan<Offset, sizeof(T)>();
 }
+
+/// ByteSource over a caller's buffer: serves the bytes once, then reports end of stream.
+class BufferSource final : public ByteSource {
+public:
+    explicit BufferSource(std::span<const std::uint8_t> bytes) noexcept : remaining_(bytes) {}
+
+    Result<std::size_t> read_some(std::span<std::uint8_t> destination) override {
+        const std::size_t count = std::min(destination.size(), remaining_.size());
+        std::ranges::copy(remaining_.first(count), destination.begin());
+        remaining_ = remaining_.subspan(count);
+        return count;
+    }
+
+private:
+    std::span<const std::uint8_t> remaining_;  ///< bytes not read yet
+};
 
 /// Reads until `destination` is full or the stream ends; returns how many bytes arrived.
 Result<std::size_t> read_fully(ByteSource& source, std::span<std::uint8_t> destination) {
@@ -205,6 +221,7 @@ Result<void> validate_report(const analysis::AnalysisReport& report) {
         const auto& tempo = *report.tempo;
         if (!is_unit_interval(tempo.confidence))
             return fail(ErrorCode::InvalidArgument, "tempo confidence out of range");
+        // The estimator's reported range in the wire unit (thousandths of a BPM).
         constexpr auto kLowestMilliBpm = static_cast<std::int64_t>(analysis::kMinimumReportedBpm * 1000.0);
         constexpr auto kHighestMilliBpm = static_cast<std::int64_t>(analysis::kMaximumReportedBpm * 1000.0);
         if (tempo.milli_bpm && (*tempo.milli_bpm < kLowestMilliBpm || *tempo.milli_bpm > kHighestMilliBpm))
@@ -697,6 +714,21 @@ Result<std::optional<Frame>> read_frame(ByteSource& source) {
     if (*payload_received < frame.payload.size())
         return fail(ErrorCode::ParseError, "worker channel ended inside a frame payload");
     return std::optional<Frame>(std::move(frame));
+}
+
+Result<std::vector<Frame>> decode_frames(std::span<const std::uint8_t> bytes) {
+    try {
+        BufferSource source(bytes);
+        std::vector<Frame> frames;
+        while (true) {
+            auto frame = read_frame(source);
+            if (!frame) return std::unexpected(frame.error());
+            if (!*frame) return frames;
+            frames.push_back(std::move(**frame));
+        }
+    } catch (const std::bad_alloc&) {
+        return fail(ErrorCode::ResourceLimit, "out of memory while decoding worker frames");
+    }
 }
 
 Result<void> write_frame(ByteSink& sink, std::uint64_t request_sequence, std::string_view payload) {

@@ -15,10 +15,10 @@
 namespace mso::analysis {
 namespace {
 
-constexpr double kFullScale = 8388608.0;  ///< 2^23
-constexpr std::int32_t kMinimumS24 = -8388608;
-constexpr std::int32_t kMaximumS24 = 8388607;
-constexpr std::size_t kBytesPerSample = 3;
+constexpr double kFullScale = 8388608.0;        ///< 2^23
+constexpr std::int32_t kMinimumS24 = -8388608;  ///< most negative signed 24-bit sample
+constexpr std::int32_t kMaximumS24 = 8388607;   ///< most positive signed 24-bit sample
+constexpr std::size_t kBytesPerSample = 3;      ///< hashed as little-endian signed 24-bit
 
 }  // namespace
 
@@ -35,7 +35,7 @@ public:
     }
 
 private:
-    picosha2::hash256_one_by_one hasher_;
+    picosha2::hash256_one_by_one hasher_;  ///< picosha2's streaming state
 };
 
 std::int32_t quantize_to_s24(float sample) noexcept {

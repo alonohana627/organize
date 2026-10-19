@@ -6,8 +6,10 @@
 /// results back to the UI thread. Application events arrive on background threads; the session
 /// merges them (one pending catalog change per library, the latest progress per operation) and
 /// re-emits them as Qt signals on the UI thread in one batch. Preferences are cached in memory and
-/// updated synchronously; writes to the workspace file are coalesced. Destruction stops the pool
-/// before the Application, so no worker ever touches a destroyed Application.
+/// updated synchronously; writes to the workspace file are coalesced. Long tasks (exports, backups)
+/// run on a pool of their own, so they never delay page loads and edits. Destruction requests the
+/// shutdown stop token and waits for both pools before the Application goes, so no worker ever
+/// touches a destroyed Application.
 #include <QObject>
 #include <QString>
 #include <QThreadPool>
@@ -43,7 +45,10 @@ public:
     static constexpr std::size_t kMaxCoalescedSampleIds = 50'000;
     /// Preference writes within this window are combined into one workspace write.
     static constexpr int kPreferenceWriteDelayMilliseconds = 400;
+    /// Long tasks (exports, backups) that run at once; more wait in their own queue.
+    static constexpr int kLongTaskThreads = 2;
 
+    /// A session that starts the Application with `options` (see start()).
     explicit ApplicationSession(app::ApplicationOptions options, QObject* parent = nullptr);
     ~ApplicationSession() override;
 
@@ -97,6 +102,13 @@ public:
             std::move(deliver));
     }
 
+    /// Like run() but on the long-task pool (exports, backups), which page loads and edits never
+    /// wait behind. Long work should observe shutdown_token().
+    template <class Work, class Deliver>
+    void run_long_task(QObject* context, Work work, Deliver deliver) {
+        run_on(long_task_pool_, context, std::move(work), std::move(deliver));
+    }
+
     /// Runs `work(Application&)` on the pool without a delivery (results are reported by events).
     template <class Work>
     void run_detached(Work work) {
@@ -126,10 +138,10 @@ public:
     std::stop_token shutdown_token() const { return shutdown_.get_token(); }
 
     // SamplePageSource
-    void request_page(const search::SearchRequest& request, std::optional<uuids::uuid> library, QObject* context,
-                      PageDelivery deliver) override;
-    void request_count(const search::SearchRequest& request, std::optional<uuids::uuid> library, QObject* context,
-                       CountDelivery deliver) override;
+    void request_page(const search::SearchRequest& request, std::optional<uuids::uuid> library,
+                      std::stop_token obsolete, QObject* context, PageDelivery deliver) override;
+    void request_count(const search::SearchRequest& request, std::optional<uuids::uuid> library,
+                       std::stop_token obsolete, QObject* context, CountDelivery deliver) override;
     void request_rows(const std::vector<SampleKey>& keys, QObject* context, RowsDelivery deliver) override;
 
     // EditGateway
@@ -157,6 +169,10 @@ signals:
     void analysisProgressed(const mso::app::AnalysisProgressEvent& event);
     /// A long operation ended.
     void operationFinished(const mso::app::OperationFinishedEvent& event);
+    /// A background step failed (index update, analysis transition, workspace write).
+    void backgroundError(const mso::app::BackgroundErrorEvent& event);
+    /// A library became writable (or read-only); librariesChanged() follows with the new state.
+    void libraryAccessChanged(const mso::app::LibraryAccessChangedEvent& event);
 
 private:
     /// Merges `event` into the pending batch (any thread) and schedules one delivery.
@@ -171,8 +187,9 @@ private:
     /// How start() creates the Application.
     app::ApplicationOptions options_;
     QThreadPool pool_;               ///< blocking Application calls
+    QThreadPool long_task_pool_;     ///< exports and backups (kLongTaskThreads)
     QThreadPool preference_writer_;  ///< one thread: workspace writes stay in order
-    std::stop_source shutdown_;
+    std::stop_source shutdown_;      ///< requested when the session shuts down
     /// Null until start() succeeds.
     std::unique_ptr<app::Application> application_;
     /// Open libraries as of the last refresh.
@@ -180,11 +197,11 @@ private:
 
     std::mutex events_mutex_;                            ///< guards the two members below
     std::vector<app::ApplicationEvent> pending_events_;  ///< merged; bounded by libraries + operations
-    bool dispatch_scheduled_ = false;
+    bool dispatch_scheduled_ = false;                    ///< a dispatch is queued on the UI thread
 
     std::map<std::string, nlohmann::json, std::less<>> preferences_;  ///< authoritative UI-side copy
     std::set<std::string, std::less<>> dirty_preferences_;            ///< changed since the last write
-    QTimer preference_write_timer_;
+    QTimer preference_write_timer_;  ///< coalesces preference writes (kPreferenceWriteDelayMilliseconds)
 };
 
 }  // namespace mso::ui

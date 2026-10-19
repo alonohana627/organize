@@ -21,6 +21,7 @@ constexpr std::size_t kXingTocBytes = 100;
 constexpr std::size_t kLameDelayOffset = 21;  // encoder string(9), revision, lowpass, replay gain(8), flags, bitrate
 constexpr std::size_t kVbriOffset = 4 + 32;   // fixed position after the header in the first frame
 constexpr std::int64_t kMicrosecondsPerSecond = 1'000'000;
+constexpr std::uint32_t kDecoderDelayFrames = 528 + 1;  // MPEG layer III decoder delay (LAME's definition)
 
 /// The big-endian 32-bit word at `offset` (0 when the span is too short).
 std::uint32_t header_word_at(Bytes bytes, std::size_t offset) {
@@ -38,7 +39,7 @@ struct LocatedFrame {
 /// Frame count and gapless trim from a Xing/Info/VBRI header in the first frame.
 struct VbrHeader {
     std::optional<std::uint64_t> frame_count;
-    std::uint64_t trim_frames = 0;  // LAME encoder delay + padding
+    std::uint64_t trim_frames = 0;  // frames a gapless decoder removes (see parse_xing_header)
 };
 
 /// Xing ("VBR") or Info ("CBR") header, optionally followed by a LAME tag with gapless trim.
@@ -61,7 +62,13 @@ std::optional<VbrHeader> parse_xing_header(Bytes frame, const MpegFrameHeader& h
     if (has_encoder_name) {
         ByteCursor trim(lame_tag.subspan(kLameDelayOffset));
         const std::uint32_t packed = trim.u24_be();
-        vbr.trim_frames = (packed >> 12) + (packed & 0xFFF);  // encoder delay + end padding
+        // Encoder delay + end padding. The decoder's own delay (528 + 1 frames) is removed from the
+        // start, so at least that many frames go at the end too: when the stated padding is
+        // shorter, those last frames never leave the decoder (dr_mp3 clamps the same way), and the
+        // count must match what a decoder delivers to be exact.
+        const std::uint32_t encoder_delay = packed >> 12;
+        const std::uint32_t end_padding = packed & 0xFFF;
+        vbr.trim_frames = encoder_delay + std::max(end_padding, kDecoderDelayFrames);
     }
     return vbr;
 }
@@ -174,9 +181,9 @@ Result<void> probe_mpeg_audio(BoundedFileReader& reader, std::uint64_t search_of
     // No frame count: estimate from the first frame's bitrate. Never exact (VBR, junk, tags).
     // duration [us] = bytes * 8 [bits] / (kbps * 1000 [bits/s]) * 1e6 = bytes * 8000 / kbps.
     const std::uint64_t audio_bytes = audio_end > first.offset ? audio_end - first.offset : 0;
-    if (const auto microsecond_kilobits = checked_multiply(audio_bytes, 8 * kMicrosecondsPerSecond / 1000)) {
+    if (const auto bits_times_thousand = checked_multiply(audio_bytes, 8 * kMicrosecondsPerSecond / 1000)) {
         result.duration_us =
-            static_cast<std::int64_t>(*microsecond_kilobits / static_cast<std::uint64_t>(header.bitrate_kbps));
+            static_cast<std::int64_t>(*bits_times_thousand / static_cast<std::uint64_t>(header.bitrate_kbps));
     }
     result.duration_exact = false;
     return {};

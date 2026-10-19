@@ -21,6 +21,7 @@ option(MSO_WITH_FFMPEG "Decode AAC/Opus/ALAC/WMA through FFmpeg when its librari
 option(MSO_REQUIRE_FFMPEG "Fail the configuration without FFmpeg, and fail (not skip) the FFmpeg-dependent tests (CI)" OFF)
 option(MSO_BUILD_TESTS "Build the test executables and register them with CTest" ON)
 option(MSO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors in project code" OFF)
+option(MSO_BUILD_FUZZERS "Build the libFuzzer targets in tests/fuzz (needs MSO_SANITIZERS with address)" OFF)
 
 if(MSO_REQUIRE_GUI AND NOT MSO_BUILD_GUI)
   message(FATAL_ERROR "MSO_REQUIRE_GUI=ON contradicts MSO_BUILD_GUI=OFF")
@@ -48,9 +49,11 @@ endif()
 #   domain <- catalog <- search;  domain <- media <- {audio, analysis};  {catalog, media} <- files;
 #   analysis <- worker (protocol and supervision of the mso-worker process);
 #   {catalog, search, files, analysis, worker} <- app;  app, audio <- cli;  ui is the desktop app.
-mso_module(domain PUBLIC mso::stduuid mso::json mso::picosha2 PRIVATE mso::utf8proc)
-mso_module(catalog MODULES domain PUBLIC mso::sqlite3)
-mso_module(search MODULES catalog)
+# Each module links the vendored libraries it uses itself: PUBLIC when their types appear in its headers
+# (stduuid and nlohmann in domain's), PRIVATE otherwise, so no module relies on another's dependencies.
+mso_module(domain PUBLIC mso::stduuid mso::json PRIVATE mso::utf8proc)
+mso_module(catalog MODULES domain PUBLIC mso::sqlite3 PRIVATE mso::picosha2)
+mso_module(search MODULES catalog PRIVATE mso::picosha2)
 mso_module(media MODULES domain PRIVATE mso::miniaudio mso::utf8proc)
 if(TARGET mso::ffmpeg)
   message(STATUS "MSO: media module links FFmpeg")
@@ -59,11 +62,11 @@ if(TARGET mso::ffmpeg)
 endif()
 mso_module(files MODULES catalog media PRIVATE mso::thread_pool mso::readerwriterqueue)
 mso_module(audio MODULES media PRIVATE mso::miniaudio mso::readerwriterqueue mso::signalsmith_stretch)
-mso_module(analysis MODULES media PUBLIC mso::json PRIVATE mso::pocketfft)
+mso_module(analysis MODULES media PRIVATE mso::pocketfft mso::picosha2)
 # Worker IPC protocol, process supervision and platform confinement: every src/worker/ source except
 # main.cpp (the mso-worker executable). Headers in include/mso/worker/.
 mso_module(worker MODULES analysis PUBLIC mso::json PRIVATE mso::picosha2 EXCLUDE main.cpp)
-mso_module(app MODULES catalog search files analysis worker PRIVATE mso::csv_parser mso::thread_pool)
+mso_module(app MODULES catalog search files analysis worker PRIVATE mso::csv_parser mso::thread_pool mso::picosha2)
 # Every CLI source except main.cpp, so the CLI tests can drive the commands in-process.
 mso_module(cli MODULES app audio media PUBLIC mso::cli11 EXCLUDE main.cpp)
 
@@ -108,7 +111,6 @@ if(MSO_BUILD_GUI)
     mso_add_executable_icon(MusicSampleOrganizer)
     mso_add_window_icon_resources(MusicSampleOrganizer)
     target_link_libraries(MusicSampleOrganizer PRIVATE mso_ui)
-    target_compile_definitions(MusicSampleOrganizer PRIVATE MSO_VERSION_STRING="${PROJECT_VERSION}")
     set_target_properties(MusicSampleOrganizer PROPERTIES AUTOMOC ON)
     mso_apply_options(MusicSampleOrganizer)
     add_dependencies(MusicSampleOrganizer mso-worker)
@@ -125,6 +127,9 @@ target_link_libraries(mso_cli PRIVATE mso::generated)
 
 if(MSO_BUILD_TESTS)
   add_subdirectory(tests)
+endif()
+if(MSO_BUILD_FUZZERS)
+  add_subdirectory(tests/fuzz)
 endif()
 mso_finalize_module_graph()
 

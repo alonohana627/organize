@@ -43,8 +43,13 @@ std::string profile_digest(const std::vector<std::string>& stage_names, const st
     return picosha2::hash256_hex_string(description);
 }
 
-/// Validates a worker-written waveform segment before it is referenced by the catalog.
+/// Validates a worker-written waveform segment before it is referenced by the catalog. The size is
+/// checked before anything is read, so a wrong or runaway file is never loaded into memory.
 Result<void> verify_waveform_segment(const std::filesystem::path& file, const worker::WaveformSegment& segment) {
+    std::error_code size_error;
+    const auto size = std::filesystem::file_size(file, size_error);
+    if (size_error) return fail(ErrorCode::FileMissing, "waveform segment missing");
+    if (size != segment.byte_length) return fail(ErrorCode::CorruptAudio, "waveform segment has the wrong size");
     std::ifstream in(file, std::ios::binary);
     if (!in) return fail(ErrorCode::FileMissing, "waveform segment missing");
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -104,7 +109,40 @@ void AnalysisSupervisor::set_paused(bool paused) {
         consecutive_failures_.store(0);
     }
     paused_.store(paused);
+    {
+        std::lock_guard lock(wake_mutex_);
+        wake_requested_ = true;
+        if (!paused) retry_requested_ = true;
+    }
+    wake_.notify_all();
+}
+
+void AnalysisSupervisor::abandon_library(const uuids::uuid& library) {
+    std::lock_guard lock(libraries_mutex_);
+    abandoned_.insert(library);
+}
+
+void AnalysisSupervisor::serve_library(const uuids::uuid& library) {
+    {
+        std::lock_guard lock(libraries_mutex_);
+        abandoned_.erase(library);
+    }
     notify();
+}
+
+bool AnalysisSupervisor::abandoned(const catalog::Library& library) const {
+    std::lock_guard lock(libraries_mutex_);
+    return abandoned_.contains(library.uuid());
+}
+
+void AnalysisSupervisor::report_lease_error(catalog::Library& library, const Error& error) {
+    {
+        std::lock_guard lock(libraries_mutex_);
+        auto& last = last_lease_errors_[library.uuid()];
+        if (last == error.message()) return;
+        last = error.message();
+    }
+    if (hooks_.on_error) hooks_.on_error(&library, "leasing an analysis job", error);
 }
 
 AnalysisSupervisor::Status AnalysisSupervisor::status() const {
@@ -154,11 +192,15 @@ bool AnalysisSupervisor::run_once(std::stop_token stop, std::size_t rotation) {
     auto libraries = hooks_.libraries();
     for (std::size_t offset = 0; offset < libraries.size() && !stop.stop_requested(); ++offset) {
         auto& library = *libraries[(rotation + offset) % libraries.size()];
-        if (library.read_only()) continue;
+        if (library.read_only() || abandoned(library)) continue;
         auto lease = library.lease_next_job(timing_.lease_duration);
         if (!lease) {
-            report(&library, "leasing an analysis job", std::unexpected(lease.error()));
+            report_lease_error(library, lease.error());
             continue;
+        }
+        {
+            std::lock_guard lock(libraries_mutex_);
+            last_lease_errors_.erase(library.uuid());
         }
         if (!*lease) continue;
         process(library, **lease, stop);
@@ -178,19 +220,28 @@ void AnalysisSupervisor::record_worker_failure(catalog::Library& library, const 
         paused_.store(true);  // do not spin; resuming retries
         return;
     }
-    // Exponential backoff before the next attempt (interrupted by shutdown or notify()).
+    // Exponential backoff before the next attempt (ended early by shutdown or by resuming; a plain
+    // notify() for new work does not end it, or repeated new runs would defeat the backoff).
     auto delay = timing_.first_retry_delay;
     for (int doubling = 1; doubling < failures && delay < timing_.maximum_retry_delay; ++doubling)
         delay *= 2;
     delay = std::min(delay, timing_.maximum_retry_delay);
     std::unique_lock lock(wake_mutex_);
-    wake_.wait_for(lock, stop, delay, [] { return false; });
+    retry_requested_ = false;
+    wake_.wait_for(lock, stop, delay, [&] { return retry_requested_; });
+    retry_requested_ = false;
 }
 
 void AnalysisSupervisor::process(catalog::Library& library, const catalog::Library::JobLease& lease,
                                  std::stop_token stop) {
     const auto stages = parse_stages(lease.stages);
-    auto path = hooks_.resolve_path(library, lease.sample_id);
+    auto detail = library.sample_detail(lease.sample_id);
+    if (!detail) {
+        report(&library, "recording a job whose sample cannot be read",
+               library.fail_job(lease, detail.error().code, false));
+        return;
+    }
+    auto path = hooks_.resolve_path(library, *detail);
     if (!path) {
         report(&library, "recording an unreachable sample",
                library.fail_job(lease, path.error().code, path.error().retryable));
@@ -213,12 +264,6 @@ void AnalysisSupervisor::process(catalog::Library& library, const catalog::Libra
         worker_->process = std::move(*started);
     }
 
-    auto detail = library.sample_detail(lease.sample_id);
-    if (!detail) {
-        report(&library, "recording a job whose sample cannot be read",
-               library.fail_job(lease, detail.error().code, false));
-        return;
-    }
     const auto relative_segment =
         std::format("derived/waveforms/{}-r{}.mswf", uuids::to_string(detail->uuid), lease.content_revision);
     const auto segment_file = library.directory() / relative_segment;
@@ -259,6 +304,14 @@ void AnalysisSupervisor::process(catalog::Library& library, const catalog::Libra
         if (stop.stop_requested()) {
             cancel_task();
             report(&library, "returning a job at shutdown", library.release_job(lease));
+            return;
+        }
+        if (abandoned(library)) {
+            // The library is closing: give the job back at once so nothing keeps it (and its lock)
+            // alive, and stop the worker so no task of it is still in flight for the next job.
+            cancel_task();
+            report(&library, "returning a job of a closing library", library.release_job(lease));
+            worker_->process.reset();
             return;
         }
         const auto now = Clock::now();
@@ -314,6 +367,9 @@ void AnalysisSupervisor::process(catalog::Library& library, const catalog::Libra
             facts.key_requested = has_stage(stages, analysis::Stage::Key);
             facts.tempo_algorithm = analysis::AlgorithmVersions::kTempo;
             facts.key_algorithm = analysis::AlgorithmVersions::kKey;
+            facts.loudness_algorithm = analysis::AlgorithmVersions::kLoudness;
+            facts.pcm_hash_algorithm = analysis::AlgorithmVersions::kPcmHash;
+            facts.waveform_algorithm = analysis::AlgorithmVersions::kWaveform;
             if (report_data.tempo) {
                 facts.bpm_milli = report_data.tempo->milli_bpm;
                 facts.bpm_confidence = report_data.tempo->confidence;

@@ -5,7 +5,6 @@
 #include <QCloseEvent>
 #include <QDockWidget>
 #include <QHeaderView>
-#include <QInputDialog>
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QMenu>
@@ -17,9 +16,9 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
-#include <map>
 
 #include "mso/ui/about_dialog.hpp"
+#include "mso/ui/analysis_controller.hpp"
 #include "mso/ui/application_session.hpp"
 #include "mso/ui/display_format.hpp"
 #include "mso/ui/drag_path_resolver.hpp"
@@ -29,7 +28,7 @@
 #include "mso/ui/history_panel.hpp"
 #include "mso/ui/inspector_panel.hpp"
 #include "mso/ui/jobs_panel.hpp"
-#include "mso/ui/layout_store.hpp"
+#include "mso/ui/layout_controller.hpp"
 #include "mso/ui/library_controller.hpp"
 #include "mso/ui/navigator_panel.hpp"
 #include "mso/ui/notification_bar.hpp"
@@ -55,8 +54,7 @@ constexpr int kDefaultHeight = 860;
 
 }  // namespace
 
-MainWindow::MainWindow(ApplicationSession& session, QWidget* parent)
-    : QMainWindow(parent), session_(session), layout_presets_(session) {
+MainWindow::MainWindow(ApplicationSession& session, QWidget* parent) : QMainWindow(parent), session_(session) {
     setWindowTitle(tr("Music Sample Organizer"));
     setObjectName(QStringLiteral("MainWindow"));
     setDockNestingEnabled(true);
@@ -79,12 +77,20 @@ MainWindow::MainWindow(ApplicationSession& session, QWidget* parent)
     connect_session();
     apply_shortcuts(shortcuts_);
 
-    default_state_ = saveState(LayoutStore::kSchemaVersion);
-    default_header_state_ = table_->horizontalHeader()->saveState();
+    layout_controller_->capture_default();
     update_status_labels();
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() {
+    // ~QWidget destroys the panels and controllers after this window's own members (the timers
+    // above all), and while they die they still emit (current item, selection, visibility). Cut
+    // every connection into this window first, so no handler runs against a half-destroyed window.
+    for (QObject* child : findChildren<QObject*>())
+        QObject::disconnect(child, nullptr, this, nullptr);
+    QObject::disconnect(&session_, nullptr, this, nullptr);
+    selection_timer_.stop();
+    window_refresh_timer_.stop();
+}
 
 void MainWindow::restore_saved_state() {
     shortcuts_ = ShortcutCatalog::from_json(session_.preference(ShortcutCatalog::kPreferenceKey));
@@ -92,8 +98,12 @@ void MainWindow::restore_saved_state() {
     const nlohmann::json audition = session_.preference(UiPreferenceKeys::kAuditionOnSelection);
     audition_on_selection_ = audition.is_boolean() && audition.get<bool>();
     preview_->load_preferences();
-    restore_layout(session_.preference(LayoutStore::kCurrentLayoutKey));
-    rebuild_layout_presets_menu();
+    layout_controller_->restore_saved();
+}
+
+QAction* MainWindow::command(const QString& id) const {
+    const auto found = commands_.find(id);
+    return found == commands_.end() ? nullptr : found->second;
 }
 
 // ---------------------------------------------------------------- construction
@@ -132,15 +142,20 @@ void MainWindow::build_central() {
     const auto schedule_selection_update = [this] { selection_timer_.start(); };
     connect(table_->selectionModel(), &QItemSelectionModel::selectionChanged, this, schedule_selection_update);
     connect(table_->selectionModel(), &QItemSelectionModel::currentChanged, this, schedule_selection_update);
-    // Rows patched by an edit or refreshed in place reach the inspector in the same pass.
-    connect(model_, &QAbstractItemModel::dataChanged, this, schedule_selection_update);
+    // Rows patched by an edit or refreshed in place reach the inspector in the same pass; changes
+    // to rows outside the selection (analysis results elsewhere) do not re-read the selection.
+    connect(model_, &QAbstractItemModel::dataChanged, this,
+            [this](const QModelIndex& top_left, const QModelIndex& bottom_right) {
+                if (rows_touch_selection(top_left.row(), bottom_right.row())) selection_timer_.start();
+            });
     connect(model_, &QAbstractItemModel::rowsRemoved, this, schedule_selection_update);
     connect(model_, &QAbstractItemModel::modelReset, this, schedule_selection_update);
     connect(table_, &QAbstractItemView::doubleClicked, this, [this] { preview_->play_selected(); });
     connect(table_, &SampleTableView::dragRefused, this, &MainWindow::show_status);
     connect(table_, &SampleTableView::mixedDragRefused, this,
             [this](const std::vector<SampleKey>& available, std::size_t unavailable) {
-                // startDrag() is still on the stack: open the dialog afterwards.
+                // startDrag() is still on the stack: open the dialog afterwards. Only values are
+                // used after the box's event loop.
                 QTimer::singleShot(0, this, [this, available, unavailable] {
                     QMessageBox box(QMessageBox::Warning, tr("Some samples are unavailable"),
                                     tr("%n of the selected samples are offline or missing, so nothing was dragged.",
@@ -174,10 +189,8 @@ void MainWindow::build_central() {
         update_status_labels();
     });
     connect(model_, &SampleTableModel::queryFailed, this, &MainWindow::show_status);
-    connect(model_, &SampleTableModel::refreshed, this, [this] {
-        table_->select_keys(saved_selection_, saved_current_);
-        selection_timer_.start();
-    });
+    // Persistent indexes already moved the selection with its samples: only re-read it.
+    connect(model_, &SampleTableModel::refreshed, this, schedule_selection_update);
 }
 
 QDockWidget* MainWindow::add_dock(const QString& object_name, const QString& title, QWidget* content,
@@ -217,15 +230,6 @@ QAction* MainWindow::add_command(const QString& id, const QString& text, void (M
     auto* action = new QAction(text, this);
     connect(action, &QAction::triggered, this, handler);
     commands_[id] = action;
-    if (ShortcutCatalog::scope(id) == ShortcutScope::SampleTable) {
-        // Space, Delete, F and digits act on the table's selection only while the table has focus,
-        // never while the user types in the navigator, inspector or search box.
-        action->setShortcutContext(Qt::WidgetWithChildrenShortcut);
-        table_->addAction(action);
-    } else {
-        action->setShortcutContext(Qt::WindowShortcut);
-        addAction(action);  // keyboard-only commands work without a menu entry
-    }
     return action;
 }
 
@@ -244,12 +248,9 @@ void MainWindow::build_actions() {
     add_command(QStringLiteral("preferences"), tr("&Preferences…"), &MainWindow::show_preferences);
     add_command(QStringLiteral("quit"), tr("&Quit"), &MainWindow::quit);
     for (int rating = 0; rating <= 5; ++rating) {
-        const QString id = QStringLiteral("rating_%1").arg(rating);
         auto* action = new QAction(rating == 0 ? tr("Clear Rating") : tr("Rate %n Star(s)", nullptr, rating), this);
-        action->setShortcutContext(Qt::WidgetWithChildrenShortcut);
         connect(action, &QAction::triggered, this, [this, rating] { set_rating(rating); });
-        table_->addAction(action);
-        commands_[id] = action;
+        commands_[QStringLiteral("rating_%1").arg(rating)] = action;
     }
     analyze_waveforms_action_ = new QAction(tr("Generate &Waveforms for Selection"), this);
     analyze_musical_action_ = new QAction(tr("&Musical Analysis (BPM, Key) for Selection"), this);
@@ -298,17 +299,13 @@ void MainWindow::build_menus() {
     analysis->addSeparator();
     pause_analysis_action_ = analysis->addAction(tr("&Pause All Analysis"));
     pause_analysis_action_->setCheckable(true);
-    connect(pause_analysis_action_, &QAction::triggered, this, &MainWindow::set_analysis_paused);
 
     QMenu* view = menuBar()->addMenu(tr("&View"));
     for (QDockWidget* dock : docks_)
         view->addAction(dock->toggleViewAction());
     view->addSeparator();
-    view->addAction(tr("&Reset Layout"), this, &MainWindow::reset_layout);
-    view->addAction(tr("&Save Layout Preset…"), this, &MainWindow::save_layout_preset);
-    layout_presets_menu_ = view->addMenu(tr("Layout &Presets"));
-    delete_presets_menu_ = view->addMenu(tr("&Delete Layout Preset"));
-    rebuild_layout_presets_menu();
+    layout_controller_ = new LayoutController(session_, *this, *table_->horizontalHeader());
+    layout_controller_->add_menu_entries(*view);
 
     QMenu* help = menuBar()->addMenu(tr("&Help"));
     help->addAction(tr("&About Music Sample Organizer"), this, &MainWindow::show_about);
@@ -317,6 +314,7 @@ void MainWindow::build_menus() {
 void MainWindow::build_status_bar() {
     catalog_label_ = new QLabel(this);
     catalog_label_->setAccessibleName(tr("Catalog state"));
+    catalog_label_->setTextFormat(Qt::PlainText);  // scope labels carry folder and tag names
     count_label_ = new QLabel(this);
     count_label_->setAccessibleName(tr("Result count"));
     selection_label_ = new QLabel(this);
@@ -330,6 +328,7 @@ void MainWindow::connect_controllers() {
     edit_controller_ = new EditController(session_, *model_, this);
     library_controller_ = new LibraryController(session_, this);
     export_controller_ = new ExportController(session_, *jobs_, this);
+    analysis_controller_ = new AnalysisController(session_, this);
     SampleMenuCommands menu_commands;
     menu_commands.play = commands_.at(QStringLiteral("play_pause"));
     for (int stars = 0; stars <= 5; ++stars)
@@ -353,7 +352,7 @@ void MainWindow::connect_controllers() {
     });
     connect(edit_controller_, &EditController::reloadRequested, this, &MainWindow::refresh_results);
     connect(inspector_, &InspectorPanel::editRequested, this,
-            [this](const catalog::EditCommand& command) { edit_selection(command, tr("Saved")); });
+            [this](const catalog::EditCommand& command) { edit_selection(command, tr("Edit"), tr("Saved")); });
     connect(table_, &SampleTableView::ratingClicked, this, [this](const SampleKey& key, int rating) {
         catalog::EditCommand command;
         command.rating = rating;
@@ -364,7 +363,7 @@ void MainWindow::connect_controllers() {
         const std::vector<search::SampleRow> samples = table_->selected_samples();
         if (row < 0 || samples.empty()) return;  // empty space below the rows: nothing to act on
         const search::SampleRow* clicked = model_->loaded_row(row);
-        context_menu_->show(position, samples, clicked ? *clicked : samples.front());
+        context_menu_->show(position, samples, table_->selected_row_count(), clicked ? *clicked : samples.front());
     });
     connect(context_menu_, &SampleContextMenu::statusMessage, this, &MainWindow::show_status);
     connect(history_, &HistoryPanel::undoRequested, this, &MainWindow::undo);
@@ -396,24 +395,26 @@ void MainWindow::connect_controllers() {
     connect(library_controller_, &LibraryController::statusMessage, this, &MainWindow::show_status);
     connect(library_controller_, &LibraryController::failed, this, &MainWindow::show_failure);
     connect(export_controller_, &ExportController::statusMessage, this, &MainWindow::show_status);
+    connect(export_controller_, &ExportController::failed, this, &MainWindow::show_failure);
     connect(preview_, &PreviewPanel::statusMessage, this, &MainWindow::show_status);
 
-    // Jobs.
+    // Analysis and jobs.
+    connect(analysis_controller_, &AnalysisController::pausedChanged, this, [this](bool paused) {
+        pause_analysis_action_->setChecked(paused);
+        jobs_->set_analysis_paused(paused);
+    });
+    connect(analysis_controller_, &AnalysisController::statusMessage, this, &MainWindow::show_status);
+    connect(analysis_controller_, &AnalysisController::failed, this, &MainWindow::show_failure);
+    connect(pause_analysis_action_, &QAction::triggered, analysis_controller_, &AnalysisController::set_paused);
+    connect(jobs_, &JobsPanel::analysisPauseRequested, analysis_controller_, &AnalysisController::set_paused);
+    connect(jobs_, &JobsPanel::analysisControlRequested, analysis_controller_, &AnalysisController::control_run);
     connect(jobs_, &JobsPanel::cancelOperationRequested, this, [this](app::OperationId operation) {
         session_.run_detached([operation](app::Application& application) { application.cancel_operation(operation); });
     });
-    connect(jobs_, &JobsPanel::analysisControlRequested, this,
-            [this](const uuids::uuid& library, std::int64_t run_id, catalog::Library::RunControl control) {
-                session_.run(
-                    this,
-                    [library, run_id, control](app::Application& application) {
-                        return application.control_analysis(library, run_id, control);
-                    },
-                    [this](Result<void> result) {
-                        if (!result) show_failure(tr("Analysis control failed"), DisplayFormat::error(result.error()));
-                    });
-            });
-    connect(jobs_, &JobsPanel::analysisPauseRequested, this, &MainWindow::set_analysis_paused);
+
+    // Layout.
+    connect(layout_controller_, &LayoutController::headerRestored, this, &MainWindow::sync_sort_with_header);
+    connect(layout_controller_, &LayoutController::statusMessage, this, &MainWindow::show_status);
 }
 
 void MainWindow::connect_session() {
@@ -436,6 +437,21 @@ void MainWindow::connect_session() {
     connect(&session_, &ApplicationSession::analysisProgressed, this, [this](const app::AnalysisProgressEvent& event) {
         jobs_->update_analysis(event, session_.library_name(event.library));
     });
+    connect(&session_, &ApplicationSession::backgroundError, this, [this](const app::BackgroundErrorEvent& event) {
+        const QString context = DisplayFormat::from_utf8(event.context);
+        const QString details =
+            event.library ? tr("%1: %2").arg(session_.library_name(*event.library), DisplayFormat::error(event.error))
+                          : DisplayFormat::error(event.error);
+        show_failure(tr("Problem while %1").arg(context), details);
+    });
+    connect(&session_, &ApplicationSession::libraryAccessChanged, this,
+            [this](const app::LibraryAccessChangedEvent& event) {
+                const QString name = session_.library_name(event.library);
+                show_status(event.read_only
+                                ? (event.in_use_elsewhere ? tr("%1 is read-only: another program is using it").arg(name)
+                                                          : tr("%1 is read-only now").arg(name))
+                                : tr("%1 can be edited again (the other program released it)").arg(name));
+            });
     connect(&session_, &ApplicationSession::rootAvailabilityChanged, this,
             [this](const app::RootAvailabilityEvent& event) {
                 // The rows' availability arrives as a catalog change; here only the labels and paths.
@@ -447,12 +463,7 @@ void MainWindow::connect_session() {
 // ---------------------------------------------------------------- session and query state
 
 void MainWindow::on_session_ready() {
-    session_.run(
-        this, [](app::Application& application) { return application.analysis_paused(); },
-        [this](bool paused) {
-            pause_analysis_action_->setChecked(paused);
-            jobs_->set_analysis_paused(paused);
-        });
+    analysis_controller_->load_paused_state();
 }
 
 void MainWindow::on_libraries_changed() {
@@ -466,11 +477,16 @@ void MainWindow::on_libraries_changed() {
         model_->clear();
         preview_->select_sample(std::nullopt, {});
     }
+    std::vector<uuids::uuid> open;
+    for (const auto& info : libraries)
+        open.push_back(info.uuid);
+    jobs_->retain_libraries(open);  // runs of a closed library are no longer cancellable
     navigator_->reload();
     history_->reload();
     root_locations_->reload();
     // The open libraries changed, so even an identical query covers different data now.
     if (any_open) model_->run_query(DisplayFormat::to_utf8(search_bar_->text()), scope_);
+    selection_timer_.start();  // a library that became writable re-enables the inspector's edits
     update_status_labels();
 }
 
@@ -487,24 +503,23 @@ void MainWindow::on_catalog_changed(const app::CatalogChangedEvent& event) {
             keys.push_back(key);
             selected_sample_changed = selected_sample_changed || key == current;
         }
-        model_->refresh_rows(keys);  // in place: no re-query, no scroll jump
+        const std::size_t loaded = model_->refresh_rows(keys);  // in place: no re-query, no scroll jump
         if (selected_sample_changed) inspector_->reload_detail();
         // Samples the table has not loaded may be new (an import) or may now match the query: re-read
         // the visible window, at most every kWindowRefreshMilliseconds (the index answers in ms).
-        if (model_->rows_of(keys).size() < keys.size() && !window_refresh_timer_.isActive())
-            window_refresh_timer_.start();
+        if (loaded < keys.size() && !window_refresh_timer_.isActive()) window_refresh_timer_.start();
     }
     if (event.structure_changed) {
         navigator_->reload_library(event.library);
         inspector_->reload_library_choices();
         root_locations_->reload();
     }
-    if (history_->library() == event.library) history_->reload();
+    // History made by this window is reloaded when its edit settles (EditController); this covers
+    // history made elsewhere, read at most every few seconds and only while the panel is visible.
+    history_->catalog_changed(event.library);
 }
 
 void MainWindow::refresh_results() {
-    saved_selection_ = table_->selected_keys();
-    saved_current_ = table_->current_key();
     model_->refresh(table_->first_visible_row());
 }
 
@@ -512,6 +527,16 @@ void MainWindow::apply_query() {
     if (session_.libraries().empty()) return;
     model_->set_query(DisplayFormat::to_utf8(search_bar_->text()), scope_);
     update_status_labels();
+}
+
+bool MainWindow::rows_touch_selection(int first, int last) const {
+    const QItemSelectionModel* selection = table_->selectionModel();
+    if (!selection) return false;
+    const int current = selection->currentIndex().row();
+    if (current >= first && current <= last) return true;
+    return std::ranges::any_of(selection->selection(), [first, last](const QItemSelectionRange& range) {
+        return range.top() <= last && range.bottom() >= first;
+    });
 }
 
 void MainWindow::on_selection_changed() {
@@ -634,34 +659,52 @@ void MainWindow::redo() {
         show_status(tr("Select a sample or library to redo in."));
 }
 
-void MainWindow::edit_selection(catalog::EditCommand command, const QString& done_message) {
-    const std::vector<SampleKey> keys = table_->selected_keys();
-    if (keys.empty()) {
-        show_status(tr("Select one or more loaded samples first."));
-        return;
+std::optional<std::vector<SampleKey>> MainWindow::complete_selection(const QString& action) {
+    const std::size_t selected = table_->selected_row_count();
+    if (selected == 0) {
+        show_status(tr("Select one or more samples first."));
+        return std::nullopt;
     }
-    edit_controller_->apply(keys, std::move(command), done_message);
+    std::vector<SampleKey> keys = table_->selected_keys();
+    if (keys.size() < selected) {
+        // Acting on the loaded part only would change fewer samples than the status bar says are
+        // selected, without telling anyone.
+        show_failure(tr("%1: nothing was changed").arg(action),
+                     tr("Only %1 of the %2 selected samples are loaded (the table keeps about %3 in memory), so "
+                        "the command would miss the others. Select fewer samples and try again.")
+                         .arg(DisplayFormat::count(static_cast<std::int64_t>(keys.size())),
+                              DisplayFormat::count(static_cast<std::int64_t>(selected)),
+                              DisplayFormat::count(SampleTableModel::kMaxHydratedPages * SampleTableModel::kPageSize)));
+        return std::nullopt;
+    }
+    return keys;
+}
+
+void MainWindow::edit_selection(catalog::EditCommand command, const QString& action, const QString& done_message) {
+    if (auto keys = complete_selection(action)) edit_controller_->apply(*keys, std::move(command), done_message);
 }
 
 void MainWindow::remove_selection_from_library() {
     catalog::EditCommand command;
     command.removed = true;
-    edit_selection(command, tr("Removed from the library; files untouched; undo to restore"));
+    edit_selection(command, tr("Remove from library"),
+                   tr("Removed from the library; files untouched; undo to restore"));
 }
 
 void MainWindow::toggle_favorite() {
+    const auto keys = complete_selection(tr("Toggle favorite"));
+    if (!keys) return;
     const auto samples = table_->selected_samples();
-    if (samples.empty()) return;
     const bool all_favorite = std::ranges::all_of(samples, [](const auto& sample) { return sample.favorite; });
     catalog::EditCommand command;
     command.favorite = !all_favorite;
-    edit_selection(command, all_favorite ? tr("Unmarked favorite") : tr("Marked favorite"));
+    edit_controller_->apply(*keys, command, all_favorite ? tr("Unmarked favorite") : tr("Marked favorite"));
 }
 
 void MainWindow::set_rating(int rating) {
     catalog::EditCommand command;
     command.rating = rating;
-    edit_selection(command, rating == 0 ? tr("Cleared rating") : tr("Rated %n star(s)", nullptr, rating));
+    edit_selection(command, tr("Rating"), rating == 0 ? tr("Cleared rating") : tr("Rated %n star(s)", nullptr, rating));
 }
 
 void MainWindow::create_smart_collection(const uuids::uuid& library, const QString& name) {
@@ -693,59 +736,20 @@ void MainWindow::focus_search() {
     search_bar_->focus_and_select();
 }
 
-// ---------------------------------------------------------------- analysis
-
 void MainWindow::analyze_waveforms() {
-    start_analysis("Waveforms", tr("Generate waveforms"));
+    analyze_selection("Waveforms", tr("Generate waveforms"));
 }
 
 void MainWindow::analyze_musical() {
-    start_analysis("Musical", tr("Musical analysis (BPM, key)"));
+    analyze_selection("Musical", tr("Musical analysis (BPM, key)"));
 }
 
 void MainWindow::analyze_duplicates() {
-    start_analysis("Duplicates", tr("Duplicate detection"));
+    analyze_selection("Duplicates", tr("Duplicate detection"));
 }
 
-void MainWindow::start_analysis(const std::string& profile, const QString& description) {
-    const std::vector<SampleKey> keys = table_->selected_keys();
-    if (keys.empty() || !session_.is_ready()) {
-        show_status(tr("Select the samples to analyze first."));
-        return;
-    }
-    const auto answer = QMessageBox::question(
-        this, description,
-        tr("%1 for %n selected sample(s)?\n\nEach file is decoded once in the background. Samples that already "
-           "have current results are skipped. You can pause or cancel the run in the Jobs panel.",
-           nullptr, static_cast<int>(keys.size()))
-            .arg(description));
-    if (answer != QMessageBox::Yes) return;
-    std::map<uuids::uuid, std::vector<std::int64_t>> groups;
-    for (const SampleKey& key : keys)
-        groups[key.library].push_back(key.sample_id);
-    for (const auto& [library, sample_ids] : groups) {
-        session_.run(
-            this,
-            [library, profile, sample_ids](app::Application& application) {
-                return application.start_analysis(library, profile, sample_ids);
-            },
-            [this, library, description](Result<catalog::Library::AnalysisRunStatus> run) {
-                if (!run) {
-                    show_failure(tr("Could not start the analysis"),
-                                 tr("%1: %2").arg(session_.library_name(library), DisplayFormat::error(run.error())));
-                    return;
-                }
-                show_status(tr("%1 queued in %2").arg(description, session_.library_name(library)));
-            });
-    }
-}
-
-void MainWindow::set_analysis_paused(bool paused) {
-    pause_analysis_action_->setChecked(paused);
-    jobs_->set_analysis_paused(paused);
-    if (session_.is_ready())
-        session_.run_detached([paused](app::Application& application) { application.set_analysis_paused(paused); });
-    show_status(paused ? tr("Background analysis paused") : tr("Background analysis resumed"));
+void MainWindow::analyze_selection(const std::string& profile, const QString& description) {
+    if (auto keys = complete_selection(description)) analysis_controller_->start(*keys, profile, description);
 }
 
 // ---------------------------------------------------------------- preferences and layout
@@ -763,62 +767,28 @@ void MainWindow::show_preferences() {
 void MainWindow::apply_shortcuts(const ShortcutBindings& bindings) {
     for (const auto& [id, action] : commands_) {
         const auto found = bindings.find(id);
-        action->setShortcut(found != bindings.end() ? found->second : QKeySequence());
+        const QKeySequence sequence = found != bindings.end() ? found->second : QKeySequence();
+        action->setShortcut(sequence);
+        // Space, Delete, F, digits — and any command the user rebound to a single key — act only
+        // while the table has focus, never while the user types in the navigator, inspector or
+        // search box. Only modifier shortcuts are window-wide.
+        const bool table_scoped =
+            ShortcutCatalog::scope(id) == ShortcutScope::SampleTable || ShortcutCatalog::is_single_key(sequence);
+        if (table_scoped) {
+            removeAction(action);
+            table_->addAction(action);
+        } else {
+            table_->removeAction(action);
+            addAction(action);  // keyboard-only commands work without a menu entry
+        }
+        action->setShortcutContext(table_scoped ? Qt::WidgetWithChildrenShortcut : Qt::WindowShortcut);
     }
-}
-
-bool MainWindow::restore_layout(const nlohmann::json& layout) {
-    const bool restored = LayoutStore::restore(*this, *table_->horizontalHeader(), layout);
-    sync_sort_with_header();  // whatever part of the header was applied
-    return restored;
 }
 
 void MainWindow::sync_sort_with_header() {
     // A restored header shows a sort indicator; make the model query with that sort.
     const QHeaderView* header = table_->horizontalHeader();
     model_->sort(header->sortIndicatorSection(), header->sortIndicatorOrder());
-}
-
-void MainWindow::reset_layout() {
-    restoreState(default_state_, LayoutStore::kSchemaVersion);
-    table_->horizontalHeader()->restoreState(default_header_state_);
-    sync_sort_with_header();
-    for (QDockWidget* dock : docks_)
-        dock->show();
-    show_status(tr("Layout reset"));
-}
-
-void MainWindow::save_layout_preset() {
-    bool accepted = false;
-    const QString name =
-        QInputDialog::getText(this, tr("Save layout preset"), tr("Preset name:"), QLineEdit::Normal, {}, &accepted)
-            .trimmed();
-    if (!accepted || name.isEmpty()) return;
-    layout_presets_.save(name, LayoutStore::capture(*this, *table_->horizontalHeader()));
-    rebuild_layout_presets_menu();
-    show_status(tr("Saved layout preset “%1”").arg(name));
-}
-
-void MainWindow::rebuild_layout_presets_menu() {
-    layout_presets_menu_->clear();
-    delete_presets_menu_->clear();
-    const QStringList names = layout_presets_.names();
-    if (names.isEmpty()) {
-        layout_presets_menu_->addAction(tr("(none saved)"))->setEnabled(false);
-        delete_presets_menu_->addAction(tr("(none saved)"))->setEnabled(false);
-        return;
-    }
-    for (const QString& name : names) {
-        layout_presets_menu_->addAction(name, this, [this, name] {
-            const auto layout = layout_presets_.layout(name);
-            if (!layout || !restore_layout(*layout))
-                show_status(tr("This preset was saved by an incompatible version and was not fully applied."));
-        });
-        delete_presets_menu_->addAction(name, this, [this, name] {
-            layout_presets_.remove(name);
-            rebuild_layout_presets_menu();
-        });
-    }
 }
 
 void MainWindow::show_about() {
@@ -850,7 +820,7 @@ void MainWindow::show_status(const QString& message) {
 void MainWindow::closeEvent(QCloseEvent* event) {
     export_controller_->cancel_all();
     preview_->stop();
-    session_.set_preference(LayoutStore::kCurrentLayoutKey, LayoutStore::capture(*this, *table_->horizontalHeader()));
+    layout_controller_->save_current();
     session_.flush_preferences();
     event->accept();
 }

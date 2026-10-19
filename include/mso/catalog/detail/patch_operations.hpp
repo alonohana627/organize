@@ -52,13 +52,14 @@ struct PatchEffects {
 
 /// Reads the current value an operation compares against. DB_CORRUPT for a malformed operation.
 /// For `tag_links` the value is true/false when all samples agree, null when they are mixed.
-Result<nlohmann::json> read_current_value(sqlite::Connection& connection, const nlohmann::json& operation);
+[[nodiscard]] Result<nlohmann::json> read_current_value(sqlite::Connection& connection,
+                                                        const nlohmann::json& operation);
 
 /// Applies an operation in the given direction after the compare-and-set check. Returns
 /// HISTORY_CONFLICT (with the offending operation in the detail) when the current value differs from
 /// the expected one, DB_CORRUPT when the stored operation is malformed. Changed samples are recorded
 /// with mark_sample_changed; structural effects are reported in `effects`.
-Result<void> apply_operation(sqlite::Connection& connection, const nlohmann::json& operation, PatchDirection direction,
-                             PatchEffects& effects);
+[[nodiscard]] Result<void> apply_operation(sqlite::Connection& connection, const nlohmann::json& operation,
+                                           PatchDirection direction, PatchEffects& effects);
 
 }  // namespace mso::catalog::detail

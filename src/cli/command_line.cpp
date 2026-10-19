@@ -1,7 +1,5 @@
 // The `mso` command line: CommandContext, the exception barrier and exit-code mapping, and the
 // process entry point (main.cpp only calls run_main()).
-#include <charconv>
-#include <cmath>
 #include <sstream>
 
 #include "mso/cli/command_context.hpp"
@@ -14,14 +12,6 @@
 #endif
 
 namespace mso::cli {
-
-namespace {
-
-/// Accepted BPM range of an override, in BPM.
-constexpr double kMinimumBpm = 1.0;
-constexpr double kMaximumBpm = 999.0;
-
-}  // namespace
 
 CommandContext::CommandContext(std::FILE* output, std::FILE* errors) : output_(output), errors_(errors) {}
 
@@ -93,17 +83,6 @@ int CommandContext::report(const Error& error) const {
 int CommandContext::usage(std::string_view message) const {
     std::println(errors_, "usage error: {}", message);
     return kExitUsage;
-}
-
-Result<std::int64_t> parse_bpm_milli(std::string_view text) {
-    double value = 0;
-    const auto* end = text.data() + text.size();
-    const auto parsed = std::from_chars(text.data(), end, value, std::chars_format::fixed);
-    if (text.empty() || parsed.ec != std::errc() || parsed.ptr != end || !std::isfinite(value) || value < kMinimumBpm ||
-        value > kMaximumBpm)
-        return fail(ErrorCode::InvalidArgument,
-                    std::format("'{}' is not a BPM between {} and {}", text, kMinimumBpm, kMaximumBpm));
-    return static_cast<std::int64_t>(std::llround(value * 1000.0));
 }
 
 int run(std::span<const std::string> arguments, std::FILE* output, std::FILE* errors) {

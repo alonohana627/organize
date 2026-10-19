@@ -1,12 +1,18 @@
-# Builds and tests on Windows (MSYS2 CLANG64: clang + libc++, prebuilt Qt 6 and FFmpeg packages) and
-# Linux (LLVM clang + libc++, distribution FFmpeg), plus a Linux Debug +
-# AddressSanitizer/UndefinedBehaviorSanitizer run and a lint job. Only this project and its vendored
-# deps/ are compiled; every other dependency is a prebuilt package.
+# Continuous integration. The owner's focus is Windows, so every build and test job runs there (MSYS2
+# CLANG64: clang + libc++, prebuilt Qt 6 and FFmpeg packages); only this project and its vendored deps/
+# are compiled. Jobs:
+#   lint       vendored-dependency check and clang-format (Ubuntu, a minute)
+#   windows    one leg per preset, all with the desktop app and FFmpeg required:
+#                ci           release build, every test, then install, a smoke test of the installed app
+#                             without MSYS2 on PATH, and the .msi (uploaded as an artifact)
+#                ci-debug     Debug with libc++ debug hardening (bounds, iterator and comparator checks)
+#                ci-sanitize  Debug with AddressSanitizer + UndefinedBehaviorSanitizer, symbolized reports
+#   fuzz       every libFuzzer target in tests/fuzz for 60 s from its seed corpus (tools/run_fuzzers.py):
+#              crash-proofing against damaged or unusual files; crashing inputs are uploaded
+#   linux      parked (see the job): the code stays Linux-buildable, but no Linux run is current
 #
-# The desktop app and its UI tests run on Windows. Linux has no prebuilt Qt built with libc++ (the
-# distribution and Qt-installer binaries use libstdc++, see docs/BUILDING.md), and building Qt in CI
-# is too slow, so the Linux jobs build the core, the CLI and the worker and run every non-UI suite
-# (MSO_BUILD_GUI=OFF). FFmpeg is mandatory everywhere (MSO_REQUIRE_FFMPEG in the ci presets).
+# Speed: prebuilt packages only, and a ccache per leg that is saved even when the run fails or is
+# cancelled (actions/cache/save with if: always()), so the next run reuses whatever was compiled.
 # Actions are pinned by commit SHA (the release tag is in the trailing comment).
 name: ci
 
@@ -26,7 +32,8 @@ env:
   CLANG_FORMAT_VERSION: "23.1.3"
   CMAKE_C_COMPILER_LAUNCHER: ccache
   CMAKE_CXX_COMPILER_LAUNCHER: ccache
-  CCACHE_MAXSIZE: 500M
+  # Per leg; the five cached legs stay inside GitHub's 10 GB cache budget, which evicts the oldest entries.
+  CCACHE_MAXSIZE: 400M
 
 jobs:
   lint:
@@ -43,19 +50,24 @@ jobs:
             | xargs -0 "$HOME/.local/bin/clang-format" --dry-run -Werror
 
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [ci, ci-debug, ci-sanitize]
     defaults:
       run:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # MSYS2 is a rolling distribution whose packages cannot be pinned; the next step prints the
-      # versions used. A toolchain bump that adds warnings fails here as it would on a developer PC.
+      # versions used. `update: false` skips the base-system upgrade (several minutes): the build uses
+      # only the CLANG64 packages below, which are installed at their current versions either way.
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: CLANG64
-          update: true
+          update: false
           install: >-
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-cmake
@@ -68,21 +80,36 @@ jobs:
       - name: Toolchain versions
         run: clang++ --version && cmake --version && python --version && ffmpeg -hide_banner -version | head -1
       - name: Restore compiler cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .ccache
-          key: ccache-windows-${{ github.sha }}
-          restore-keys: ccache-windows-
+          key: ccache-windows-${{ matrix.preset }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-windows-${{ matrix.preset }}-
       - name: Configure
-        run: CCACHE_DIR="$PWD/.ccache" cmake --preset ci
+        run: CCACHE_DIR="$PWD/.ccache" cmake --preset ${{ matrix.preset }}
       - name: Build
-        run: CCACHE_DIR="$PWD/.ccache" cmake --build --preset ci -- -k 0
+        # -k 0: report every compile error of the run, not only the first failing file.
+        run: |
+          export CCACHE_DIR="$PWD/.ccache"
+          ccache --zero-stats
+          cmake --build --preset ${{ matrix.preset }} -- -k 0
+          ccache --show-stats
+      - name: Save compiler cache (also after a failed or cancelled run)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-windows-${{ matrix.preset }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Test
-        run: ctest --preset ci
+        # The sanitizer leg symbolizes its reports: CMake finds llvm-symbolizer next to clang and passes
+        # ASAN_SYMBOLIZER_PATH to every test.
+        run: ctest --preset ${{ matrix.preset }}
       - name: Install
+        if: matrix.preset == 'ci'
         run: cmake --install build/ci --prefix "$PWD/install"
       # The installed application must start with no MSYS2 directory on PATH (the double-click case).
       - name: Smoke-test the installed application without MSYS2 on PATH
+        if: matrix.preset == 'ci'
         shell: pwsh
         run: |
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
@@ -92,10 +119,77 @@ jobs:
           if ($gui.ExitCode -ne 0) { throw "MusicSampleOrganizer.exe exited with $($gui.ExitCode)" }
           & install\bin\mso.exe capabilities
           if ($LASTEXITCODE -ne 0) { throw "mso.exe exited with $LASTEXITCODE" }
+      # WiX Toolset 3.14 (CPack's WIX generator) from Chocolatey at a fixed version; WIX tells CPack where.
+      - name: Install the WiX Toolset
+        if: matrix.preset == 'ci'
+        shell: pwsh
+        run: |
+          choco install wixtoolset --version=3.14.1 --no-progress -y
+          "WIX=${env:ProgramFiles(x86)}\WiX Toolset v3.14" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the installer (.msi)
+        if: matrix.preset == 'ci'
+        run: cpack --config build/ci/CPackConfig.cmake -B build/ci/package
+      - name: Upload the installer
+        if: matrix.preset == 'ci'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: MusicSampleOrganizer-msi
+          path: build/ci/package/*.msi
+          retention-days: 7
+
+  fuzz:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: CLANG64
+          update: false
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-ccache
+            mingw-w64-clang-x86_64-ffmpeg
+      - name: Restore compiler cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-windows-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-windows-fuzz-
+      - name: Configure and build the fuzz targets
+        run: |
+          export CCACHE_DIR="$PWD/.ccache"
+          cmake --preset fuzz
+          cmake --build --preset fuzz -- -k 0
+      - name: Save compiler cache (also after a failed or cancelled run)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-windows-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Fuzz every target for 60 s
+        run: python tools/run_fuzzers.py --build-dir build/fuzz --seconds 60 --jobs 4
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: build/fuzz/fuzz-artifacts
+          retention-days: 14
 
   linux:
-    # Parked by the owner (2026-10-19): most users are on Windows. The job builds and passes; delete
-    # the next line to run it again.
+    # Parked by the owner (2026-10-19): the focus is Windows. Its last run, 39229983572, FAILED: both
+    # presets failed `include-graph`, and ci-sanitize also failed `cli` (a use-after-free, fixed since)
+    # and `worker` (two memory-cap tests that cannot pass under ASan); "79% tests passed, 3 tests
+    # failed out of 14". Before re-enabling it (delete the `if:` line): install llvm-symbolizer with
+    # the toolchain (install-llvm.sh) and make those worker tests sanitizer-aware.
     if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -108,18 +202,26 @@ jobs:
       - name: Install LLVM (pinned apt repository) and system libraries
         run: |
           bash .github/scripts/install-llvm.sh "$LLVM_VERSION"
-          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config ccache ffmpeg             libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libpulse-dev libasound2-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config ccache ffmpeg \
+            libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libpulse-dev libasound2-dev
       - name: Restore compiler cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.ccache
-          key: ccache-linux-${{ matrix.preset }}-${{ github.sha }}
+          key: ccache-linux-${{ matrix.preset }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-linux-${{ matrix.preset }}-
-      - name: Configure (no desktop app, see the header)
+      - name: Configure without the desktop app (Linux has no prebuilt libc++ Qt, see docs/BUILDING.md)
         run: |
-          CCACHE_DIR="$HOME/.ccache" cmake --preset ${{ matrix.preset }}             -DCMAKE_C_COMPILER=clang-$LLVM_VERSION -DCMAKE_CXX_COMPILER=clang++-$LLVM_VERSION             -DMSO_BUILD_GUI=OFF -DMSO_REQUIRE_GUI=OFF
+          CCACHE_DIR="$HOME/.ccache" cmake --preset ${{ matrix.preset }} \
+            -DCMAKE_C_COMPILER=clang-$LLVM_VERSION -DCMAKE_CXX_COMPILER=clang++-$LLVM_VERSION \
+            -DMSO_BUILD_GUI=OFF -DMSO_REQUIRE_GUI=OFF
       - name: Build
-        # -k 0: report every compile error of the run, not only the first failing file.
         run: CCACHE_DIR="$HOME/.ccache" cmake --build --preset ${{ matrix.preset }} -- -k 0
+      - name: Save compiler cache (also after a failed or cancelled run)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.ccache
+          key: ccache-linux-${{ matrix.preset }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}

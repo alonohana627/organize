@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 2026-10-19 · branch `phase/p1-browser` · the first implementation is committed (`4a91682`, `4b81d78`); the review-round changes below are not committed yet (awaiting the owner's OK).
+Updated 2026-10-19 · branch `phase/p1-browser` · committed: the first implementation (`4a91682`), the first review round (`6b10cc9`) and the Windows installer (`6b5f1d4`). The **second review round** (section below, from the second `CODE_REVIEW.md`) is not committed yet (awaiting the owner's OK).
 
 ## Where the roadmap stands
 
@@ -18,7 +18,23 @@ Updated 2026-10-19 · branch `phase/p1-browser` · the first implementation is c
 Deliberate deviations from the specification, at the owner's request:
 - Scrapped (2026-10-19), not to be built: tempo-aware preview against a project tempo (P6), and the
   offline metadata mirror with safe eject (P2.3). Semantic search (P5) is deferred far out.
-- Linux is a target in addition to Windows.
+- Linux is a target in addition to Windows; Windows comes first (owner, 2026-10-19), and Linux-only
+  work waits (see `CODE_REVIEW.md` §8).
+- **Priorities (owner, 2026-10-19; `AGENTS.md` rule 17):** stability, bug catching and performance come
+  first; the app runs on the user's own workstation. Basic robustness stays: no crash or memory
+  corruption from bad or damaged files, and nothing from a file or a library is ever run as code.
+  Security-only hardening is out of scope. Accordingly, **worker IPC over anonymous stdin/stdout pipes**
+  (the child's process id is checked in the handshake) is an accepted decision, not a gap: the
+  specification's ACL'd named pipe and handshake nonce will not be built.
+- **In-memory sample index (owner's request), against docs/06's 768 MiB browse budget:** the desktop app
+  keeps every open library's sample rows in an in-memory index for responsiveness. Measured with
+  `mso bench` (release, Windows): 248–265 bytes per row at 1M rows (237–254 MiB), 262–322 bytes per row at
+  100k. The indexes of all open libraries are capped at 1,000,000 rows together
+  (`ApplicationOptions::index_row_limit`, about 260 MiB). A library that would exceed the cap is searched
+  in SQLite with identical results, and the user is told. A reload keeps the previous index until the
+  new one is ready, so the index can briefly use twice its memory (about 520 MiB at the cap), which
+  still fits the 768 MiB browse budget together with the UI and SQLite's page cache. The 64 MiB
+  hydrated-row budget is unchanged: full rows are built only for returned pages.
 - The desktop app analyzes automatically: after each import it queues the `Full` profile for the
   folder (only new or changed samples run), rescans folders at start-up and on reconnect, and creates
   a default library in the workspace. The spec required explicit analysis only; the CLI still is.
@@ -35,8 +51,13 @@ Deliberate exceptions to owner rule 1 ("use libraries, never hand-roll"), with t
     `METADATA_BLOCK_PICTURE` across Ogg pages, ASF `WM/Picture`, APE binary items) are skipped unread;
   - the probe needs container facts TagLib does not expose: acid tempo, `smpl` loops, AIFF `MARK`/`INST`,
     RF64 `ds64`, exact frame counts and gapless trim;
-  - the parsers are overflow-checked (`ByteCursor`, `checked_add`, no allocation driven by untrusted
-    sizes) and fuzz-tested.
+  - the parsers are overflow-checked (`ByteCursor`, `checked_add`, no allocation driven by sizes read
+    from the file). They are fuzzed with libFuzzer under AddressSanitizer and UndefinedBehaviorSanitizer
+    through `media::probe_memory`, one target per family (RIFF/AIFF/CAF, FLAC, MPEG with ID3, Ogg with
+    Vorbis comments and OpusTags, MP4, ASF, APEv2; `tests/fuzz/`): 60 s each, about 0.5–1 million
+    inputs per target, no finding (2026-10-19, see "Verified"). CI repeats the 60 s runs on every
+    push. This is crash-proofing against damaged files. (Until this round the claim rested on a
+    400-iteration seeded random test without sanitizers.)
 
   Decoding still uses miniaudio, stb_vorbis and FFmpeg. The CRC for the Ogg tail check
   (`src/media/probe_ogg.cpp`) is also written here, because no vendored library exports it.
@@ -45,15 +66,152 @@ Deliberate exceptions to owner rule 1 ("use libraries, never hand-roll"), with t
   frames come from many supervisor threads, the sender has a "broken" state, and the event queue drops
   the oldest Progress message from the middle of the queue when full; both queues are bounded. No
   lock-free queue library offers that policy.
+- **Preview-engine concurrency helpers are written in this project** (`include/mso/audio/detail/`):
+  - Seqlock: no vendored library provides one. The callback must publish multi-field progress (epoch,
+    consumed and audible positions) without locking or allocating, and `std::atomic` of such a struct
+    is not lock-free.
+  - PlayheadHistory: latency-compensation logic over a fixed array that the callback writes without
+    allocating. No vendored library offers a bounded random-access history.
+  - ScopedDenormalFlush: miniaudio's `ma_disable_denormals` is static to its implementation section
+    and no other vendored library exports one. It is a thin wrapper over the compiler intrinsics.
+  - The transport mailbox's Stop side channel and value coalescing, on top of the vendored moodycamel
+    `ReaderWriterQueue`: no vendored queue can amend or reorder an element once queued. The transport
+    needs "the newest seek, volume, speed or pitch wins" and "Stop is never refused", without the
+    producer blocking or allocating.
+
+  The decoder and output threads now wake up through moodycamel's `LightweightSemaphore`.
 
 Not a deviation any more: the preview's **declick fades**. Intact audio is no longer faded (attacks at
 frame 0 stay untouched); only mid-signal starts, resume and underrun recovery fade, and loop-seam
 crossfades are opt-in (`transport::SetSeamFades`, reported in the snapshot).
 
-Platform code is isolated (`#ifdef _WIN32` with POSIX branches, in `.cpp` files and `detail/` headers);
-the Linux build is not yet verified on a Linux machine.
+Platform code is isolated (`#ifdef _WIN32` with POSIX branches, in `.cpp` files and `detail/` headers).
+The Linux build compiled in CI run 39229983572 (core, CLI and worker, release and ASan/UBSan), but that
+run failed tests (see "Not verified / known gaps"), and no Linux run is current.
 
-## Review round 2026-10-19 (CODE_REVIEW.md): what changed
+## Second review round 2026-10-19 (second CODE_REVIEW.md): what changed
+
+**Build, CI, dependencies and checks** (infra)
+- Windows sanitizers: the `sanitize` preset builds and runs on Windows (MSYS2 CLANG64 ships the ASan and
+  UBSan runtimes). CTest prepends the toolchain's `bin` to `PATH` on Windows, so `ctest` works from any
+  shell, and passes `ASAN_SYMBOLIZER_PATH` (llvm-symbolizer next to clang), so reports have file:line.
+  Its first run found the `mso collection --delete` use-after-free (fixed in the CLI). The worker's 2 GiB
+  job-object cap holds under ASan (peak worker commit about 86 MiB).
+- libFuzzer on Windows (`tests/fuzz/`, option `MSO_BUILD_FUZZERS`, preset `fuzz`, runner
+  `tools/run_fuzzers.py`), for crash-proofing against bad or damaged input: one target per entry point:
+  the media probe per container family (`media::probe_memory`), `stb_vorbis_open_memory` plus decoding
+  and seeking, the worker protocol (`worker::decode_frames` and both message decoders), the query
+  parser (plus the in-memory `RowMatcher`), and both paging-cursor decoders (`SearchService` and the
+  in-memory index). Seed corpora are checked in (`tests/fuzz/corpus/<target>/`, byte-exact). clang's
+  driver refuses `-fsanitize=fuzzer` for the MinGW target, so the build spells out the coverage flags
+  and links MSYS2's `libclang_rt.fuzzer-x86_64.a` (`cmake/ProjectOptions.cmake`); fuzz builds are
+  optimized with libc++'s extensive hardening. Findings are listed under "Verified".
+- CI (`.github/workflows/ci.yml`): Windows legs `ci` (release, tests, install, smoke test, MSI artifact),
+  `ci-debug` (new preset: Debug with libc++ debug hardening, `-Werror`) and `ci-sanitize` (ASan + UBSan,
+  symbolized), plus a `fuzz` job (every target 60 s) and the lint job. ccache is restored and saved per
+  leg with `actions/cache/save` under `if: always()`, so failed and cancelled runs still save it; MSYS2
+  skips the base-system upgrade (`update: false`); runners pinned to `windows-2025`. The Linux job stays
+  parked and its comment now states its real last result. Not yet run on GitHub at the time of writing.
+- Installer (`cmake/Packaging.cmake`): `CPACK_WIX_INSTALL_SCOPE perMachine` set explicitly (with CMake
+  3.28 policies the WiX 3 default was a per-user registration of a Program Files install). The install
+  tree and the MSI now carry `THIRD_PARTY_NOTICES.txt` (generated from the manifest: every shipped
+  vendored library with its license text, plus Qt and FFmpeg with where to get their source),
+  `share/licenses/<package>/` with the license files of every MSYS2 package a shipped DLL comes from,
+  and `share/licenses/PACKAGES.txt` (package, version, SPDX license; 80 packages in a local build). The
+  README's screenshot and `docs/COMMAND_LINE.md` are installed next to it. A GUI-less build packages
+  the CLI without Start-menu entries.
+- Dependencies: every git dependency re-fetched at its pinned commit; `--verify-upstream` reports all
+  14 equal to their pinned upstream (patches applied), so the CRLF copies are gone. `doctest` is marked
+  `test_only` (not in the About box, the notices or the installer). `update_deps.py` refuses a git
+  dependency without `ref` and replaces each file atomically. New patch:
+  `patches/miniaudio/0001-stb-vorbis-setup-allocation-overflow.patch` (see `deps/README.md`).
+- Module graph: each module links the vendored libraries it uses itself (picosha2 moved from `domain`
+  to its users; `analysis` no longer links nlohmann). The include-graph check also rejects including
+  another module's `detail/` headers.
+- `contracts/schema.sql` carries the indexes and the column added by migrations 4–6.
+
+**Catalog** (catalog-domain)
+- Migration 6: indexes `jobs_ready` and `scan_frontier_state`, and the column
+  `scan_frontier.directory_key`. Paused runs settle.
+- Benchmarks, 100k samples and 100k queued jobs, debug build: a lease took 130.6 ms before and 1.363 ms
+  after, including the fsync'd commit. `finish_scan` with 20k unseen locations and 5k frontier
+  directories took 5,581.6 ms for one pass before and 458.8 ms in total after.
+- Case-insensitive path keys use the simple uppercase mapping, like NTFS; stored keys are rebuilt on
+  open, and real collisions open a `normalization_conflict` review item.
+- Integrity checks run on a reader snapshot, except the FTS5 check, which needs the writer.
+- Corrupt job rows fail with `DB_CORRUPT` instead of blocking the queue.
+- One non-throwing JSON helper for every module: `include/mso/domain/json_fields.hpp`.
+- `tests/sqlite_tests.cpp` has its own suite, `sqlite` (one more CTest entry).
+
+**Media and import** (media-files)
+- Skipped entries (cloud-only, links, unsupported) are marked seen in the scan and never become
+  missing (`Library::mark_scan_entries_seen`); skipped directories are recorded as scan gaps.
+- `BoundedFileReader` reads through a 16 KiB read-ahead window (charging only the bytes handed out).
+- The FFmpeg probe is bounded by the deadline through an interrupt callback.
+- The importer keeps a cache of 8 directories' stored stats; identity reads run in parallel.
+- The MP3 gapless trim matches dr_mp3.
+- `media/native_file.hpp` is public, replacing the detail header other modules included.
+- `media::probe_memory` probes bytes in memory with the same parsers (for fuzzing and tests).
+- stb_vorbis is patched (heap overflow from the review, and the fuzzer's findings; `deps/README.md`).
+
+**Search** (search)
+- `SampleRow::path_key` carries the stored location key; `folder:` compares it with `starts_with` and
+  resolves folder rules once per library and root. Release measurements at 100K rows: in memory,
+  `folder:Loops` went from 52–75 ms to 2.6–3.4 ms, and a mixed `RowMatcher` query from 5.3–7.4 ms to
+  2.5–3.3 ms. In SQL, a small folder (1% of rows) went from 27–97 ms to 11–15 ms for the first page and
+  from 56 ms to 11–15 ms for the count; a large folder (25%) is unchanged at about 3.4 ms first page and
+  about 60 ms count (the plan is chosen by folder size, under 1/16 of the library or not). The search
+  benchmark now asserts the docs/06 budgets.
+- `RowMatcher` takes the merged-tag aliases, so `tag:` finds a merged tag by its old name;
+  `folder:/Drums` works (a leading slash is ignored).
+- The SQL cursor format is v3: relevance retries rows whose hydration failed.
+- A bad stored smart-collection query is a per-library coverage failure; other libraries still answer.
+
+**Analysis and worker** (analysis-worker)
+- `worker::decode_frames()` decodes a byte buffer as a peer reads its pipe (the fuzzing entry point).
+- The worker exits by itself within 2 s of Shutdown even when its task is stuck.
+- New self-test faults `foreign-limits` and `excess-waveform-bins`.
+
+**Application and CLI** (app-cli)
+- The in-memory index (deviation above): `mso bench` reports index memory per row. 100k rows: 992 B/row
+  before and 322 B/row after load (262 after queries); load 324 ms. 1M rows: load 1.8 s; first page
+  2.6 ms; folder filter with duration sort 149 ms in the index against 600 ms in SQLite; 10 pages 3.8 ms
+  against 1.2 s; a rating edit plus index patch 79 ms. In memory at 100k, `folder:` went from 92 ms to
+  20 ms in the full bench path, and a plain `bpm:` range filter from 2.7 ms to 6.4 ms.
+- Index cursors are per-library keyset cursors (version 102), and the federated merge uses binary
+  search. A row whose own value changes across the cursor can reappear, as with `SearchService`; the UI
+  de-duplicates by key. Structure changes still return `STALE_CURSOR`.
+- `Application::rows()` has an error channel (a missing key is omitted; a failure is an error).
+- `LibraryAccessChangedEvent`: a library opened read-only upgrades to writable once the CLI releases
+  its lock. Closing a library while a job or a load holds it waits up to 10 s, then returns a
+  retryable `DB_BUSY`.
+- CLI: `mso collection --delete` use-after-free fixed; see `docs/COMMAND_LINE.md` for exit 3 on a paused
+  queue, the 35-minute stall limit and `backup` needing the lock.
+
+**Desktop UI** (ui)
+- STALE_CURSOR and full reloads answer with an anchored refresh that keeps rows, scroll position and
+  selection (capped at 500,000 rows); pages are de-duplicated by `SampleKey`; pending edits overlay
+  every incoming page.
+- Writes are ordered per library (one queue each); a 2-thread long-task pool runs exports and backups.
+- History is read on demand (when shown, after this window's edits, otherwise at most every 2 s while
+  visible); navigator reads are coalesced to at most one per second per library.
+- New `AnalysisController` and `LayoutController`; new tests (`tests/ui_application_tests.cpp`).
+- The preview panel has an Output device menu and a Retry notice when the device disappears; actions on
+  a partly loaded huge selection ask the user to wait; the welcome text fits any window size; the
+  navigator menu no longer keeps item pointers across a nested event loop.
+
+**Audio preview** (audio)
+- Every epoch change decays the old level, so a seek while playing does not click.
+- Speed, pitch, mode, loop and seam-fade changes continue from the consumed position, so nothing is
+  replayed.
+- A lost output device is reported (`output_device_lost`) and re-opened automatically with backoff
+  (500 ms doubling up to 10 s); `restart_output_device()` retries at once and resumes playback.
+- Every backend and device call runs on the engine's own output thread, so COM init and uninit are
+  balanced.
+
+**Everywhere:** `[[nodiscard]]` on every function returning `mso::Result`.
+
+## First review round 2026-10-19 (CODE_REVIEW.md): what changed
 
 **Build, CI and dependencies**
 - One static library per module (`mso_module(<name> MODULES ...)`, `cmake/Modules.cmake`); the declared
@@ -80,11 +238,14 @@ the Linux build is not yet verified on a Linux machine.
   `miniaudio/miniaudio.c` and `signalsmith_linear/platform/linear-xsimd-dispatch.cpp` are no longer
   vendored. SQLite additionally uses `OMIT_DEPRECATED`, `OMIT_SHARED_CACHE` and
   `LIKE_DOESNT_MATCH_BLOBS`; its options are PRIVATE to the amalgamation.
-- CI: see `docs/DEVELOPING.md`. The Linux job is parked (owner's decision, 2026-10-19); its last run
-  (release and ASan/UBSan) built cleanly and passed every suite except an include-graph false
-  positive in GUI-less builds, since fixed. Windows builds everything from prebuilt MSYS2 packages; Linux builds the core,
-  CLI and worker without the desktop app (`MSO_BUILD_GUI=OFF`), because no prebuilt Qt uses libc++
-  and building Qt in CI is too slow. `.github/scripts/build-qt-libcxx.sh` stays for building the desktop app
+- CI: see `docs/DEVELOPING.md`. The Linux job is parked (owner's decision, 2026-10-19). Its last run,
+  39229983572, built the core, CLI and worker in both presets but **failed**: `include-graph` in both
+  (a GUI-less false positive, fixed since), and in `ci-sanitize` also `cli` (the `collection --delete`
+  use-after-free) and `worker` (two memory-cap tests that cannot pass under ASan); CTest reported "79%
+  tests passed, 3 tests failed out of 14". Windows passed in run 39233493989 (16/16 entries, install
+  and smoke test). Windows builds everything from prebuilt MSYS2 packages; Linux builds the core, CLI and
+  worker without the desktop app (`MSO_BUILD_GUI=OFF`), because no prebuilt Qt uses libc++ and building
+  Qt in CI is too slow. `.github/scripts/build-qt-libcxx.sh` stays for building the desktop app
   locally on Linux (`docs/BUILDING.md` explains the libstdc++ link problem).
 - Tests: CTest entries are generated per `TEST_SUITE` plus a catch-all per executable, with timeouts
   and labels; shared helpers (scratch directories, WAV writers, deadline polling, worker path) are in
@@ -99,7 +260,7 @@ the Linux build is not yet verified on a Linux machine.
 - Whether a root's file system is case-sensitive is detected when the root is added (`add_root`).
 - Backups keep the 10 most recent; user history is never pruned automatically (spec docs/03 §9).
 - Readers wait for a free connection with a timeout (`acquire_reader`).
-- New `tests/sqlite_tests.cpp` (suite `catalog`).
+- New `tests/sqlite_tests.cpp` (suite `catalog`; its own suite `sqlite` since the second round).
 - Fixed: `catalog::detail::for_each_row` now always resets the statement when it finishes. A statement
   rebound after `SQLITE_DONE` without a reset gave `SQLITE_MISUSE` ("bind parameter 1"), the import
   failure seen in the infra hand-off run below.
@@ -145,7 +306,7 @@ the Linux build is not yet verified on a Linux machine.
 - The workspace file is written atomically under `workspace.lock`.
 - CLI: exit codes 0 ok, 1 error, 2 usage, 3 partial result, 130 interrupted; global `--worker <path>`;
   `analyze --timeout`, and `analyze` cannot hang (it stops on a paused queue, a missing worker, the
-  timeout, 15 minutes without a finished job, or Ctrl+C, which cancels its runs); `play --backend null`;
+  timeout, 15 minutes (35 since the second round) without a finished job, or Ctrl+C, which cancels its runs); `play --backend null`;
   the bench has an index section; `mso --json search ... --count` prints one JSON document; progress lines appear
   only on a terminal and never with `--json`; `--version` comes from the generated header.
 - New test suites `app` and `cli`.
@@ -174,15 +335,17 @@ the Linux build is not yet verified on a Linux machine.
   `byte_order.hpp`. The decision not to adopt reproc for process spawning is recorded in
   `include/mso/worker/worker_process.hpp`.
 - The `--self-test-fault` worker modes exist for the tests only.
-- New `worker` test suite. `src/worker/worker_platform_posix.cpp` has never been compiled on Linux.
+- New `worker` test suite. `src/worker/worker_platform_posix.cpp` compiled on Linux in CI run
+  39229983572; running it there is not verified (two of its tests cannot pass under ASan).
 
 **Desktop UI (responsiveness)**
 - Ratings, favorites and category edits are optimistic: the row and the inspector change on click, the
   SQLite write runs in the background and the row is then reconciled with `Application::rows(keys)`; on
   failure the stored values are restored and a notification bar shows the error until dismissed.
 - `CatalogChangedEvent`s refresh the affected rows in place (by sample id) instead of reloading the
-  table. Changes to rows not on screen re-read the visible rows (throttled to 500 ms, scroll position
-  kept).
+  table. Changes to rows not on screen re-read the visible rows (throttled to 500 ms). The first round
+  said the scroll position was kept; after a stale cursor it was not (the view went back to row 400).
+  The second round's anchored refresh keeps it.
 - The navigator tree is held in memory and rebuilt per library only when the structure changes, never
   on a timer.
 - Folder clicks and sorting are answered from the application's in-memory sample index; the previous
@@ -201,7 +364,55 @@ the Linux build is not yet verified on a Linux machine.
 
 ## Verified on this machine (Windows 11, MSYS2 CLANG64, clang 23.1.3, libc++, Qt 6.11.2, FFmpeg 9.0.2)
 
-### Integration run (end of the review round)
+### Second review round (2026-10-19)
+
+**Integration run** (integrator, 2026-10-19, Windows 11, MSYS2 CLANG64, all modules integrated):
+- Release preset (RelWithDebInfo, `-Werror`, GUI on): 0 warnings, 0 errors; `clang-format --dry-run
+  -Werror` clean over `include/`, `src/`, `tests/`.
+- `ctest` (release, `MSO_REQUIRE_FFMPEG=1`): `100% tests passed out of 17`.
+- `tests/mso_tests.exe`: `test cases: 379 | 379 passed | 0 failed | 2 skipped` (the two opt-in
+  benchmarks), `assertions: 86533 | 86533 passed`.
+- `mso_ui_tests.exe` (offscreen, null audio): `test cases: 58 | 58 passed | 0 failed`,
+  `assertions: 594 | 594 passed`.
+- Sanitize preset (Debug, ASan + UBSan, `-Werror`): `ctest`: `100% tests passed out of 17`, no
+  AddressSanitizer or UBSan report in the log. The debug preset was not run separately (the sanitize
+  preset is a Debug build).
+- Fuzzing: not re-run by the integrator; the infra owner's last run (after the final stb_vorbis patch)
+  ran all 11 targets for 60 s each with no finding.
+- CLI end to end on WAV, FLAC, MP3, Opus and AAC files with a Hebrew folder: 6 added; edit, undo, redo;
+  `collection --create` then `--delete` (the old use-after-free) exit 0; `analyze --profile Full`
+  analyzed 6, failed 0; `folder:Loops` returns the 3 loops; a rename re-imports as `1 renamed`; `check`
+  prints `integrity: ok; foreign keys: 0 violation(s); search index: ok`.
+- A workspace created by the previous build opened in the desktop app (`--screenshot`, exit 0); the
+  library migrated to migration 6 and `mso check` reports it intact.
+- `mso bench --rows 100000 --repetitions 30` (release, medians, SQLite vs in-memory index): first page
+  2.55 vs 0.21 ms; folder click 3.75 vs 0.41 ms; duration sort 11.64 vs 0.20 ms; `bpm:120..130`
+  10.00 vs 1.80 ms; folder filter with duration sort 60.01 vs 7.63 ms; ten pages 119.89 vs 0.70 ms;
+  text `kick` 5.62 vs 10.59 ms; index load 186 ms; index memory 322 bytes/row after load, 270 after
+  the queries; rating edit committed and patched 7.76 ms; inserts 12,872 rows/s.
+
+Recorded by the owners during the round (other modules were still changing, so these are not the
+final state):
+- Windows `sanitize` preset (infra): built and ran on Windows for the first time. First run: 15 of 16
+  CTest entries passed; `cli` failed with the expected AddressSanitizer heap-use-after-free (CLI11 flag
+  callback writing through a `shared_ptr<bool>` freed when `register_collection` returned,
+  `src/cli/edit_commands.cpp`), fixed by the CLI owner since. No UBSan report. The worker suite passes
+  under ASan on Windows.
+- Fuzzing (infra), `fuzz` preset, 60 s per target, 5–6 targets in parallel on this PC:
+  `probe_riff`, `probe_flac`, `probe_mpeg_id3`, `probe_ogg`, `probe_mp4`, `probe_asf`, `probe_ape`,
+  `query_parser`, `worker_protocol` and `cursor` ran clean from the first run (about 0.4–1.5 million
+  inputs each; `cursor` about 160,000). `stb_vorbis` found four defects in the vendored decoder within seconds: a
+  left shift of a negative value in `get32_packet` (UBSan), a 1.8 GB allocation from a comment length
+  read from the file, a float-to-int overflow in `lookup1_values` (UBSan), and a leak of the codebook
+  setup buffer on corrupt codebooks (up to 2 MB per open, found as the fuzzer's RSS limit; present in
+  upstream 1.22 too). All four are fixed by the recorded stb_vorbis patch, and their inputs are
+  regression seeds in `tests/fuzz/corpus/stb_vorbis/`. After the fixes, a final 60 s run of all 11
+  targets (6 in parallel) was clean: `stb_vorbis` about 145,000 inputs, `cursor` about 173,000, the
+  others 0.4–1.4 million each.
+- MSI (infra): `cpack` with WiX 3.14 builds the package from a local (sanitizer) build; the generated
+  WiX sources carry `InstallScope="perMachine"`. The package was not installed on a clean PC.
+
+### Integration run (end of the first review round)
 
 2026-10-19, all modules integrated, release preset (RelWithDebInfo, `-Werror`, GUI on):
 
@@ -224,7 +435,7 @@ the Linux build is not yet verified on a Linux machine.
   11.59 ms; `folder:` filter with duration sort 79.27 vs 85.61 ms (known follow-up); rating edit
   committed and patched into the index 10.59 ms.
 
-### During the review round (2026-10-19, infra hand-off; other modules were still being edited)
+### During the first review round (2026-10-19, infra hand-off; other modules were still being edited)
 
 - `cmake --preset release` configures; the release build (RelWithDebInfo, `-Werror`, the new warning
   set) of the whole tree: 0 warnings, 0 errors. The Debug build (libc++ debug hardening) likewise.
@@ -234,12 +445,13 @@ the Linux build is not yet verified on a Linux machine.
   "Catalog"), `media` (an FFmpeg channel-change case), `ui` (one case) and `include-graph` (the
   transitional forwarders `include/mso/analysis/worker_{process,protocol}.hpp`, since removed).
 - On the committed tree (`HEAD`) with this round's CMake: Debug and `MSO_SANITIZERS=address;undefined`
-  builds pass every suite (the sanitizer build includes the worker process tests), and
+  builds passed every suite of that time (the `cli` suite did not exist yet; the second round's
+  Windows sanitizer run found a use-after-free in it), and
   `cmake --install` produces a folder whose `MusicSampleOrganizer.exe --exit-when-ready` and
   `mso.exe capabilities` run with only `C:\Windows\System32;C:\Windows` on `PATH`.
 - `python deps/update_deps.py --check`: 55 vendored files match the manifest. `--verify-upstream`:
-  every file matches its pinned upstream in content; 46 files differ in line endings only (see
-  "Known gaps").
+  every file matched its pinned upstream in content; 46 files differed in line endings only (fixed in
+  the second round by a re-fetch).
 
 ### Before the review round
 
@@ -272,20 +484,20 @@ the Linux build is not yet verified on a Linux machine.
 - Real DAW drag-and-drop (Ableton and another DAW) has not been tried by a person.
 - Audible playback on a real device was not listened to; tests use the null/offline backends.
 - CI runs on GitHub (`alonohana627/organize`). The Linux job (core, CLI, worker; release and
-  ASan/UBSan) passed its tests once and is now parked; the desktop app has never been built on Linux,
-  and `.github/scripts/build-qt-libcxx.sh` has not completed a run.
-- The vendored git dependencies were originally fetched on Windows with `core.autocrlf=true`, so 46
-  vendored files carry CRLF line endings where upstream has LF (content otherwise identical). The
-  fixed `update_deps.py` fetches upstream bytes; running `python deps/update_deps.py` once rewrites
-  those files to the upstream LF bytes and records the new digests.
+  ASan/UBSan) has never passed: its last run, 39229983572, failed `include-graph`, `cli` and `worker`
+  (see above), and it is parked. The desktop app has never been built on Linux, and
+  `.github/scripts/build-qt-libcxx.sh` has not completed a run. The second round's Windows `ci-debug`,
+  `ci-sanitize`, `fuzz` and MSI steps have not run on GitHub yet.
+- The MSI has not been installed and uninstalled on a clean PC, and its size is not recorded. Some of
+  the 80 shipped MSYS2 packages (FFmpeg among them) carry no license file; `PACKAGES.txt` names their
+  SPDX license (GPL-3.0 is `LICENSE` itself).
 - Tempo/key accuracy is proven only on synthetic signals, not on a labeled real-music corpus.
-- `folder:Loops` typed as query text takes 86 ms on 100K rows (`RowMatcher` cost), against 3.5 ms
-  for the same folder clicked in the navigator; a known follow-up.
 - Samples on FAT volumes imported before `file_id` became a 16-byte BLOB are not recognised by file
   id on their next scan.
-- Worker IPC uses anonymous stdin/stdout pipes instead of the specification's ACL'd named pipe and
-  handshake nonce; the handshake checks the child's process id.
-- Memory budgets, 30-minute audio stability, D1M/D5M scale and network-blocked runs are not measured.
+- Memory budgets other than the index's, 30-minute audio stability, D1M/D5M scale and network-blocked
+  runs are not measured.
+- Linux-only review items wait (`CODE_REVIEW.md` §8): the Linux symbolizer, `INSTALL_RPATH`, the libc++
+  probe, PDEATHSIG and fd tests, the POSIX process group for Ctrl+C, `QFile::decodeName`.
 - The UI lacks: a waveform browser view, a review-items panel, a relevance-sort choice, persistent
   "select all results" snapshots, and drag-onto-navigator.
 

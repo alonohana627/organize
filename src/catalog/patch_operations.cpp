@@ -78,13 +78,13 @@ struct Operation {
 };
 
 std::unexpected<Error> corrupt_operation(const nlohmann::json& operation, std::string_view why) {
-    return fail(ErrorCode::DbCorrupt,
-                std::format("malformed history operation ({}): {}", why, to_json_text(operation).substr(0, 200)));
+    return fail(ErrorCode::DbCorrupt, std::format("malformed history operation ({}): {}", why,
+                                                  json_fields::dump_json(operation).substr(0, 200)));
 }
 
 std::unexpected<Error> corrupt_value(std::string_view field, const nlohmann::json& value) {
-    return fail(ErrorCode::DbCorrupt,
-                std::format("history value for '{}' is invalid: {}", field, to_json_text(value).substr(0, 120)));
+    return fail(ErrorCode::DbCorrupt, std::format("history value for '{}' is invalid: {}", field,
+                                                  json_fields::dump_json(value).substr(0, 120)));
 }
 
 bool is_one_of(std::string_view value, std::initializer_list<std::string_view> allowed) {
@@ -95,20 +95,20 @@ bool is_one_of(std::string_view value, std::initializer_list<std::string_view> a
 
 Result<Operation> parse_operation(const nlohmann::json& stored) {
     Operation operation;
-    const auto kind = json_string_member(stored, "op");
+    const auto kind = json_fields::string_field(stored, "op");
     if (!kind) return corrupt_operation(stored, "no op");
-    operation.before = json_member(stored, "before");
-    operation.after = json_member(stored, "after");
+    operation.before = json_fields::member_field(stored, "before");
+    operation.after = json_fields::member_field(stored, "after");
     if (!operation.before || !operation.after) return corrupt_operation(stored, "no before/after");
 
     auto require_integer = [&](std::string_view key, std::int64_t& out) -> Result<void> {
-        const auto value = json_integer_member(stored, key);
+        const auto value = json_fields::integer_field(stored, key);
         if (!value) return corrupt_operation(stored, std::format("no integer '{}'", key));
         out = *value;
         return {};
     };
     auto require_field = [&](std::initializer_list<std::string_view> allowed) -> Result<void> {
-        auto field = json_string_member(stored, "field");
+        auto field = json_fields::string_field(stored, "field");
         if (!field || !is_one_of(*field, allowed)) return corrupt_operation(stored, "unknown field");
         operation.field = std::move(*field);
         return {};
@@ -128,7 +128,7 @@ Result<Operation> parse_operation(const nlohmann::json& stored) {
     } else if (*kind == "tag_links") {
         operation.kind = OperationKind::TagLinks;
         parsed = require_integer("tag", operation.target_id);
-        auto samples = json_integer_array_member(stored, "samples");
+        auto samples = json_fields::integer_array_field(stored, "samples");
         if (parsed && !samples) return corrupt_operation(stored, "no sample list");
         if (samples) operation.sample_ids = std::move(*samples);
     } else if (*kind == "collection_link") {
@@ -230,7 +230,7 @@ Result<sqlite::PreparedStatement> prepare_sample_field_write(sqlite::Connection&
         return statement;
     }
     if (field == "rating") {
-        const auto rating = json_integer(value);
+        const auto rating = json_fields::integer_value(value);
         if (!rating || *rating < 0 || *rating > 5) return corrupt_value(field, value);
         auto statement = prepared("UPDATE samples SET rating=?2 WHERE id=?1");
         if (statement) statement->bind(2, *rating);
@@ -244,16 +244,16 @@ Result<sqlite::PreparedStatement> prepare_sample_field_write(sqlite::Connection&
         return statement;
     }
     if (field == "category_id") {
-        const auto category = json_integer(value);
+        const auto category = json_fields::integer_value(value);
         if (!value.is_null() && !category) return corrupt_value(field, value);
         auto statement = prepared("UPDATE samples SET category_id=?2 WHERE id=?1");
         if (statement) statement->bind(2, category);
         return statement;
     }
     if (field == "bpm_override") {
-        const auto state = json_string_member(value, "state");
-        const auto* milli_value = json_member(value, "milli");
-        const auto milli = milli_value ? json_integer(*milli_value) : std::nullopt;
+        const auto state = json_fields::string_field(value, "state");
+        const auto* milli_value = json_fields::member_field(value, "milli");
+        const auto milli = milli_value ? json_fields::integer_value(*milli_value) : std::nullopt;
         const bool valid_state = state && is_one_of(*state, {"auto", "value", "unknown"});
         const bool needs_value = state && *state == "value";
         if (!valid_state || !milli_value || needs_value != milli.has_value() ||
@@ -265,9 +265,9 @@ Result<sqlite::PreparedStatement> prepare_sample_field_write(sqlite::Connection&
         return statement;
     }
     if (field == "key_override") {
-        const auto state = json_string_member(value, "state");
-        const auto pitch_class = json_integer_member(value, "pitch_class");
-        const auto mode = json_string_member(value, "mode");
+        const auto state = json_fields::string_field(value, "state");
+        const auto pitch_class = json_fields::integer_field(value, "pitch_class");
+        const auto mode = json_fields::string_field(value, "mode");
         const bool valid_state = state && is_one_of(*state, {"auto", "value", "unknown"});
         const bool needs_value = state && *state == "value";
         const bool has_value = pitch_class && mode;
@@ -328,7 +328,7 @@ Result<void> write_tag_link(sqlite::Connection& connection, const Operation& ope
 }
 
 std::string sample_list_json(const Operation& operation) {
-    return to_json_text(nlohmann::json(operation.sample_ids));
+    return json_fields::dump_json(nlohmann::json(operation.sample_ids));
 }
 
 /// true when every listed sample is linked, false when none is, null when they are mixed.
@@ -385,7 +385,7 @@ Result<void> write_collection_link(sqlite::Connection& connection, const Operati
         if (auto removed = remove->run(); !removed) return removed;
         return mark_sample_changed(connection, operation.sample_id, /*search_text_changed=*/false);
     }
-    const auto position = json_integer(ordinal);
+    const auto position = json_fields::integer_value(ordinal);
     if (!position) return corrupt_value("ordinal", ordinal);
     auto insert = connection.prepare("INSERT INTO collection_items(collection_id,sample_id,ordinal) VALUES(?1,?2,?3)");
     if (!insert) return std::unexpected(insert.error());
@@ -435,7 +435,7 @@ Result<nlohmann::json> read_row_field(sqlite::Connection& connection, std::strin
 Result<void> write_row_field(sqlite::Connection& connection, std::string_view table, std::int64_t id,
                              const std::string& field, const nlohmann::json& value) {
     if (field == "alias_of") {
-        const auto canonical = json_integer(value);
+        const auto canonical = json_fields::integer_value(value);
         if (!value.is_null() && !canonical) return corrupt_value(field, value);
         auto remove = connection.prepare("DELETE FROM tag_aliases WHERE source_tag_id=?1");
         if (!remove) return std::unexpected(remove.error());
@@ -460,7 +460,7 @@ Result<void> write_row_field(sqlite::Connection& connection, std::string_view ta
         statement->bind(2, name);
         if (has_key) statement->bind(3, fold_key(name));
     } else if (field == "parent_id") {
-        const auto parent = json_integer(value);
+        const auto parent = json_fields::integer_value(value);
         if (!value.is_null() && !parent) return corrupt_value(field, value);
         statement =
             connection.prepare(std::format("UPDATE {} SET parent_id=?2, revision=revision+1 WHERE id=?1", table));
@@ -530,9 +530,10 @@ Result<void> apply_operation(sqlite::Connection& connection, const nlohmann::jso
     auto current = read_current(connection, operation);
     if (!current) return std::unexpected(current.error());
     if (*current != expected)
-        return fail(ErrorCode::HistoryConflict,
-                    std::format("{} changed since: expected {}, found {}", to_json_text(stored).substr(0, 200),
-                                to_json_text(expected), to_json_text(*current)));
+        return fail(
+            ErrorCode::HistoryConflict,
+            std::format("{} changed since: expected {}, found {}", json_fields::dump_json(stored).substr(0, 200),
+                        json_fields::dump_json(expected), json_fields::dump_json(*current)));
     if (*current == target) return {};
 
     switch (operation.kind) {

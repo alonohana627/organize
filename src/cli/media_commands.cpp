@@ -1,6 +1,8 @@
 // probe, play and capabilities commands.
+#include <algorithm>
 #include <chrono>
-#include <thread>
+#include <condition_variable>
+#include <mutex>
 
 #include "mso/audio/preview_engine.hpp"
 #include "mso/cli/command_context.hpp"
@@ -15,6 +17,8 @@ namespace {
 constexpr double kMaximumPlaySeconds = 3600.0;
 /// How often `play` refreshes its position line.
 constexpr auto kPlayRefresh = std::chrono::milliseconds(50);
+/// How long `play` waits past the file's length for the engine to report the end.
+constexpr double kPlayEndGrace = 2.0;
 
 /// A known number, or "?".
 std::string optional_number(const std::optional<std::int64_t>& value) {
@@ -24,10 +28,10 @@ std::string optional_number(const std::optional<std::int64_t>& value) {
 /// Registers `probe`.
 void register_probe(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("probe", "Show what a bounded import probe reads from a file");
-    auto file = std::make_shared<std::string>();
-    command->add_option("file", *file, "Audio file")->required();
-    command->callback([&, file] {
-        auto probe = media::probe_file(path_from_utf8(*file));
+    auto& file = context.command_options<std::string>();
+    command->add_option("file", file, "Audio file")->required();
+    command->callback([&] {
+        auto probe = media::probe_file(path_from_utf8(file));
         if (!probe) return void(exit_code = context.report(probe.error()));
         context.print("format {} codec {}  {} Hz  {} ch  {} bit{}", probe->format, probe->codec,
                       optional_number(probe->sample_rate), optional_number(probe->channels),
@@ -43,7 +47,7 @@ void register_probe(CLI::App& root, CommandContext& context, int& exit_code) {
         if (tags.key) context.print("key    {} (tag)", format_key(*tags.key));
         for (const auto& loop : probe->loops)
             context.print("loop   {}..{}", loop.start_frame, loop.end_frame);
-        const auto hints = media::filename_hints(path_to_utf8(path_from_utf8(*file).stem()));
+        const auto hints = media::filename_hints(path_to_utf8(path_from_utf8(file).stem()));
         if (hints.bpm_milli) context.print("bpm    {} (file name)", format_bpm(*hints.bpm_milli));
         if (hints.key) context.print("key    {} (file name)", format_key(*hints.key));
     });
@@ -52,37 +56,52 @@ void register_probe(CLI::App& root, CommandContext& context, int& exit_code) {
 /// Registers `play`.
 void register_play(CLI::App& root, CommandContext& context, int& exit_code) {
     auto* command = root.add_subcommand("play", "Preview a file on the default output device");
-    auto file = std::make_shared<std::string>();
-    auto volume = std::make_shared<double>(-6.0);
-    auto seconds = std::make_shared<double>(0);
-    auto backend = std::make_shared<std::string>("system");
-    command->add_option("file", *file, "Audio file")->required();
-    command->add_option("--volume", *volume, "Volume in dB")->check(CLI::Range(-96.0, 0.0));
-    command->add_option("--seconds", *seconds, "Stop after this many seconds (0 = whole file, at most an hour)")
+    /// Every option of `play`.
+    struct Options {
+        std::string file;
+        double volume = -6.0;
+        double seconds = 0;
+        std::string backend = "system";
+    };
+    auto& options = context.command_options<Options>();
+    command->add_option("file", options.file, "Audio file")->required();
+    command->add_option("--volume", options.volume, "Volume in dB")->check(CLI::Range(-96.0, 0.0));
+    command->add_option("--seconds", options.seconds, "Stop after this many seconds (0 = whole file, at most an hour)")
         ->check(CLI::Range(0.0, kMaximumPlaySeconds));
-    command->add_option("--backend", *backend, "system, or null (silent; for tests)")
+    command->add_option("--backend", options.backend, "system, or null (silent; for tests)")
         ->check(CLI::IsMember({"system", "null"}));
-    command->callback([&, file, volume, seconds, backend] {
-        audio::PreviewOptions options;
-        options.backend = *backend == "null" ? audio::OutputBackend::Null : audio::OutputBackend::System;
-        auto engine = audio::PreviewEngine::create(options);
+    command->callback([&] {
+        audio::PreviewOptions preview_options;
+        preview_options.backend = options.backend == "null" ? audio::OutputBackend::Null : audio::OutputBackend::System;
+        auto engine = audio::PreviewEngine::create(preview_options);
         if (!engine) return void(exit_code = context.report(engine.error()));
-        if (auto opened = (*engine)->open(path_from_utf8(*file)); !opened)
+        if (auto opened = (*engine)->open(path_from_utf8(options.file)); !opened)
             return void(exit_code = context.report(opened.error()));
-        (*engine)->post(audio::transport::SetVolumeDecibels{*volume});
+        (*engine)->post(audio::transport::SetVolumeDecibels{options.volume});
         (*engine)->post(audio::transport::Play{});
         InterruptScope interrupt;
         const auto started = std::chrono::steady_clock::now();
-        const double limit = *seconds > 0 ? *seconds : kMaximumPlaySeconds;
-        bool was_playing = false;
+        double limit = options.seconds > 0 ? options.seconds : kMaximumPlaySeconds;
+        bool length_applied = false;
+        std::mutex sleep_mutex;
+        std::condition_variable_any sleeper;
         while (!interrupt.interrupted()) {
-            std::this_thread::sleep_for(kPlayRefresh);
+            {
+                std::unique_lock lock(sleep_mutex);
+                sleeper.wait_for(lock, interrupt.token(), kPlayRefresh, [] { return false; });
+            }
             const auto snapshot = (*engine)->snapshot();
             if (snapshot.last_error) {
                 exit_code = context.report(Error{*snapshot.last_error, false, "playback stopped", {}, {}});
                 break;
             }
-            if (snapshot.state == audio::PreviewState::Playing) was_playing = true;
+            // Once the length is known, a Play that never takes effect (or an end the 50 ms polls
+            // never saw) still ends shortly after the file would have.
+            if (!length_applied && snapshot.total_frames && snapshot.source_sample_rate > 0) {
+                length_applied = true;
+                const double file_seconds = static_cast<double>(*snapshot.total_frames) / snapshot.source_sample_rate;
+                limit = std::min(limit, file_seconds + kPlayEndGrace);
+            }
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (snapshot.source_sample_rate > 0)
                 context.progress("  {} / {}   underruns {}",
@@ -91,7 +110,9 @@ void register_play(CLI::App& root, CommandContext& context, int& exit_code) {
                                      ? format_duration(*snapshot.total_frames * 1'000'000 / snapshot.source_sample_rate)
                                      : "?",
                                  snapshot.underrun_count);
-            if ((was_playing && snapshot.state != audio::PreviewState::Playing) || elapsed >= limit) break;
+            // After open() the engine is Loading, Ready or Playing; it reaches Stopped only when
+            // playback ended, however short the file (a one-shot can start and end between polls).
+            if (snapshot.state == audio::PreviewState::Stopped || elapsed >= limit) break;
         }
         context.end_progress();
         if (interrupt.interrupted()) exit_code = kExitInterrupted;

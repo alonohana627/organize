@@ -30,22 +30,22 @@ inline constexpr Stage kAllStages[] = {Stage::Waveform, Stage::Loudness, Stage::
                                        Stage::Key,      Stage::ByteHash, Stage::PcmHash};
 
 /// Stable wire and profile name: "waveform", "loudness", "tempo", "key", "byte_hash", "pcm_hash".
-std::string_view to_string(Stage stage) noexcept;
+[[nodiscard]] std::string_view to_string(Stage stage) noexcept;
 /// Inverse of to_string(Stage); nullopt for any other text (names are case-sensitive).
-std::optional<Stage> parse_stage(std::string_view text) noexcept;
+[[nodiscard]] std::optional<Stage> parse_stage(std::string_view text) noexcept;
 
 /// Algorithm versions are part of every artifact identity; bump on any output-changing edit.
 struct AlgorithmVersions {
-    static constexpr std::string_view kWaveform = "waveform-minmaxrms-2";
-    static constexpr std::string_view kLoudness = "loudness-peak-rms-1";
-    static constexpr std::string_view kTempo = "tempo-flux-autocorr-2";
-    static constexpr std::string_view kKey = "key-chroma-ks-2";
-    static constexpr std::string_view kByteHash = "sha256-bytes-1";
-    static constexpr std::string_view kPcmHash = "sha256-pcm-s24-1";
+    static constexpr std::string_view kWaveform = "waveform-minmaxrms-2";  ///< Stage::Waveform
+    static constexpr std::string_view kLoudness = "loudness-peak-rms-1";   ///< Stage::Loudness
+    static constexpr std::string_view kTempo = "tempo-flux-autocorr-2";    ///< Stage::Tempo
+    static constexpr std::string_view kKey = "key-chroma-ks-2";            ///< Stage::Key
+    static constexpr std::string_view kByteHash = "sha256-bytes-1";        ///< Stage::ByteHash
+    static constexpr std::string_view kPcmHash = "sha256-pcm-s24-1";       ///< Stage::PcmHash
 };
 
 /// The algorithm version that produces `stage`'s results (one of AlgorithmVersions).
-std::string_view algorithm_version(Stage stage) noexcept;
+[[nodiscard]] std::string_view algorithm_version(Stage stage) noexcept;
 
 /// Per-bin signed peaks and RMS across all channels for an overview of the whole file.
 struct WaveformOverview {
@@ -99,7 +99,7 @@ struct InputEvidence {
 /// What to analyze: one file and the stages to run on it.
 struct AnalysisRequest {
     std::filesystem::path file;
-    std::vector<Stage> stages;                            ///< duplicates are allowed and collapsed
+    std::vector<Stage> stages;                            ///< each stage at most once
     int waveform_bins = kDefaultWaveformBins;             ///< in [1, kMaximumWaveformBins]
     double max_musical_seconds = kDefaultMusicalSeconds;  ///< tempo/key analyze at most this much audio
 };
@@ -127,22 +127,24 @@ using ProgressCallback = std::function<void(double fraction)>;
 /// value matter, so relaxed ordering is enough.
 using WorkCounter = std::atomic<std::uint64_t>;
 
-/// Runs the requested stages with one shared streaming decode. Returns CANCELLED when stop is
-/// requested, INPUT_CHANGED when the file's size/mtime changed while reading, and decoder errors
-/// (UNSUPPORTED_CODEC, CORRUPT_AUDIO, FILE_MISSING, ACCESS_DENIED, SOURCE_OFFLINE) otherwise.
+/// Runs the requested stages with one shared streaming decode. Returns INVALID_ARGUMENT for a
+/// request that validate_request() refuses, CANCELLED when stop is requested, INPUT_CHANGED when
+/// the file's size/mtime changed while reading, and decoder errors (UNSUPPORTED_CODEC,
+/// CORRUPT_AUDIO, FILE_MISSING, ACCESS_DENIED, SOURCE_OFFLINE) otherwise.
 /// Memory is bounded regardless of file length. No exception escapes: allocation failure is
 /// RESOURCE_LIMIT and any other exception INTERNAL.
 ///
 /// @param work_counter optional; incremented as described at WorkCounter.
-Result<AnalysisReport> analyze_file(const AnalysisRequest& request, std::stop_token stop,
-                                    const ProgressCallback& progress = {}, WorkCounter* work_counter = nullptr);
+[[nodiscard]] Result<AnalysisReport> analyze_file(const AnalysisRequest& request, std::stop_token stop,
+                                                  const ProgressCallback& progress = {},
+                                                  WorkCounter* work_counter = nullptr);
 
 /// Versioned binary encoding of a waveform overview for derived/waveforms segment files:
 /// magic, version, counts, payload and SHA-256 checksum. Decoding validates every field.
-std::vector<std::uint8_t> encode_waveform(const WaveformOverview& overview);
+[[nodiscard]] std::vector<std::uint8_t> encode_waveform(const WaveformOverview& overview);
 /// Size in bytes of encode_waveform()'s output for an overview with `bins` bins.
-std::uint64_t encoded_waveform_size(std::size_t bins) noexcept;
+[[nodiscard]] std::uint64_t encoded_waveform_size(std::size_t bins) noexcept;
 /// Inverse of encode_waveform(); PARSE_ERROR for anything truncated, corrupted or inconsistent.
-Result<WaveformOverview> decode_waveform(const std::vector<std::uint8_t>& bytes);
+[[nodiscard]] Result<WaveformOverview> decode_waveform(const std::vector<std::uint8_t>& bytes);
 
 }  // namespace mso::analysis

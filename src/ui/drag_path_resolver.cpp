@@ -30,6 +30,7 @@ void DragPathResolver::resolve(std::vector<SampleKey> keys) {
     checking_ = false;
     keys_ = std::move(keys);
     results_.clear();
+    index_of_key_.clear();
     if (keys_.empty() || keys_.size() > kMaxDragSamples) {
         debounce_.stop();
         return;
@@ -58,6 +59,8 @@ void DragPathResolver::start_check() {
             checking_ = false;
             if (results.size() != keys_.size()) return;  // cancelled
             results_ = std::move(results);
+            for (std::size_t index = 0; index < keys_.size(); ++index)
+                index_of_key_.emplace(keys_[index], index);
             ready_ = true;
             emit resolved();
         });
@@ -89,9 +92,10 @@ std::vector<SampleKey> DragPathResolver::available_keys() const {
 }
 
 std::optional<std::filesystem::path> DragPathResolver::path_of(const SampleKey& key) const {
-    const auto found = std::ranges::find(keys_, key);
-    if (found == keys_.end() || !ready_) return std::nullopt;
-    const auto& result = results_[static_cast<std::size_t>(found - keys_.begin())];
+    // A map lookup: startDrag() asks once per dragged sample (up to kMaxDragSamples).
+    const auto found = index_of_key_.find(key);
+    if (found == index_of_key_.end() || !ready_) return std::nullopt;
+    const auto& result = results_[found->second];
     if (!result) return std::nullopt;
     return *result;
 }

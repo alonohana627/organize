@@ -1,6 +1,7 @@
-// The application layer: library lifetime and locking, workspace persistence and merging, the
-// in-memory SampleIndex (checked against SearchService on the same data), incremental index
-// updates, coalesced events and automatic analysis.
+// The application layer: library lifetime and locking (closing, reopening, read-only upgrades),
+// workspace persistence and merging, the in-memory SampleIndex (checked against SearchService on the
+// same data, keyset paging while values change, its row budget), incremental index updates,
+// coalesced events and automatic analysis.
 #include <doctest.h>
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <format>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -249,6 +251,37 @@ void populate_through_application(app::Application& application, const uuids::uu
     REQUIRE(populated.has_value());
 }
 
+/// Pages through `request` with `run`, calling `between` after every page (to change values while
+/// paging), and returns every (library, id) in the order returned.
+std::vector<app::SampleKey> collect_while_editing(const SearchFunction& run, search::SearchRequest request,
+                                                  const std::function<void(int page_number)>& between) {
+    std::vector<app::SampleKey> keys;
+    for (int page_number = 0; page_number < 1000; ++page_number) {
+        auto page = run(request);
+        REQUIRE_MESSAGE(page.has_value(), page.error().message());
+        for (const auto& row : page->rows)
+            keys.push_back(app::SampleKey{row.library, row.sample_id});
+        if (!page->next) return keys;
+        between(page_number);
+        request.cursor = page->next;
+    }
+    FAIL("paging did not terminate");
+    return keys;
+}
+
+/// Checks keyset paging under edits: every row that was never edited appears exactly once, and in
+/// the order of a fresh query after all edits.
+void check_unedited_rows_once(const std::vector<app::SampleKey>& paged, const std::vector<app::SampleKey>& fresh,
+                              const std::set<app::SampleKey>& edited) {
+    std::vector<app::SampleKey> paged_unedited;
+    std::ranges::copy_if(paged, std::back_inserter(paged_unedited),
+                         [&](const app::SampleKey& key) { return !edited.contains(key); });
+    std::vector<app::SampleKey> fresh_unedited;
+    std::ranges::copy_if(fresh, std::back_inserter(fresh_unedited),
+                         [&](const app::SampleKey& key) { return !edited.contains(key); });
+    CHECK(paged_unedited == fresh_unedited);
+}
+
 /// Collects application events from background threads.
 class EventLog {
 public:
@@ -264,6 +297,14 @@ public:
             if (const auto* failure = std::get_if<app::BackgroundErrorEvent>(&event))
                 messages.push_back(failure->context + ": " + failure->error.message());
         return messages;
+    }
+    /// Number of LibraryAccessChangedEvents of one library.
+    int access_changes(const uuids::uuid& library) const {
+        std::lock_guard lock(mutex_);
+        return static_cast<int>(std::ranges::count_if(events_, [&](const auto& entry) {
+            const auto* changed = std::get_if<app::LibraryAccessChangedEvent>(&entry.second);
+            return changed != nullptr && changed->library == library;
+        }));
     }
     /// Catalog events of one library with their arrival times.
     std::vector<std::pair<std::chrono::steady_clock::time_point, app::CatalogChangedEvent>> catalog_events(
@@ -505,7 +546,15 @@ TEST_SUITE("app") {
                 CHECK(left.relative_path == right.relative_path);
                 CHECK(left.rating == right.rating);
                 CHECK(left.favorite == right.favorite);
-                CHECK(left.tags == right.tags);
+                CHECK(left.tag_paths == right.tag_paths);
+                CHECK(left.tag_ids == right.tag_ids);
+                CHECK(left.path_key == right.path_key);
+                CHECK(left.file_name == right.file_name);
+                CHECK(left.folder_path == right.folder_path);
+                CHECK(left.root_name == right.root_name);
+                CHECK(left.duration_us == right.duration_us);
+                CHECK(left.key == right.key);
+                CHECK(left.analysis_flags == right.analysis_flags);
                 CHECK(left.category == right.category);
                 CHECK(left.bpm_milli == right.bpm_milli);
                 CHECK(left.availability == right.availability);
@@ -595,6 +644,26 @@ TEST_SUITE("app") {
 
         for (const auto& request : comparison_requests(varied))
             if (app::SampleIndex::serves(request)) check_same_results(sources, libraries, request);
+
+        // A merged tag's old name keeps matching its new home, in memory exactly as in SQL.
+        auto tags = library.list_tags();
+        REQUIRE(tags.has_value());
+        std::int64_t hard = 0;
+        std::int64_t dark = 0;
+        for (const auto& tag : *tags) {
+            if (tag.path == "Hard") hard = tag.id;
+            if (tag.path == "Mood/Dark") dark = tag.id;
+        }
+        REQUIRE(hard != 0);
+        REQUIRE(dark != 0);
+        catalog::TaxonomyCommand merge{
+            .kind = catalog::TaxonomyCommand::Kind::MergeTag, .target_id = hard, .other_id = dark};
+        REQUIRE(library.apply_taxonomy(merge).has_value());
+        change = index->synchronize(library);
+        REQUIRE(change.has_value());
+        CHECK(change->structure_changed);
+        for (const auto* text : {"tag:Hard", "tag:Dark", "NOT tag:Hard", "tag:Mood"})
+            check_same_results(sources, libraries, {.text = text});
     }
 
     TEST_CASE("index cursors survive value edits and go stale when rows are added") {
@@ -628,6 +697,224 @@ TEST_SUITE("app") {
         CHECK(wrong_query.error().code == ErrorCode::StaleCursor);
     }
 
+    TEST_CASE("keyset cursors never skip or repeat an unedited row while ratings and BPMs change") {
+        ScratchDirectory scratch;
+        auto varied = make_varied_library(scratch / "lib", 300);
+        auto& library = *varied.populated.library;
+        auto index = loaded_index(library);
+        const app::IndexedLibrary sources[] = {{index.get(), &library, "Varied"}};
+        auto run = [&](const search::SearchRequest& request) { return app::search_indexes(sources, request); };
+
+        const std::vector<search::SearchRequest> requests = {
+            {.sort = search::SortField::Rating, .descending = true, .page_size = 40},
+            {.sort = search::SortField::Rating, .page_size = 40},
+            {.sort = search::SortField::Bpm, .page_size = 40},
+            {.sort = search::SortField::Bpm, .descending = true, .page_size = 40},
+            {.text = "rating:>=1", .sort = search::SortField::Name, .page_size = 40},
+            {.text = "bpm:80..200", .sort = search::SortField::Bpm, .page_size = 40},
+        };
+        int round = 0;
+        for (const auto& request : requests) {
+            CAPTURE(request.text);
+            CAPTURE(search::to_string(request.sort));
+            CAPTURE(request.descending);
+            std::set<app::SampleKey> edited;
+            const auto paged = collect_while_editing(run, request, [&](int page_number) {
+                // Move rows across the cursor in both directions: ids before and after it change
+                // rating, BPM and filter membership, like analysis results and ratings arriving.
+                ++round;
+                const std::vector<std::int64_t> ids = {1 + (page_number * 7) % 300, 150 + (page_number * 13) % 150,
+                                                       2 + (page_number * 29) % 290};
+                for (const auto id : ids)
+                    edited.insert(app::SampleKey{library.uuid(), id});
+                edit_samples(library, ids, [&](catalog::EditCommand& command) {
+                    command.rating = (round + page_number) % 6;
+                    command.bpm = catalog::BpmOverrideEdit{catalog::OverrideState::Value,
+                                                           std::int64_t{60'000 + (round * 37'000) % 150'000}};
+                });
+                auto change = index->synchronize(library);
+                REQUIRE(change.has_value());
+                CHECK_FALSE(change->rows_added_or_removed);  // values only: cursors stay valid
+            });
+            search::SearchRequest fresh_request = request;
+            fresh_request.cursor.reset();
+            check_unedited_rows_once(paged, collect(run, fresh_request), edited);
+            // Nothing is returned twice unless it was edited across the cursor.
+            std::map<app::SampleKey, int> seen;
+            for (const auto& key : paged)
+                if (++seen[key] > 1) CHECK(edited.contains(key));
+        }
+    }
+
+    TEST_CASE("federated keyset cursors keep each library's position while values change") {
+        ScratchDirectory scratch;
+        auto first = make_varied_library(scratch / "one", 120, "One");
+        auto second = make_varied_library(scratch / "two", 80, "Two");
+        auto first_index = loaded_index(*first.populated.library);
+        auto second_index = loaded_index(*second.populated.library);
+        const app::IndexedLibrary sources[] = {{first_index.get(), first.populated.library.get(), "One"},
+                                               {second_index.get(), second.populated.library.get(), "Two"}};
+        auto run = [&](const search::SearchRequest& request) { return app::search_indexes(sources, request); };
+        std::set<app::SampleKey> edited;
+        const search::SearchRequest request{.sort = search::SortField::Rating, .descending = true, .page_size = 25};
+        const auto paged = collect_while_editing(run, request, [&](int page_number) {
+            auto& library = page_number % 2 ? *second.populated.library : *first.populated.library;
+            auto& index = page_number % 2 ? *second_index : *first_index;
+            const std::int64_t id = 1 + page_number * 5;
+            edited.insert(app::SampleKey{library.uuid(), id});
+            edit_samples(library, {id}, [&](catalog::EditCommand& command) { command.rating = 5 - page_number % 6; });
+            REQUIRE(index.synchronize(library).has_value());
+        });
+        check_unedited_rows_once(paged, collect(run, request), edited);
+        CHECK(paged.size() >= 203 - edited.size());
+    }
+
+    TEST_CASE("a library over the index budget is answered from SQLite with the same results") {
+        ScratchDirectory scratch;
+        SUBCASE("SampleIndex::load refuses more rows than its limit and keeps its previous state") {
+            auto varied = make_varied_library(scratch / "lib", 60);
+            auto& library = *varied.populated.library;
+            app::SampleIndex index(library.uuid());
+            auto loaded = index.load(library, {}, 10);
+            REQUIRE_FALSE(loaded.has_value());
+            CHECK(loaded.error().code == ErrorCode::ResourceLimit);
+            CHECK_FALSE(index.ready());
+            REQUIRE(index.load(library, {}, 1000).has_value());
+            CHECK(index.size() == 63);
+            index.clear();
+            CHECK_FALSE(index.ready());
+            CHECK(index.size() == 0);
+            const app::IndexedLibrary sources[] = {{&index, &library, "Varied"}};
+            auto page = app::search_indexes(sources, {});
+            REQUIRE_FALSE(page.has_value());
+            CHECK(page.error().code == ErrorCode::IndexUnavailable);
+        }
+        SUBCASE("the Application falls back to SQLite and says so") {
+            auto options = quiet_options(scratch / "workspace");
+            options.index_row_limit = 20;
+            auto started = app::Application::start(options);
+            REQUIRE(started.has_value());
+            auto& application = **started;
+            EventLog log;
+            application.set_event_handler([&](const app::ApplicationEvent& event) { log.record(event); });
+            auto created = application.create_library(scratch / "big", "Big");
+            REQUIRE(created.has_value());
+            std::vector<catalog::ScannedFile> files;
+            for (int index = 0; index < 50; ++index)
+                files.push_back(test::synthetic_file(std::format("Loops/loop {:02}.wav", index), 10, 10'000 + index));
+            populate_through_application(application, created->uuid, files);
+            REQUIRE(test::wait_until(
+                [&] {
+                    for (const auto& message : log.errors())
+                        if (message.find("in-memory index limit") != std::string::npos) return true;
+                    return false;
+                },
+                kBackgroundTimeout));
+            CHECK_FALSE(application.index_ready(created->uuid));
+            auto page = application.search(
+                {.text = "rating:0", .sort = search::SortField::Duration, .descending = true}, created->uuid);
+            REQUIRE(page.has_value());
+            CHECK(page->rows.size() == 50);
+            CHECK(page->rows.front().duration_us == 10'049);
+            catalog::EditCommand edit;
+            edit.sample_ids = {1};
+            edit.rating = 3;
+            REQUIRE(application.apply_edit(created->uuid, edit).has_value());
+            const std::vector<app::SampleKey> key = {{created->uuid, 1}};
+            auto rows = application.rows(key);
+            REQUIRE(rows.has_value());
+            REQUIRE(rows->size() == 1);
+            CHECK(rows->front().rating == 3);
+            application.set_event_handler({});
+        }
+    }
+
+    TEST_CASE("reopening a library that is still closing waits for it instead of opening it read-only") {
+        ScratchDirectory scratch;
+        auto options = quiet_options(scratch / "workspace");
+        options.close_wait = 100ms;
+        auto started = app::Application::start(options);
+        REQUIRE(started.has_value());
+        auto& application = **started;
+        auto created = application.create_library(scratch / "lib", "Closing");
+        REQUIRE(created.has_value());
+        std::atomic<bool> holding{false};
+        std::atomic<bool> release{false};
+        std::jthread holder([&] {
+            // Long work of this process (like an import) keeps the closed library and its lock.
+            auto held = application.with_library(created->uuid, [&](catalog::Library&) {
+                holding = true;
+                CHECK(test::wait_until([&] { return release.load(); }, kBackgroundTimeout));
+            });
+            CHECK(held.has_value());
+        });
+        REQUIRE(test::wait_until([&] { return holding.load(); }, kBackgroundTimeout));
+        REQUIRE(application.close_library(created->uuid).has_value());
+        auto too_early = application.open_library(scratch / "lib");
+        REQUIRE_FALSE(too_early.has_value());
+        CHECK(too_early.error().code == ErrorCode::DbBusy);
+        CHECK(too_early.error().retryable);
+        release = true;
+        holder.join();
+        auto reopened = application.open_library(scratch / "lib");
+        REQUIRE(reopened.has_value());
+        CHECK_FALSE(reopened->read_only);
+        CHECK_FALSE(reopened->in_use_elsewhere);
+    }
+
+    TEST_CASE("a library opened read-only while another process held it becomes writable when it is released") {
+        ScratchDirectory scratch;
+        auto cli = start_application(scratch / "cli");
+        auto created = cli->create_library(scratch / "lib", "Shared");
+        REQUIRE(created.has_value());
+        populate_through_application(*cli, created->uuid, {test::synthetic_file("a.wav", 1, 1'000)});
+
+        auto desktop = start_application(scratch / "desktop");
+        EventLog log;
+        desktop->set_event_handler([&](const app::ApplicationEvent& event) { log.record(event); });
+        auto visiting = desktop->open_library(scratch / "lib");
+        REQUIRE(visiting.has_value());
+        CHECK(visiting->read_only);
+        desktop->retry_read_only_libraries();  // still held: nothing changes
+        CHECK(desktop->libraries().front().read_only);
+
+        REQUIRE(cli->close_library(created->uuid).has_value());
+        desktop->retry_read_only_libraries();
+        const auto upgraded = desktop->libraries();
+        REQUIRE(upgraded.size() == 1);
+        CHECK_FALSE(upgraded.front().read_only);
+        CHECK_FALSE(upgraded.front().in_use_elsewhere);
+        catalog::EditCommand edit;
+        edit.sample_ids = {1};
+        edit.rating = 2;
+        CHECK(desktop->apply_edit(created->uuid, edit).has_value());
+        desktop->set_event_handler({});
+        CHECK(log.access_changes(created->uuid) == 1);
+    }
+
+    TEST_CASE("a folder that fails to open keeps no library.lock, and the CLI's root bindings reach the desktop") {
+        ScratchDirectory scratch;
+        auto application = start_application(scratch / "workspace");
+        test::write_file(scratch / "broken/library.json",
+                         nlohmann::json{{"library_uuid", uuids::to_string(new_uuid())}}.dump());
+        test::write_file(scratch / "broken/catalog.sqlite", "this is not a database");
+        CHECK_FALSE(application->open_library(scratch / "broken").has_value());
+        CHECK_FALSE(std::filesystem::exists(scratch / "broken" / app::FileLock::kLibraryLockFileName));
+
+        auto created = application->create_library(scratch / "lib", "Bound elsewhere");
+        REQUIRE(created.has_value());
+        auto other_process = app::Workspace::load(scratch / "workspace");
+        REQUIRE(other_process.has_value());
+        const auto root = new_uuid();
+        REQUIRE(other_process->bind_root(app::RootBinding{created->uuid, root, scratch / "pack"}).has_value());
+        CHECK_FALSE(application->workspace().root_binding(created->uuid, root).has_value());
+        application->refresh_root_availability();  // re-reads the workspace first
+        CHECK(application->workspace().root_binding(created->uuid, root) == scratch / "pack");
+        auto unchanged = application->workspace().reload_if_changed();
+        REQUIRE(unchanged.has_value());
+        CHECK_FALSE(*unchanged);
+    }
+
     TEST_CASE("edits through the application patch the index before returning, events are coalesced") {
         ScratchDirectory scratch;
         auto options = quiet_options(scratch / "workspace");
@@ -657,17 +944,27 @@ TEST_SUITE("app") {
             return edit;
         };
         REQUIRE(application.apply_edit(created->uuid, rate(3, 4)).has_value());
-        const auto rows = application.rows({app::SampleKey{created->uuid, 3}, app::SampleKey{created->uuid, 999}});
-        REQUIRE(rows.size() == 1);
-        CHECK(rows.front().rating == 4);  // no waiting: the index was patched by apply_edit
+        const std::vector<app::SampleKey> asked = {{created->uuid, 3}, {created->uuid, 999}, {new_uuid(), 1}};
+        const auto rows = application.rows(asked);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);        // unknown samples and libraries that are not open are omitted
+        CHECK(rows->front().rating == 4);  // no waiting: the index was patched by apply_edit
+        CHECK(rows->front().library == created->uuid);
+        auto rating_of = [&](std::int64_t sample_id) {
+            const std::vector<app::SampleKey> key = {{created->uuid, sample_id}};
+            auto found = application.rows(key);
+            REQUIRE(found.has_value());
+            REQUIRE(found->size() == 1);
+            return found->front().rating;
+        };
         auto rated = application.count({.text = "rating:4"}, created->uuid);
         REQUIRE(rated.has_value());
         CHECK(rated->total == 1);
 
         REQUIRE(application.undo(created->uuid).has_value());
-        CHECK(application.rows({app::SampleKey{created->uuid, 3}}).front().rating == 0);
+        CHECK(rating_of(3) == 0);
         REQUIRE(application.redo(created->uuid).has_value());
-        CHECK(application.rows({app::SampleKey{created->uuid, 3}}).front().rating == 4);
+        CHECK(rating_of(3) == 4);
 
         // A burst of edits is announced together (a full reload still pending absorbs them).
         for (int round = 0; round < 12; ++round)

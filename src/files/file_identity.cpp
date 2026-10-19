@@ -6,7 +6,7 @@
 #include <limits>
 #include <system_error>
 
-#include "mso/media/detail/native_file_support.hpp"
+#include "mso/media/native_file.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -74,15 +74,14 @@ bool data_not_local(DWORD attributes, bool is_directory) noexcept {
 Result<FileIdentity> read_file_identity(const std::filesystem::path& file) {
     // Attribute-only access: never reads content and never blocks writers. Without
     // FILE_FLAG_OPEN_REPARSE_POINT the handle (and so the identity) is the link target's.
-    media::detail::UniqueWin32Handle handle(CreateFileW(media::detail::native_path(file).c_str(), FILE_READ_ATTRIBUTES,
-                                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-    if (!handle.valid())
-        return std::unexpected(media::detail::error_from_win32(GetLastError(), "reading the file identity"));
+    media::UniqueWin32Handle handle(CreateFileW(media::native_path(file).c_str(), FILE_READ_ATTRIBUTES,
+                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!handle.valid()) return std::unexpected(media::error_from_win32(GetLastError(), "reading the file identity"));
 
     BY_HANDLE_FILE_INFORMATION information{};
     if (!GetFileInformationByHandle(handle.get(), &information)) {
-        return std::unexpected(media::detail::error_from_win32(GetLastError(), "reading the file identity"));
+        return std::unexpected(media::error_from_win32(GetLastError(), "reading the file identity"));
     }
     FileIdentity identity;
     identity.byte_size = static_cast<std::int64_t>((static_cast<std::uint64_t>(information.nFileSizeHigh) << 32) |
@@ -106,30 +105,31 @@ Result<FileIdentity> read_file_identity(const std::filesystem::path& file) {
     return identity;
 }
 
-LinkKind classify_link(const std::filesystem::path& path) noexcept {
+EntryClassification classify_entry(const std::filesystem::path& path) noexcept {
     try {
-        const std::filesystem::path native = media::detail::native_path(path);
+        const std::filesystem::path native = media::native_path(path);
         const DWORD attributes = GetFileAttributesW(native.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES) return LinkKind::None;
+        if (attributes == INVALID_FILE_ATTRIBUTES) return {};
         const bool is_directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
-            return data_not_local(attributes, is_directory) ? LinkKind::CloudOnly : LinkKind::None;
+            return {data_not_local(attributes, is_directory) ? LinkKind::CloudOnly : LinkKind::None, is_directory};
         }
         // The reparse tag comes with the directory listing data; nothing is opened.
         WIN32_FIND_DATAW data{};
         HANDLE search = FindFirstFileExW(native.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
-        if (search == INVALID_HANDLE_VALUE) return LinkKind::OtherReparsePoint;
+        if (search == INVALID_HANDLE_VALUE) return {LinkKind::OtherReparsePoint, is_directory};
         FindClose(search);
         const DWORD tag = data.dwReserved0;
-        if (tag == kReparseTagSymbolicLink) return LinkKind::SymbolicLink;
-        if (tag == kReparseTagMountPoint) return LinkKind::Junction;
-        if (tag == kReparseTagDeduplication) return LinkKind::Deduplicated;
+        if (tag == kReparseTagSymbolicLink) return {LinkKind::SymbolicLink, is_directory};
+        if (tag == kReparseTagMountPoint) return {LinkKind::Junction, is_directory};
+        if (tag == kReparseTagDeduplication) return {LinkKind::Deduplicated, is_directory};
         if ((tag & ~kReparseTagCloudMask) == kReparseTagCloud || tag == kReparseTagFilePlaceholder) {
-            return data_not_local(attributes, is_directory) ? LinkKind::CloudOnly : LinkKind::CloudPlaceholder;
+            return {data_not_local(attributes, is_directory) ? LinkKind::CloudOnly : LinkKind::CloudPlaceholder,
+                    is_directory};
         }
-        return LinkKind::OtherReparsePoint;
+        return {LinkKind::OtherReparsePoint, is_directory};
     } catch (const std::exception&) {
-        return LinkKind::None;  // path conversion ran out of memory: let the open report it
+        return {};  // path conversion ran out of memory: let the open report it
     }
 }
 
@@ -155,7 +155,7 @@ std::int64_t modification_time_ns(const struct stat& status) noexcept {
 Result<FileIdentity> read_file_identity(const std::filesystem::path& file) {
     struct stat status{};
     if (::stat(file.c_str(), &status) != 0) {
-        return std::unexpected(media::detail::error_from_errno(errno, "reading the file identity"));
+        return std::unexpected(media::error_from_errno(errno, "reading the file identity"));
     }
     FileIdentity identity;
     identity.byte_size = static_cast<std::int64_t>(status.st_size);
@@ -165,16 +165,23 @@ Result<FileIdentity> read_file_identity(const std::filesystem::path& file) {
     return identity;
 }
 
-LinkKind classify_link(const std::filesystem::path& path) noexcept {
+EntryClassification classify_entry(const std::filesystem::path& path) noexcept {
     try {
         std::error_code error;
         const auto status = std::filesystem::symlink_status(path, error);
-        return !error && std::filesystem::is_symlink(status) ? LinkKind::SymbolicLink : LinkKind::None;
+        if (error) return {};
+        if (!std::filesystem::is_symlink(status)) return {LinkKind::None, std::filesystem::is_directory(status)};
+        std::error_code target_error;  // a dangling link is simply not a directory
+        return {LinkKind::SymbolicLink, std::filesystem::is_directory(std::filesystem::status(path, target_error))};
     } catch (const std::exception&) {
-        return LinkKind::None;  // out of memory: let the open report it
+        return {};  // out of memory: let the open report it
     }
 }
 
 #endif
+
+LinkKind classify_link(const std::filesystem::path& path) noexcept {
+    return classify_entry(path).kind;
+}
 
 }  // namespace mso::files::detail

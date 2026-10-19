@@ -112,14 +112,13 @@ std::string path_key(std::string_view relative_path, bool case_sensitive) {
 #endif
         return key;
     }
-    // NFC, then simple (1:1) lowercase mapping per code point: like NTFS's case-insensitive
-    // comparison, and unlike full case folding, it never merges distinct names such as "ﬁ"/"fi".
-    const std::string normalized =
-        map_utf8_runs(relative_path, static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
+    // Simple (1:1) uppercase mapping per code point and no normalization, like NTFS's $UpCase
+    // comparison: "Cafe\u0301" and "Caf\u00e9", "İ" and "i", or the Kelvin sign and "k" are
+    // different files there, so they keep different keys.
     std::string key;
-    key.reserve(normalized.size());
-    const auto* bytes = reinterpret_cast<const utf8proc_uint8_t*>(normalized.data());
-    const auto size = static_cast<utf8proc_ssize_t>(normalized.size());
+    key.reserve(relative_path.size());
+    const auto* bytes = reinterpret_cast<const utf8proc_uint8_t*>(relative_path.data());
+    const auto size = static_cast<utf8proc_ssize_t>(relative_path.size());
     for (utf8proc_ssize_t offset = 0; offset < size;) {
         utf8proc_int32_t code_point = 0;
         const utf8proc_ssize_t consumed = utf8proc_iterate(bytes + offset, size - offset, &code_point);
@@ -130,7 +129,7 @@ std::string path_key(std::string_view relative_path, bool case_sensitive) {
         }
         offset += consumed;
         utf8proc_uint8_t encoded[4];
-        const auto written = utf8proc_encode_char(utf8proc_tolower(native_separator_to_slash(code_point)), encoded);
+        const auto written = utf8proc_encode_char(utf8proc_toupper(native_separator_to_slash(code_point)), encoded);
         key.append(reinterpret_cast<const char*>(encoded), static_cast<std::size_t>(written));
     }
     return key;
@@ -347,7 +346,8 @@ std::optional<MusicalKey> parse_key(std::string_view text) {
 
 std::string format_duration(std::int64_t microseconds) {
     if (microseconds < 0) return {};
-    if (microseconds < 10'000'000) return std::format("{:.2f}s", static_cast<double>(microseconds) / 1e6);
+    // Below 9.995 s two decimals never round up to "10.00s"; from there on the m:ss form is used.
+    if (microseconds < 9'995'000) return std::format("{:.2f}s", static_cast<double>(microseconds) / 1e6);
     const auto seconds = microseconds / 1'000'000;
     return std::format("{}:{:02}", seconds / 60, seconds % 60);
 }

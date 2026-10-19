@@ -23,7 +23,7 @@ public:
 
     /// Takes an idle connection or opens a new one. Waits at most `timeout` while every reader is
     /// leased (RESOURCE_LIMIT, retryable, afterwards); NOT_FOUND once the pool is closed.
-    Result<std::unique_ptr<sqlite::Connection>> acquire(std::chrono::milliseconds timeout);
+    [[nodiscard]] Result<std::unique_ptr<sqlite::Connection>> acquire(std::chrono::milliseconds timeout);
     /// Returns a connection (its read transaction rolled back); destroys it once the pool is closed.
     void give_back(std::unique_ptr<sqlite::Connection> connection) noexcept;
     /// Closes idle connections and refuses further leases; leased connections close when returned.

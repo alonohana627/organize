@@ -13,18 +13,18 @@ namespace mso::analysis {
 namespace {
 
 constexpr double kFrameSeconds = 8192.0 / 44100.0;  ///< about 186 ms: ~5.4 Hz bins at 44.1 kHz
-constexpr double kLowestFrequencyHz = 80.0;
-constexpr double kHighestFrequencyHz = 2500.0;
-constexpr double kFlatnessForZeroTonality = 0.35;  ///< white noise measures about 0.56
-constexpr double kSilentFramePower = 1e-10;        ///< mean band power below -100 dBFS
-constexpr float kPeakFloorRatio = 0.01F;           ///< peaks below -40 dB of the frame maximum are ignored
+constexpr double kLowestFrequencyHz = 80.0;         ///< lowest analyzed partial; rumble below is ignored
+constexpr double kHighestFrequencyHz = 2500.0;      ///< highest analyzed partial; overtones dominate above
+constexpr double kFlatnessForZeroTonality = 0.35;   ///< white noise measures about 0.56
+constexpr double kSilentFramePower = 1e-10;         ///< mean band power below -100 dBFS
+constexpr float kPeakFloorRatio = 0.01F;            ///< peaks below -40 dB of the frame maximum are ignored
 /// A partial must stand 10 dB above the median of the bins 3..6 away on both sides, i.e. just
 /// outside a Hann main lobe. Leakage skirts and sidelobe ripple have neighbours at their own level.
 constexpr float kPeakProminenceRatio = 3.16F;
-constexpr std::size_t kProminenceInnerOffset = 3;
-constexpr std::size_t kProminenceOuterOffset = 6;
-constexpr double kReferenceFrequencyHz = 440.0;
-constexpr double kReferenceMidiNote = 69.0;  ///< A4; MIDI note 60 = C4 so note % 12 == 0 is C
+constexpr std::size_t kProminenceInnerOffset = 3;  ///< nearest neighbour bin of the prominence test
+constexpr std::size_t kProminenceOuterOffset = 6;  ///< farthest neighbour bin of the prominence test
+constexpr double kReferenceFrequencyHz = 440.0;    ///< concert pitch A4 before tuning compensation
+constexpr double kReferenceMidiNote = 69.0;        ///< A4; MIDI note 60 = C4 so note % 12 == 0 is C
 
 /// Chroma frame length at `sample_rate`: the power of two closest to kFrameSeconds.
 std::size_t chroma_frame_size(int sample_rate) {
@@ -53,7 +53,7 @@ struct BandPower {
 
 /// Mean power and spectral flatness of bins [first, last).
 BandPower measure_band(std::span<const float> magnitudes, std::size_t first, std::size_t last) {
-    constexpr double kPowerEpsilon = 1e-20;
+    constexpr double kPowerEpsilon = 1e-20;  ///< keeps log() finite for empty bins
     double log_sum = 0.0;
     double power_sum = 0.0;
     for (std::size_t bin = first; bin < last; ++bin) {

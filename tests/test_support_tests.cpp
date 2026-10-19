@@ -143,15 +143,15 @@ TEST_SUITE("infra") {
         CHECK(mso::test::ffmpeg_required() == mso::test::environment_flag("MSO_REQUIRE_FFMPEG"));
     }
 
-    TEST_CASE("generated dependency notices cover the manifest with license texts") {
+    TEST_CASE("generated dependency notices cover the shipped dependencies with license texts") {
         using mso::generated::kDependencies;
         CHECK_FALSE(mso::generated::kProjectVersion.empty());
         const auto find = [](std::string_view name) {
             return std::ranges::find(kDependencies, name, &mso::generated::DependencyNotice::name);
         };
-        for (const std::string_view name : {"sqlite", "nlohmann_json", "utf8proc", "stduuid", "picosha2", "miniaudio",
-                                            "pocketfft", "signalsmith_linear", "signalsmith_stretch", "thread_pool",
-                                            "readerwriterqueue", "csv_parser", "cli11", "doctest"}) {
+        for (const std::string_view name :
+             {"sqlite", "nlohmann_json", "utf8proc", "stduuid", "picosha2", "miniaudio", "pocketfft",
+              "signalsmith_linear", "signalsmith_stretch", "thread_pool", "readerwriterqueue", "csv_parser", "cli11"}) {
             CAPTURE(name);
             const auto notice = find(name);
             REQUIRE(notice != std::end(kDependencies));
@@ -163,6 +163,8 @@ TEST_SUITE("infra") {
             // Every non-public-domain dependency ships its notice text (MIT/BSD require it).
             if (notice->license != "Public domain") CHECK(notice->license_text.size() > 100);
         }
+        // Test-only dependencies ("test_only" in the manifest) are not shipped, so they are not listed.
+        CHECK(find("doctest") == std::end(kDependencies));
         for (const auto& notice : kDependencies) {
             if (notice.system_library) {
                 CHECK((notice.name == "Qt" || notice.name == "FFmpeg"));

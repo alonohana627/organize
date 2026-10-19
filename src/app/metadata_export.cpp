@@ -6,7 +6,15 @@
 #include <csv.hpp>
 #include <nlohmann/json.hpp>
 
-#include "mso/app/json_fields.hpp"
+#include "mso/catalog/durable_file.hpp"
+#include "mso/domain/json_fields.hpp"
+
+#ifdef _WIN32
+#include <windows.h>  // CreateFileW, FlushFileBuffers
+#else
+#include <fcntl.h>   // open
+#include <unistd.h>  // fsync, close
+#endif
 
 namespace mso::app {
 
@@ -47,7 +55,7 @@ std::vector<std::string> csv_values(const search::SampleRow& row, const std::str
             row.key ? format_key(*row.key) : "",
             row.key_source,
             row.category,
-            dump_json(nlohmann::json(row.tag_paths)),
+            json_fields::dump_json(nlohmann::json(row.tag_paths)),
             std::to_string(row.rating),
             row.favorite ? "true" : "false",
             std::string(search::to_string(row.availability)),
@@ -104,6 +112,25 @@ void remove_quietly(const std::filesystem::path& file) {
     std::filesystem::remove(file, ignored);
 }
 
+/// Flushes a closed file's data to stable storage, so the rename that publishes it can never
+/// expose a file whose contents a power loss would lose.
+Result<void> flush_to_disk(const std::filesystem::path& file) {
+#ifdef _WIN32
+    const HANDLE handle = CreateFileW(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return fail(ErrorCode::AccessDenied, "cannot reopen the export to flush it");
+    const bool flushed = FlushFileBuffers(handle) != 0;
+    CloseHandle(handle);
+#else
+    const int descriptor = ::open(file.c_str(), O_WRONLY | O_CLOEXEC);
+    if (descriptor < 0) return fail(ErrorCode::AccessDenied, "cannot reopen the export to flush it");
+    const bool flushed = ::fsync(descriptor) == 0;
+    ::close(descriptor);
+#endif
+    if (!flushed) return fail(ErrorCode::DiskFull, "the export could not be flushed to disk");
+    return {};
+}
+
 }  // namespace
 
 std::string spreadsheet_safe(std::string value) {
@@ -145,8 +172,8 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
             const nlohmann::json library_json = {{"uuid", uuids::to_string(identity.uuid)},
                                                  {"name", identity.name},
                                                  {"catalog_revision", identity.catalog_revision}};
-            out << "{\"schema_version\":" << kExportSchemaVersion << ",\"library\":" << dump_json(library_json)
-                << ",\"exported_at\":" << now_unix_ms()
+            out << "{\"schema_version\":" << kExportSchemaVersion
+                << ",\"library\":" << json_fields::dump_json(library_json) << ",\"exported_at\":" << now_unix_ms()
                 << ",\"absolute_paths\":" << (options.include_absolute_paths ? "true" : "false") << ",\"samples\":[";
         }
         if (!out) return write_failed();
@@ -173,7 +200,8 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
                             value = spreadsheet_safe(std::move(value));
                     csv_writer << values;
                 } else {
-                    out << (first ? "" : ",") << dump_json(json_row(row, absolute, options.include_absolute_paths));
+                    out << (first ? "" : ",")
+                        << json_fields::dump_json(json_row(row, absolute, options.include_absolute_paths));
                     first = false;
                 }
                 ++summary.rows;
@@ -195,46 +223,36 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
         if (!out) return write_failed();
     }
 
-    // The CSV manifest is complete on disk before the CSV itself is published.
-    std::filesystem::path manifest_temporary;
-    auto manifest_path = destination;
-    manifest_path += ".manifest.json";
-    if (csv) {
-        manifest_temporary = temporary_sibling(manifest_path);
-        std::ofstream manifest(manifest_temporary, std::ios::binary | std::ios::trunc);
-        manifest << dump_json({{"schema_version", kExportSchemaVersion},
-                               {"library", uuids::to_string(identity.uuid)},
-                               {"catalog_revision", identity.catalog_revision},
-                               {"catalog_revision_at_end", revision_at_end},
-                               {"consistent", revision_at_end == identity.catalog_revision},
-                               {"rows", summary.rows},
-                               {"spreadsheet_safe", options.spreadsheet_safe},
-                               {"absolute_paths", options.include_absolute_paths},
-                               {"tags_encoding", "JSON array per cell"}},
-                              2);
-        manifest.flush();
-        if (!manifest) {
-            manifest.close();
-            remove_quietly(manifest_temporary);
-            remove_quietly(temporary);
-            return fail(ErrorCode::DiskFull, "writing the export manifest failed");
-        }
+    if (auto flushed = flush_to_disk(temporary); !flushed) {
+        remove_quietly(temporary);
+        return std::unexpected(flushed.error());
     }
-
     std::error_code error;
     std::filesystem::rename(temporary, destination, error);
     if (error) {
         const auto message = std::format("cannot replace the export destination: {}", error.message());
         remove_quietly(temporary);
-        if (csv) remove_quietly(manifest_temporary);
         return fail(ErrorCode::AccessDenied, message);
     }
     if (csv) {
-        std::filesystem::rename(manifest_temporary, manifest_path, error);
-        if (error) {
-            remove_quietly(manifest_temporary);
-            return fail(ErrorCode::AccessDenied,
-                        std::format("the export was written but its manifest could not be: {}", error.message()));
+        // The manifest describes the CSV just published. If it cannot be written, an older manifest
+        // must not stay next to the new CSV claiming to describe it.
+        auto manifest_path = destination;
+        manifest_path += ".manifest.json";
+        const auto manifest = json_fields::dump_json({{"schema_version", kExportSchemaVersion},
+                                                      {"library", uuids::to_string(identity.uuid)},
+                                                      {"catalog_revision", identity.catalog_revision},
+                                                      {"catalog_revision_at_end", revision_at_end},
+                                                      {"consistent", revision_at_end == identity.catalog_revision},
+                                                      {"rows", summary.rows},
+                                                      {"spreadsheet_safe", options.spreadsheet_safe},
+                                                      {"absolute_paths", options.include_absolute_paths},
+                                                      {"tags_encoding", "JSON array per cell"}},
+                                                     2);
+        if (auto written = catalog::write_file_atomically(manifest_path, manifest); !written) {
+            remove_quietly(manifest_path);
+            return fail(written.error().code, std::format("the export was written but its manifest could not be: {}",
+                                                          written.error().message()));
         }
     }
     return summary;

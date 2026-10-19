@@ -3,11 +3,12 @@
 #include <doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <format>
 
 #include <nlohmann/json.hpp>
 
-#include "mso/catalog/detail/library_test_access.hpp"
+#include "mso/catalog/detail/catalog_internal.hpp"
 #include "mso/catalog/durable_file.hpp"
 #include "mso/catalog/library.hpp"
 #include "mso/catalog/migrations.hpp"
@@ -17,6 +18,18 @@
 using namespace mso;
 using namespace mso::catalog;
 using mso::test::ScratchDirectory;
+
+namespace mso::catalog {
+
+/// Friend of Library (declared in library.hpp, defined only here) giving these tests the private
+/// writer connection for fault injection: simulating a concurrent tool, corrupt rows or an injected
+/// failure. Production code has no way to reach it.
+struct LibraryTestAccess {
+    /// The serialized writer connection (hold writer_mutex while using it from several threads).
+    static sqlite::Connection& writer(Library& library) { return library.writer_; }
+};
+
+}  // namespace mso::catalog
 
 namespace {
 
@@ -104,13 +117,14 @@ LocationState location_state(Library& library, std::int64_t sample_id) {
     return detail->locations.front().state;
 }
 
-/// Writes a catalog with only migrations 1–4 (as released before this build) plus its manifest.
-void write_version_four_library(const std::filesystem::path& directory, const uuids::uuid& uuid) {
+/// Writes a catalog with only the migrations up to `version` (as released before this build) plus its
+/// manifest.
+void write_library_at_version(const std::filesystem::path& directory, const uuids::uuid& uuid, int version) {
     std::filesystem::create_directories(directory);
     auto connection = sqlite::Connection::open(directory / Library::kCatalogFileName, {.create = true});
     REQUIRE(connection.has_value());
     for (const auto& migration : migrations()) {
-        if (migration.version > 4) break;
+        if (migration.version > version) break;
         REQUIRE(connection->execute_script(migration.sql).has_value());
         auto record = connection->prepare("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?1,?2,0)");
         REQUIRE(record.has_value());
@@ -125,7 +139,10 @@ void write_version_four_library(const std::filesystem::path& directory, const uu
             REQUIRE(state->run().has_value());
         }
     }
-    REQUIRE(connection->execute_script("UPDATE library_state SET schema_version=4; PRAGMA user_version=4").has_value());
+    REQUIRE(connection
+                ->execute_script(
+                    std::format("UPDATE library_state SET schema_version={0}; PRAGMA user_version={0}", version))
+                .has_value());
     connection->close();
     const nlohmann::json manifest = {{"format_version", 1}, {"library_uuid", uuids::to_string(uuid)}, {"name", "Old"}};
     REQUIRE(write_file_atomically(directory / Library::kManifestFileName, manifest.dump()).has_value());
@@ -159,6 +176,7 @@ TEST_SUITE("catalog") {
             {3, "9122c1c8f2c8ae370655ed299a16ae3391af06cb9d55d435605ff6c7c11e2e76"},
             {4, "f6dd240e6d183500cad2f7621f330ff4ae438230550141404e13fae57a00f128"},
             {5, "c892cdf8794da18f988447b87f103a5933ca5ba50c61d73ddd839a8b04dbe7b4"},
+            {6, "d626e8ddfd71f63dfdc0c742c4942cfdf2dd2f85fca222dc844667ec36817b5c"},
         };
         REQUIRE(migrations().size() >= released.size());
         for (const auto& [version, checksum] : released) {
@@ -215,7 +233,7 @@ TEST_SUITE("catalog") {
     TEST_CASE("an older schema is upgraded after a verified backup, and cannot be opened read-only") {
         ScratchDirectory scratch;
         const auto uuid = new_uuid();
-        write_version_four_library(scratch / "lib", uuid);
+        write_library_at_version(scratch / "lib", uuid, 4);
         auto read_only = Library::open(scratch / "lib", {.read_only = true});
         REQUIRE_FALSE(read_only.has_value());
         CHECK(read_only.error().code == ErrorCode::InvalidArgument);
@@ -1203,6 +1221,513 @@ TEST_SUITE("catalog") {
                     .has_value());
         REQUIRE(library.finish_scan(*session, false).has_value());
         CHECK(job_state(library, (*lease)->job_id) == "queued");
+    }
+
+    // ------------------------------------------------------------ second review round
+
+    TEST_CASE("skipped entries stay seen: never missing, and a missing one comes back as unknown") {
+        ScratchDirectory scratch;
+        auto library = Library::create(scratch / "lib", "Skips");
+        REQUIRE(library.has_value());
+        auto& catalog = **library;
+        const std::vector<ScannedFile> files = {
+            test::synthetic_file("Cloud/Pad.wav", 10, 1'000), test::synthetic_file("Links/Loop.wav", 20, 1'000),
+            test::synthetic_file("Drums/Kick.wav", 30, 1'000), test::synthetic_file("Gone/Old.wav", 40, 1'000)};
+        const auto root = add_scanned_root(catalog, "Root", files, /*case_sensitive=*/false);
+
+        auto session = catalog.begin_scan(root);
+        REQUIRE(session.has_value());
+        const std::vector<ScannedFile> probed = {test::synthetic_file("Drums/Kick.wav", 30, 1'000)};
+        REQUIRE(catalog.commit_scan_batch(*session, probed, {}, [](std::string_view) { return false; }).has_value());
+        const auto before = current_revision(catalog);
+        // A cloud placeholder, a link spelled in another case, and a path the catalog never saw.
+        const std::vector<std::string> skipped = {"Cloud/Pad.wav", "LINKS/loop.WAV", "Unknown/new.wav"};
+        REQUIRE(catalog.mark_scan_entries_seen(*session, skipped).has_value());
+        CHECK(current_revision(catalog) == before);  // bookkeeping only: nothing visible changed
+        auto finished = catalog.finish_scan(*session, false);
+        REQUIRE(finished.has_value());
+        CHECK(finished->marked_missing == 1);
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Pad")) == LocationState::Present);
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Loop")) == LocationState::Present);
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Kick")) == LocationState::Present);
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Old")) == LocationState::Missing);
+        CHECK(query(catalog, "SELECT byte_size FROM locations WHERE relative_path='Cloud/Pad.wav'") == 10);
+
+        // The missing file is back but skipped (say it became a cloud placeholder): it exists, but its
+        // bytes were not examined, so it is unknown rather than present; the change is a revision.
+        auto again = catalog.begin_scan(root);
+        REQUIRE(again.has_value());
+        const std::vector<std::string> back = {"Gone/Old.wav"};
+        REQUIRE(catalog.mark_scan_entries_seen(*again, back).has_value());
+        CHECK(current_revision(catalog) == before + 2);
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Old")) == LocationState::Unknown);
+
+        const std::vector<std::string> too_many(Library::kMaximumScanBatchFiles + 1, "Cloud/Pad.wav");
+        auto oversized = catalog.mark_scan_entries_seen(*again, too_many);
+        REQUIRE_FALSE(oversized.has_value());
+        CHECK(oversized.error().code == ErrorCode::InvalidArgument);
+    }
+
+    TEST_CASE("case-insensitive roots: a case-only rename is stored, and a gap in another case protects its files") {
+        ScratchDirectory scratch;
+        auto library = Library::create(scratch / "lib", "Cases");
+        REQUIRE(library.has_value());
+        auto& catalog = **library;
+        const std::vector<ScannedFile> files = {test::synthetic_file("Drums/Kick.wav", 10, 1'000),
+                                                test::synthetic_file("Loops/Beat.wav", 20, 1'000)};
+        const auto root = add_scanned_root(catalog, "Windows volume", files, /*case_sensitive=*/false);
+        const auto kick = test::sample_id_named(catalog, "Kick");
+
+        auto session = catalog.begin_scan(root);
+        REQUIRE(session.has_value());
+        const std::vector<ScannedFile> renamed = {test::synthetic_file("drums/KICK.wav", 10, 1'000)};
+        auto committed = catalog.commit_scan_batch(*session, renamed, {}, [](std::string_view) { return false; });
+        REQUIRE(committed.has_value());
+        CHECK(committed->unchanged == 1);
+        REQUIRE(catalog.record_scan_gap(*session, "LOOPS", /*denied=*/true).has_value());
+        auto finished = catalog.finish_scan(*session, false);
+        REQUIRE(finished.has_value());
+        CHECK(finished->marked_missing == 0);  // Loops/Beat.wav is inside the denied subtree
+        auto detail = catalog.sample_detail(kick);
+        REQUIRE(detail.has_value());
+        REQUIRE(detail->locations.size() == 1);
+        CHECK(detail->locations.front().relative_path == "drums/KICK.wav");
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Beat")) == LocationState::Present);
+        auto folders = catalog.list_folders(root);
+        REQUIRE(folders.has_value());
+        CHECK(std::ranges::count(*folders, std::string("drums"), &FolderRecord::relative_path) == 1);
+    }
+
+    TEST_CASE("deep folder trees are stored without recursion, and emptied folders are removed") {
+        ScratchDirectory scratch;
+        std::string deep;
+        for (int level = 0; level < 150; ++level)
+            deep += std::format("level{}/", level);
+        auto moved = test::synthetic_file("Old/Moved.wav", 10, 1'000);
+        moved.volume_id = "volume";
+        moved.file_id = std::string(16, 'x');
+        auto populated =
+            test::make_library(scratch / "lib", {test::synthetic_file(deep + "Deep.wav", 5, 1'000), moved});
+        auto& library = *populated.library;
+        auto folders = library.list_folders(populated.root_id);
+        REQUIRE(folders.has_value());
+        CHECK(folders->size() == 151);
+
+        // A same-volume rename moves the file out of Old/, which then holds nothing and goes away.
+        auto session = library.begin_scan(populated.root_id);
+        REQUIRE(session.has_value());
+        auto renamed = moved;
+        renamed.relative_path = "New/Moved.wav";
+        const std::vector<ScannedFile> files = {test::synthetic_file(deep + "Deep.wav", 5, 1'000), renamed};
+        auto committed = library.commit_scan_batch(*session, files, {}, [](std::string_view) { return false; });
+        REQUIRE(committed.has_value());
+        CHECK(committed->relinked == 1);
+        auto finished = library.finish_scan(*session, false);
+        REQUIRE(finished.has_value());
+        CHECK(finished->removed_empty_folders == 1);
+        folders = library.list_folders(populated.root_id);
+        REQUIRE(folders.has_value());
+        CHECK(std::ranges::count(*folders, std::string("Old"), &FolderRecord::relative_path) == 0);
+        CHECK(std::ranges::count(*folders, std::string("New"), &FolderRecord::relative_path) == 1);
+        CHECK(folders->size() == 151);
+    }
+
+    TEST_CASE("begin_scan resumes a recent interrupted scan but abandons one that is too old") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        auto first = library.begin_scan(populated.root_id);
+        REQUIRE(first.has_value());
+        REQUIRE(library.finish_scan(*first, /*cancelled=*/true).has_value());
+        auto resumed = library.begin_scan(populated.root_id);
+        REQUIRE(resumed.has_value());
+        CHECK(resumed->id == first->id);
+        REQUIRE(library.finish_scan(*resumed, /*cancelled=*/true).has_value());
+
+        execute(library, std::format("UPDATE scan_sessions SET started_at=0 WHERE id={}", first->id));
+        auto fresh = library.begin_scan(populated.root_id);
+        REQUIRE(fresh.has_value());
+        CHECK(fresh->id != first->id);
+        CHECK(fresh->generation > first->generation);
+        CHECK(query_text(library, std::format("SELECT state FROM scan_sessions WHERE id={}", first->id)) ==
+              "cancelled");
+    }
+
+    TEST_CASE("a conflicting undo keeps its receipt: resending it reports the conflict again") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        const auto kick = test::sample_id_named(library, "Kick 01");
+        const auto snare = test::sample_id_named(library, "Snare");
+        REQUIRE(library.apply_edit(rate({kick}, 1)).has_value());
+        REQUIRE(library.apply_edit(rate({snare}, 3)).has_value());
+        execute(library, std::format("UPDATE samples SET rating=5 WHERE id={}", snare));
+        const auto operation = new_uuid();
+        auto first = library.undo(operation);
+        REQUIRE_FALSE(first.has_value());
+        CHECK(first.error().code == ErrorCode::HistoryConflict);
+        auto resent = library.undo(operation);
+        REQUIRE_FALSE(resent.has_value());
+        CHECK(resent.error().code == ErrorCode::HistoryConflict);
+        CHECK(library.sample_detail(kick)->rating == 1);  // the older action was not undone instead
+    }
+
+    TEST_CASE("a conflicting redo is recorded once and supersedes the rest of the redo tail") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        const auto kick = test::sample_id_named(library, "Kick 01");
+        const auto snare = test::sample_id_named(library, "Snare");
+        REQUIRE(library.apply_edit(rate({kick}, 1)).has_value());
+        REQUIRE(library.apply_edit(rate({snare}, 3)).has_value());
+        REQUIRE(library.undo().has_value());
+        REQUIRE(library.undo().has_value());
+        execute(library, std::format("UPDATE samples SET rating=4 WHERE id={}", kick));
+        auto redone = library.redo();
+        REQUIRE_FALSE(redone.has_value());
+        CHECK(redone.error().code == ErrorCode::HistoryConflict);
+        CHECK(library.sample_detail(kick)->rating == 4);
+        auto history = library.history();
+        REQUIRE(history.has_value());
+        REQUIRE(history->size() == 1);  // the newer undone action was superseded
+        CHECK(history->front().state == "conflict");
+        auto again = library.redo();
+        REQUIRE_FALSE(again.has_value());
+        CHECK(again.error().code == ErrorCode::NotFound);
+        auto review = library.open_review_items();
+        REQUIRE(review.has_value());
+        CHECK(std::ranges::count(*review, std::string("history_conflict"), &ReviewItem::kind) == 1);
+    }
+
+    TEST_CASE("an edit that changes nothing leaves history and the redo tail alone") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        const auto kick = test::sample_id_named(library, "Kick 01");
+        REQUIRE(library.apply_edit(rate({kick}, 1)).has_value());
+        REQUIRE(library.undo().has_value());
+        auto unchanged = library.apply_edit(rate({kick}, 0));  // already 0
+        REQUIRE(unchanged.has_value());
+        CHECK_FALSE(unchanged->history_action.has_value());
+        CHECK(unchanged->applied == 1);
+        auto replayed = library.apply_edit([&] {
+            auto command = rate({kick}, 0);
+            command.operation = unchanged->operation;
+            return command;
+        }());
+        REQUIRE(replayed.has_value());
+        CHECK(replayed->replayed);
+        REQUIRE(library.history()->size() == 1);
+        REQUIRE(library.redo().has_value());
+        CHECK(library.sample_detail(kick)->rating == 1);
+    }
+
+    TEST_CASE("the outbox is pruned to its byte cap, and lagging consumers are told to reload") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        const auto kick = test::sample_id_named(library, "Kick 01");
+        for (int rating = 1; rating <= 5; ++rating)
+            REQUIRE(library.apply_edit(rate({kick}, rating)).has_value());
+        const auto newest = current_revision(library);
+        const auto kept_bytes = query(library, std::format("SELECT sum(length(payload_json)) FROM catalog_outbox "
+                                                           "WHERE revision>{}",
+                                                           newest - 2));
+        REQUIRE(detail::enforce_outbox_cap(writer(library), kept_bytes).has_value());
+        CHECK(query(library, "SELECT count(*) FROM catalog_outbox") == 2);
+        auto lagging = library.changes_since(0);
+        REQUIRE(lagging.has_value());
+        CHECK(lagging->full_reload);
+        auto current = library.changes_since(newest - 2);
+        REQUIRE(current.has_value());
+        CHECK_FALSE(current->full_reload);
+    }
+
+    TEST_CASE("pausing a run takes its waiting jobs out of the queue, and a paused run still settles") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        auto run = library.create_analysis_run({"Tempo", {"tempo"}, all_sample_ids(library), false});
+        REQUIRE(run.has_value());
+        auto leased = library.lease_next_job(std::chrono::seconds(15));
+        REQUIRE(leased.has_value());
+        REQUIRE(leased->has_value());
+        REQUIRE(library.control_run(run->id, Library::RunControl::Pause).has_value());
+        auto runs = library.list_analysis_runs();
+        REQUIRE(runs.has_value());
+        CHECK(runs->front().state == "paused");
+        CHECK(runs->front().paused == 2);
+        CHECK(runs->front().running == 1);
+        CHECK(runs->front().queued == 0);
+        CHECK(runs->front().blocked == 0);
+        auto nothing = library.lease_next_job(std::chrono::seconds(15));
+        REQUIRE(nothing.has_value());
+        CHECK_FALSE(nothing->has_value());
+
+        const auto facts = [](const Library::JobLease& lease) {
+            return Library::AnalysisFacts{.sample_id = lease.sample_id,
+                                          .content_revision = lease.content_revision,
+                                          .bpm_milli = 120'000,
+                                          .tempo_algorithm = "test",
+                                          .tempo_requested = true};
+        };
+        REQUIRE(library.complete_job(**leased, facts(**leased)).has_value());  // the leased job finishes
+        CHECK(library.list_analysis_runs()->front().state == "paused");
+        REQUIRE(library.control_run(run->id, Library::RunControl::Resume).has_value());
+        CHECK(library.list_analysis_runs()->front().queued == 2);
+        for (int remaining = 0; remaining < 2; ++remaining) {
+            auto next = library.lease_next_job(std::chrono::seconds(15));
+            REQUIRE(next.has_value());
+            REQUIRE(next->has_value());
+            REQUIRE(library.complete_job(**next, facts(**next)).has_value());
+        }
+        CHECK(library.list_analysis_runs()->front().state == "completed");
+
+        // Paused while its only job is leased: when that job finishes nothing is left, so it completes.
+        auto single = library.create_analysis_run({"Tempo", {"tempo"}, {all_sample_ids(library).front()}, true});
+        REQUIRE(single.has_value());
+        auto only = library.lease_next_job(std::chrono::seconds(15));
+        REQUIRE(only.has_value());
+        REQUIRE(only->has_value());
+        REQUIRE(library.control_run(single->id, Library::RunControl::Pause).has_value());
+        REQUIRE(library.complete_job(**only, facts(**only)).has_value());
+        CHECK(library.list_analysis_runs()->front().state == "completed");
+    }
+
+    TEST_CASE("a damaged job row fails on its own and the queue moves on") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        auto run = library.create_analysis_run({"Tempo", {"tempo"}, all_sample_ids(library), false});
+        REQUIRE(run.has_value());
+        const auto first_job = query(library, "SELECT min(id) FROM jobs");
+        execute(library, std::format("UPDATE jobs SET uuid='not a uuid' WHERE id={}", first_job));
+        execute(library, std::format("UPDATE jobs SET checkpoint_json='{{}}' WHERE id={}", first_job + 1));
+        execute(library,
+                std::format("UPDATE jobs SET checkpoint_json='{{}}', stage='bogus' WHERE id={}", first_job + 2));
+
+        auto lease = library.lease_next_job(std::chrono::seconds(15));
+        REQUIRE(lease.has_value());
+        REQUIRE(lease->has_value());
+        CHECK((*lease)->job_id == first_job + 1);
+        CHECK((*lease)->stages == std::vector<std::string>{"tempo"});  // recovered from the stage column
+        CHECK(job_state(library, first_job) == "failed");
+        CHECK(query_text(library, std::format("SELECT error_code FROM jobs WHERE id={}", first_job)) == "DB_CORRUPT");
+        auto empty = library.lease_next_job(std::chrono::seconds(15));
+        REQUIRE(empty.has_value());
+        CHECK_FALSE(empty->has_value());
+        CHECK(job_state(library, first_job + 2) == "failed");
+        REQUIRE(library.release_job(**lease).has_value());
+    }
+
+    TEST_CASE("loudness, PCM hash and waveform results are stored with their algorithm versions") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        const auto kick = test::sample_id_named(library, "Kick 01");
+        Library::AnalysisFacts facts{.sample_id = kick,
+                                     .content_revision = 1,
+                                     .peak_dbfs = -1.0,
+                                     .rms_dbfs = -12.0,
+                                     .pcm_sha256 = std::string(64, 'a'),
+                                     .waveform_segment = "derived/waveforms/kick.bin"};
+        auto unversioned = library.record_analysis(facts);
+        REQUIRE_FALSE(unversioned.has_value());
+        CHECK(unversioned.error().code == ErrorCode::InvalidArgument);
+        facts.loudness_algorithm = "loudness-test-3";
+        facts.pcm_hash_algorithm = "pcm-hash-test-4";
+        facts.waveform_algorithm = "waveform-test-5";
+        REQUIRE(library.record_analysis(facts).has_value());
+        CHECK(query_text(library, "SELECT algorithm_version FROM metadata_observations WHERE field='peak_dbfs'") ==
+              "loudness-test-3");
+        CHECK(query_text(library, "SELECT algorithm_version FROM metadata_observations WHERE field='pcm_sha256'") ==
+              "pcm-hash-test-4");
+        CHECK(query_text(library, "SELECT algorithm_version FROM artifacts WHERE kind='waveform'") ==
+              "waveform-test-5");
+    }
+
+    TEST_CASE("opening a library written with another key normalization rebuilds its keys") {
+        ScratchDirectory scratch;
+        std::int64_t root = 0;
+        {
+            auto library = Library::create(scratch / "lib", "Keys");
+            REQUIRE(library.has_value());
+            root = add_scanned_root(**library, "Root", {test::synthetic_file("Drums/Kick.wav", 10, 1'000)}, false);
+            REQUIRE((*library)->ensure_tag("Drums/Acoustic").has_value());
+            execute(**library,
+                    "UPDATE library_state SET normalization_version='older'; "
+                    "UPDATE locations SET path_key='drums/kick.wav'; UPDATE folders SET path_key='drums'; "
+                    "UPDATE samples SET name_key='stale'; UPDATE tags SET name_key='stale-'||id");
+        }
+        auto reopened = Library::open(scratch / "lib");
+        REQUIRE_MESSAGE(reopened.has_value(), reopened.error().message());
+        auto& library = **reopened;
+        CHECK(query_text(library, "SELECT normalization_version FROM library_state") == kFoldVersion);
+        CHECK(query_text(library, "SELECT path_key FROM locations") == path_key("Drums/Kick.wav", false));
+        CHECK(query_text(library, "SELECT path_key FROM folders") == path_key("Drums", false));
+        CHECK(query_text(library, "SELECT name_key FROM samples") == fold_key("Kick"));
+        CHECK(query(library, "SELECT count(*) FROM tags WHERE name_key LIKE 'stale%'") == 0);
+        auto stats = library.known_stats_in_directory(root, "DRUMS");
+        REQUIRE(stats.has_value());
+        CHECK(stats->contains(path_key("drums/kick.WAV", false)));
+        CHECK(library.ensure_tag("drums/acoustic").has_value());
+        CHECK(query(library, "SELECT count(*) FROM tags") == 2);  // found, not created again
+    }
+
+    TEST_CASE("rebuilt keys that would collide keep the old keys and open a review item") {
+        ScratchDirectory scratch;
+        {
+            auto library = Library::create(scratch / "lib", "Keys");
+            REQUIRE(library.has_value());
+            const std::vector<ScannedFile> files = {test::synthetic_file("Kick.wav", 10, 1'000),
+                                                    test::synthetic_file("kick.wav", 20, 1'000)};
+            add_scanned_root(**library, "Root", files, /*case_sensitive=*/true);
+            // As if the root had been stored case-insensitive under a key scheme that kept them apart.
+            execute(**library,
+                    "UPDATE roots SET case_sensitive=0; UPDATE library_state SET normalization_version='older'");
+        }
+        for (int open = 0; open < 2; ++open) {
+            auto reopened = Library::open(scratch / "lib");
+            REQUIRE_MESSAGE(reopened.has_value(), reopened.error().message());
+            auto& library = **reopened;
+            CHECK(query_text(library, "SELECT normalization_version FROM library_state") == "older");
+            CHECK(query(library, "SELECT count(DISTINCT path_key) FROM locations") == 2);
+            auto review = library.open_review_items();
+            REQUIRE(review.has_value());
+            CHECK(std::ranges::count(*review, std::string("normalization_conflict"), &ReviewItem::kind) == 1);
+        }
+    }
+
+    TEST_CASE("an upgrade parks the waiting jobs of paused runs and settles paused runs with nothing left") {
+        ScratchDirectory scratch;
+        const auto uuid = new_uuid();
+        write_library_at_version(scratch / "lib", uuid, 5);
+        {
+            auto connection = sqlite::Connection::open(scratch / "lib" / Library::kCatalogFileName, {});
+            REQUIRE(connection.has_value());
+            REQUIRE(connection
+                        ->execute_script(
+                            "INSERT INTO samples(id,uuid,display_name,name_key,created_at,updated_at) "
+                            "VALUES(1,'s1','One','one',0,0);"
+                            "INSERT INTO analysis_profiles(id,uuid,version,name,config_json,digest,created_at) "
+                            "VALUES(1,'p',1,'Tempo','{}','d',0);"
+                            "INSERT INTO analysis_runs(id,uuid,profile_id,state,requested_at,input_revision,"
+                            "selection_json) VALUES(1,'r1',1,'paused',0,0,'{}'),(2,'r2',1,'paused',0,0,'{}');"
+                            "INSERT INTO jobs(id,uuid,run_id,sample_id,content_revision,stage,state) "
+                            "VALUES(1,'j1',1,1,1,'tempo','queued'),(2,'j2',2,1,1,'tempo','completed')")
+                        .has_value());
+            connection->close();
+        }
+        auto library = Library::open(scratch / "lib");
+        REQUIRE_MESSAGE(library.has_value(), library.error().message());
+        CHECK(job_state(**library, 1) == "paused");
+        CHECK(query_text(**library, "SELECT state FROM analysis_runs WHERE id=1") == "paused");
+        CHECK(query_text(**library, "SELECT state FROM analysis_runs WHERE id=2") == "completed");
+        CHECK(query(**library, "SELECT count(*) FROM pragma_index_list('jobs') WHERE name='jobs_ready'") == 1);
+    }
+
+    TEST_CASE("the integrity report notices a damaged search index") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        auto healthy = library.integrity_report();
+        REQUIRE(healthy.has_value());
+        CHECK(*healthy == "integrity: ok; foreign keys: 0 violation(s); search index: ok");
+        // The search projection changes behind the index's back (the database itself stays sound).
+        execute(library, "DROP TRIGGER sample_search_au; UPDATE sample_search SET name='renamed elsewhere'");
+        auto report = library.integrity_report();
+        REQUIRE(report.has_value());
+        CAPTURE(*report);
+        CHECK(report->starts_with("integrity: ok; foreign keys: 0 violation(s); search index: "));
+        CHECK_FALSE(report->ends_with("search index: ok"));
+    }
+
+    TEST_CASE("benchmark: leasing at 100k queued jobs and finishing a scan with many directories" *
+              doctest::skip(!test::environment_flag("MSO_CATALOG_BENCHMARK"))) {
+        ScratchDirectory scratch;
+        auto created = Library::create(scratch / "lib", "Bench");
+        REQUIRE(created.has_value());
+        auto& library = **created;
+        constexpr int kSamples = 100'000;
+        constexpr int kDirectories = 5'000;
+        const auto root = library.add_root("Bench", RootMode::Referenced, false);
+        REQUIRE(root.has_value());
+        execute(library, std::format("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{0}) "
+                                     "INSERT INTO samples(id,uuid,display_name,name_key,created_at,updated_at) "
+                                     "SELECT i, 'sample-'||i, 'S'||i, 's'||i, 0, 0 FROM n;"
+                                     "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{0}) "
+                                     "INSERT INTO locations(sample_id,root_id,relative_path,path_key,state,"
+                                     "observed_content_revision,seen_scan_generation) "
+                                     "SELECT i, {1}, 'D'||(i%{2})||'/S'||i||'.wav', 'D'||(i%{2})||'/S'||i||'.WAV', "
+                                     "'present', 1, 0 FROM n;",
+                                     kSamples, root->id, kDirectories));
+        REQUIRE(library.set_root_availability(root->id, Availability::Online).has_value());
+        auto run = library.create_analysis_run_for_root(root->id, "Bench", {"tempo"}, false);
+        REQUIRE(run.has_value());
+        REQUIRE(run->queued == kSamples);
+
+        using Clock = std::chrono::steady_clock;
+        const auto milliseconds_per = [](Clock::duration elapsed, int count) {
+            return std::chrono::duration<double, std::milli>(elapsed).count() / count;
+        };
+        // Before: the review-time query (sorts every queued job in a temp B-tree per lease).
+        constexpr std::string_view kOldLeaseQuery =
+            "SELECT jobs.id FROM jobs JOIN analysis_runs run ON run.id=jobs.run_id "
+            "WHERE jobs.state IN ('queued','interrupted') AND run.state IN ('queued','running') "
+            "AND (jobs.lease_expires_at IS NULL OR jobs.lease_expires_at<=?1) AND {} "
+            "ORDER BY run.id, jobs.priority DESC, jobs.id LIMIT 1";
+        constexpr int kOldLeases = 20;
+        auto old_query = writer(library).prepare(std::format(kOldLeaseQuery, detail::kJobSampleReachableSql));
+        REQUIRE(old_query.has_value());
+        auto started = Clock::now();
+        for (int lease = 0; lease < kOldLeases; ++lease) {
+            old_query->bind(1, now_unix_ms());
+            REQUIRE(old_query->next_row().value_or(false));
+            old_query->reset();
+        }
+        const double old_per_lease = milliseconds_per(Clock::now() - started, kOldLeases);
+
+        constexpr int kLeases = 2'000;
+        started = Clock::now();
+        for (int lease = 0; lease < kLeases; ++lease) {
+            auto next = library.lease_next_job(std::chrono::minutes(10));
+            REQUIRE(next.has_value());
+            REQUIRE(next->has_value());
+        }
+        const double new_per_lease = milliseconds_per(Clock::now() - started, kLeases);
+        MESSAGE(
+            std::format("lease at {} queued jobs: before {:.3f} ms (query only), after {:.3f} ms per "
+                        "lease_next_job (whole transaction)",
+                        kSamples, old_per_lease, new_per_lease));
+
+        // finish_scan: 20k unseen locations under 2k gap-free directories plus one denied directory.
+        auto session = library.begin_scan(root->id);
+        REQUIRE(session.has_value());
+        execute(library, std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{}) "
+                                     "INSERT INTO scan_frontier(scan_id,relative_directory,state) "
+                                     "SELECT {}, 'D'||i, 'complete' FROM n",
+                                     kDirectories - 1, session->id));
+        execute(library,
+                std::format("UPDATE locations SET seen_scan_generation={} WHERE sample_id>20000", session->generation));
+        REQUIRE(library.record_scan_gap(*session, "Elsewhere", /*denied=*/true).has_value());
+        constexpr std::string_view kOldUnseenCount =
+            "SELECT count(*) FROM locations location WHERE location.root_id={} "
+            "AND location.state IN ('present','changed','unknown') AND location.seen_scan_generation<{} "
+            "AND NOT EXISTS (SELECT 1 FROM scan_frontier gap NOT INDEXED WHERE gap.scan_id={} "
+            "AND gap.state IN ('denied','failed') AND (gap.relative_directory='' OR "
+            "substr(location.relative_path, 1, length(gap.relative_directory)+1)=gap.relative_directory || '/'))";
+        started = Clock::now();
+        CHECK(query(library, std::format(kOldUnseenCount, root->id, session->generation, session->id)) == 20'000);
+        const double old_subquery = milliseconds_per(Clock::now() - started, 1);
+        started = Clock::now();
+        auto finished = library.finish_scan(*session, false);
+        const double new_finish = milliseconds_per(Clock::now() - started, 1);
+        REQUIRE(finished.has_value());
+        CHECK(finished->marked_missing == 20'000);
+        MESSAGE(
+            std::format("finish_scan, 20k unseen of {} in {} directories: before {:.1f} ms (one of its two "
+                        "unseen passes), after {:.1f} ms (whole finish_scan)",
+                        kSamples, kDirectories, old_subquery, new_finish));
     }
 
 }  // TEST_SUITE("catalog")

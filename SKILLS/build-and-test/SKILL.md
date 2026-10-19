@@ -20,15 +20,23 @@ QT_QPA_PLATFORM=offscreen MSO_AUDIO_BACKEND=null build/debug/mso_ui_tests.exe   
 ```
 
 Presets: `release` = RelWithDebInfo with `-Werror` (use it before handing work over); `sanitize` =
-Debug with AddressSanitizer + UndefinedBehaviorSanitizer and `-Werror` (works on Windows and Linux);
-`ci` / `ci-sanitize` additionally require Qt and FFmpeg. All options are in `docs/BUILDING.md`.
+Debug with AddressSanitizer + UndefinedBehaviorSanitizer and `-Werror` (verified on Windows; on Linux
+its last CI run failed, see `docs/DEVELOPING.md`); `fuzz` = the libFuzzer targets (below);
+`ci` / `ci-debug` / `ci-sanitize` additionally require Qt and FFmpeg. All options are in
+`docs/BUILDING.md`. CTest puts the toolchain's `bin` on `PATH` itself, so `ctest` also works from
+PowerShell; sanitizer builds get `ASAN_SYMBOLIZER_PATH` automatically.
+
+```sh
+cmake --preset sanitize -B build/<you>-asan && cmake --build build/<you>-asan
+ctest --test-dir build/<you>-asan -j 6         # ASan/UBSan stop at the first finding with a symbolized stack
+```
 
 If the Qt UI is mid-edit and breaks the build, build the rest with
 `cmake --preset debug -DMSO_BUILD_GUI=OFF`.
 
 ## Linux
 
-See `docs/BUILDING.md`: LLVM 23 from apt.llvm.org (`.github/scripts/install-llvm.sh 23`), FFmpeg `-dev`
+Not the owner's focus now (Windows first); the CI job is parked. See `docs/BUILDING.md`: LLVM 23 from apt.llvm.org (`.github/scripts/install-llvm.sh 23`), FFmpeg `-dev`
 packages, and Qt built with libc++ (`.github/scripts/build-qt-libcxx.sh ~/qt-libcxx`; distribution Qt
 is built with libstdc++ and cannot link). Pass
 `-DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_PREFIX_PATH=~/qt-libcxx` to the preset.
@@ -37,9 +45,10 @@ is built with libstdc++ and cannot link). Pass
 
 - `mso_tests` (`build/<preset>/tests/`): every `tests/*.cpp` except `ui_*.cpp`, Qt-free.
 - `mso_ui_tests` (`build/<preset>/`): `tests/ui_*.cpp`, offscreen Qt.
-- Each file wraps its cases in `TEST_SUITE("<area>")`: `domain`, `catalog` (also `sqlite_tests.cpp`),
-  `search`, `media`, `import`, `audio`, `analysis`, `worker`, `app`, `export`, `cli`, `infra`
-  (the shared helpers and generated headers) and `ui`.
+- Each file wraps its cases in `TEST_SUITE("<area>")`: `domain`, `catalog`, `sqlite`, `search`, `media`,
+  `import`, `audio`, `analysis`, `worker`, `app`, `export`, `cli`, `infra` (the shared helpers and
+  generated headers) and `ui`. The number of CTest entries follows from that (suites plus three);
+  check it with `ctest -N` rather than relying on a number written down somewhere.
 - CTest gets one entry per suite found at configure time (labels `core`/`gui` plus the suite name), a
   catch-all per executable (`unlisted-suites`, `ui-unlisted-suites`) for cases outside those suites,
   and `include-graph` (label `lint`), which fails when a module includes a module it does not declare
@@ -60,6 +69,19 @@ Use these instead of per-file copies:
 - `test::ffmpeg_required()`: true under `MSO_REQUIRE_FFMPEG=1` (set by CTest in CI builds); a test that
   needs ffmpeg must then fail instead of skipping (use `doctest::skip()`/MESSAGE only otherwise).
 - Catalog fixtures: `synthetic_file`, `make_library`, `sample_id_named`.
+
+## Fuzzing (crash-proofing against damaged input)
+
+```sh
+cmake --preset fuzz -B build/<you>-fuzz && cmake --build build/<you>-fuzz --target fuzzers
+python tools/run_fuzzers.py --build-dir build/<you>-fuzz --seconds 60     # every target, as CI
+```
+
+Targets and seeds are in `tests/fuzz/` (see `docs/BUILDING.md`, "Fuzzing"). A finding saves its input in
+`<build>/fuzz-artifacts/<target>/`; replay it with `<build>/tests/fuzz/fuzz_<target>.exe <file>`. After
+the fix, copy the input into `tests/fuzz/corpus/<target>/` as `regression_<what>.<ext>` so every later
+run checks it. When you add code that reads files, pipes, query text or tokens, add a target (one
+`mso_add_fuzzer` line in `tests/fuzz/CMakeLists.txt` plus a seed directory).
 
 ## Running the app after a build
 

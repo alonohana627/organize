@@ -51,8 +51,8 @@ Type words to match names, folders, tags and notes. Add filters to narrow it dow
 | `kic*` | anything starting with "kic" |
 | `bpm:140..155`, `bpm:>=120`, `bpm:120` | a tempo range, a minimum tempo, or about 120 BPM |
 | `key:Am`, `key:F#minor`, `key:unknown` | a musical key, or samples without a detected key |
-| `tag:Drums/Kick`, `tag:Kick` | a tag and everything under it; a single name matches at any level |
-| `category:Bass`, `folder:"Packs/Goa"`, `collection:Favorites` | a category, folder or collection |
+| `tag:Drums/Kick`, `tag:Kick` | a tag and everything under it; a single name matches at any level, and a merged tag is still found by its old name |
+| `category:Bass`, `folder:"Packs/Goa"`, `collection:Favorites` | a category, folder or collection (`folder:/Drums` works too) |
 | `duration:<2s`, `size:>1MB` | one-shots under two seconds, files over a megabyte |
 | `rate:44.1k`, `channels:2`, `bits:24`, `format:flac` | technical details |
 | `rating:>=4`, `favorite:true`, `available:true` | your ratings and favorites; skip offline files |
@@ -87,6 +87,11 @@ library, Ctrl+Shift+N new library. You can change any of them in Preferences.
 - **Analysis in the background:** it runs as a separate, throttled process so the app stays smooth.
   You can pause or cancel it from the Jobs panel at any time.
 - **Offline, always:** the app never connects to the internet.
+- **Headphones unplugged?** If the audio device disappears, a notice with a **Retry** button appears
+  in the preview panel, and preview switches back on its own once a speaker is available. Pick another
+  output in the preview panel's **Output device** menu.
+- **Huge selections:** if you select a very long list and only part of it has loaded yet, rating,
+  favorite, delete and analyze ask you to wait a moment instead of acting on only part of it.
 - **Coming next:** reviewing duplicates side by side (the app already fingerprints every sample to
   find them), a waveform browser, and copying samples into a library.
 - **Command line:** there is also an `mso` tool for scripting and batch jobs; see

@@ -22,12 +22,21 @@
 #include "mso/media/detail/byte_cursor.hpp"
 #include "mso/media/detail/decoder_backends.hpp"
 #include "mso/media/detail/file_handle.hpp"
-#include "mso/media/detail/native_file_support.hpp"
 #include "mso/media/detail/probe_formats.hpp"
 #include "mso/media/detail/tag_mapping.hpp"
 #include "mso/media/detail/text_decoding.hpp"
 #include "mso/media/media.hpp"
+#include "mso/media/native_file.hpp"
 #include "test_support.hpp"
+
+#ifdef _WIN32
+#include <windows.h>
+// psapi.h needs windows.h first.
+#include <psapi.h>
+#else
+#include <unistd.h>
+#include <fstream>
+#endif
 
 namespace {
 
@@ -597,11 +606,64 @@ bool skip_without_ffmpeg_backend() {
 /// Renders `seconds` of a 440 Hz sine with `encoder_arguments`; false if ffmpeg failed.
 bool render_with_ffmpeg(const fs::path& output, std::string_view encoder_arguments, int sample_rate = 44100,
                         int channels = 2, double seconds = 1.0) {
-    const std::string command = "ffmpeg -hide_banner -loglevel error -y -f lavfi -i \"sine=frequency=440:sample_rate=" +
-                                std::to_string(sample_rate) + ":duration=" + std::to_string(seconds) + "\" -ac " +
-                                std::to_string(channels) + " " + std::string(encoder_arguments) + " \"" +
-                                mso::path_to_utf8(output) + "\"";
+    const std::string arguments =
+        "ffmpeg -hide_banner -loglevel error -y -f lavfi -i \"sine=frequency=440:sample_rate=" +
+        std::to_string(sample_rate) + ":duration=" + std::to_string(seconds) + "\" -ac " + std::to_string(channels) +
+        " " + std::string(encoder_arguments) + " \"";
+#ifdef _WIN32
+    // _wsystem keeps a non-ASCII output path intact (std::system reads UTF-8 in the ANSI code page).
+    const std::wstring command = mso::path_from_utf8(arguments).native() + output.native() + L"\"";
+    return _wsystem(command.c_str()) == 0 && fs::exists(output);
+#else
+    const std::string command = arguments + mso::path_to_utf8(output) + "\"";
     return std::system(command.c_str()) == 0 && fs::exists(output);
+#endif
+}
+
+}  // namespace
+
+namespace {
+
+/// Packs values least-significant bit first, the bit order of Vorbis header fields.
+class BitWriter {
+public:
+    /// Appends the low `count` bits of `value`.
+    BitWriter& bits(std::uint32_t value, int count) {
+        for (int bit = 0; bit < count; ++bit) {
+            if (used_ == 0) bytes_.push_back(0);
+            if ((value >> bit) & 1u) bytes_.back() = static_cast<std::uint8_t>(bytes_.back() | (1u << used_));
+            used_ = (used_ + 1) % 8;
+        }
+        return *this;
+    }
+    const Bytes& result() const { return bytes_; }
+
+private:
+    Bytes bytes_;
+    int used_ = 0;  ///< bits used in the last byte (0: start a new byte)
+};
+
+/// Memory the process has committed for itself (Windows private bytes, Linux data segment), or
+/// nullopt where it cannot be measured.
+std::optional<std::uint64_t> committed_bytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                 sizeof(counters)))
+        return std::nullopt;
+    return counters.PrivateUsage;
+#else
+    std::ifstream statm("/proc/self/statm");
+    std::uint64_t size = 0, resident = 0, shared = 0, text = 0, library = 0, data = 0;
+    if (!(statm >> size >> resident >> shared >> text >> library >> data)) return std::nullopt;
+    return data * static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+#endif
+}
+
+/// The leak check needs a memory measurement; elsewhere it is reported as skipped.
+bool memory_not_measurable() {
+    static const bool unmeasurable = !committed_bytes().has_value();
+    return unmeasurable;
 }
 
 }  // namespace
@@ -746,10 +808,10 @@ TEST_SUITE("media") {
         const fs::path file = deep / "long_path_sample.wav";
         REQUIRE(mso::path_to_utf8(file).size() > 300);
         std::error_code error;
-        fs::create_directories(detail::native_path(deep), error);
+        fs::create_directories(native_path(deep), error);
         REQUIRE_FALSE(error);
         {
-            auto handle_path = detail::native_path(file);
+            auto handle_path = native_path(file);
             const Bytes wav = small_wav(32);
             std::FILE* stream = nullptr;
 #ifdef _WIN32
@@ -768,7 +830,7 @@ TEST_SUITE("media") {
         REQUIRE(decoder.has_value());
         CHECK(read_all(**decoder).size() == 64);
         decoder->reset();
-        fs::remove_all(detail::native_path(directory.path() / std::string(48, 'a')), error);
+        fs::remove_all(native_path(directory.path() / std::string(48, 'a')), error);
     }
 
     // ---------------------------------------------------------------- WAV
@@ -1946,6 +2008,253 @@ TEST_SUITE("media") {
         REQUIRE(starved.has_value());
         CHECK(starved->partial);  // a read the budget refused is never reported as a complete probe
         CHECK(starved->bytes_read <= 2048);
+    }
+
+    // ---------------------------------------------------------------- second review round
+
+    TEST_CASE("A sparse Vorbis codebook that fails part-way leaks nothing, however often it is opened" *
+              doctest::skip(memory_not_measurable())) {
+        // patches/miniaudio/0001: a sparse codebook's code lengths live in temporary memory that
+        // vorbis_deinit never frees; failing on the first entry used to leak `entries` bytes (4 MiB
+        // here) on every open, so previewing such a file again and again grew the app without bound.
+        constexpr std::uint32_t kEntries = 1u << 22;  // the most libvorbis allows with one dimension
+        BitWriter setup;
+        setup.bits(0, 8);                                 // one codebook
+        setup.bits(0x42, 8).bits(0x43, 8).bits(0x56, 8);  // "BCV" sync pattern
+        setup.bits(1, 16).bits(kEntries, 24);             // dimensions, entries
+        setup.bits(0, 1).bits(1, 1);                      // not ordered, sparse
+        setup.bits(1, 1).bits(31, 5);                     // entry 0: length 32, invalid
+        ByteWriter setup_packet;
+        setup_packet.u8(5).text("vorbis").bytes(setup.result()).zeros(8);
+        ByteWriter comment_packet;
+        comment_packet.u8(3).text("vorbis").bytes(vorbis_comment_block({})).u8(1);
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("leaky_codebook.ogg");
+        write_bytes(file, ogg_stream({vorbis_identification(2, 44100), comment_packet.result(), setup_packet.result()},
+                                     9, 4410));
+
+        constexpr int kOpens = 200;  // a leak would be 800 MiB
+        const auto open_once = [&file] {
+            auto decoder = detail::open_vorbis_decoder(file, ProbeResult{});
+            REQUIRE_FALSE(decoder.has_value());
+            CHECK(decoder.error().code == ErrorCode::CorruptAudio);
+        };
+        open_once();  // first use: allocator and C runtime setup are not part of the measurement
+        const std::uint64_t before = committed_bytes().value_or(0);
+        for (int open = 0; open < kOpens; ++open)
+            open_once();
+        const std::uint64_t after = committed_bytes().value_or(0);
+        const std::uint64_t growth = after > before ? after - before : 0;
+        CAPTURE(growth);
+        // Generous: allocator caches (and AddressSanitizer's quarantine of freed blocks) may keep
+        // freed memory committed, but never the 800 MiB a leak would cost.
+        CHECK(growth < std::uint64_t{kOpens} * kEntries / 2);
+    }
+
+    TEST_CASE("A Vorbis comment header with an overflowing count or length fails cleanly in stb_vorbis") {
+        // patches/miniaudio/0001: setup_malloc() used to truncate sizeof(char*) * count to int, so
+        // 0x20000001 comments got an 8-byte list (heap overflow) and 0x10000000 a NULL list that
+        // vorbis_deinit() then walked. Each crafted header must now be refused without a crash
+        // (the sanitize preset turns any overrun or undefined shift into a failure).
+        const auto comment_packet = [](std::uint32_t vendor_length, std::uint32_t count, const Bytes& rest) {
+            ByteWriter packet;
+            packet.u8(3).text("vorbis").u32le(vendor_length);
+            if (vendor_length < 64) packet.fill(vendor_length, 'v');
+            packet.u32le(count).bytes(rest).u8(1);
+            return packet.result();
+        };
+        ByteWriter short_entry;
+        short_entry.u32le(5000).text("TITLE=cut short");  // claims 5000 bytes; the packet ends first
+        struct Hostile {
+            std::string_view name;
+            Bytes comments;
+        };
+        const Hostile cases[] = {
+            {"list size wraps to 8 bytes", comment_packet(4, 0x20000001u, {})},
+            {"list size turns negative", comment_packet(4, 0x10000000u, {})},
+            {"count above INT_MAX", comment_packet(4, 0x80000001u, {})},
+            {"vendor length above INT_MAX", comment_packet(0xFFFFFFF0u, 0, {})},
+            {"entry longer than its packet", comment_packet(4, 1, short_entry.result())},
+            // Fuzzer finds: lengths far beyond the file used to be allocated before any byte was read.
+            {"1.8 GB entry in a 200-byte file", comment_packet(4, 1, Bytes{0x00, 0x00, 0x75, 0x6C})},
+            {"16 million entries in a 200-byte file", comment_packet(4, 0x00FFFFFFu, {})},
+            {"packet ends inside the comment count", Bytes{3, 'v', 'o', 'r', 'b', 'i', 's', 0, 0, 0, 0, 0x01}},
+        };
+        ScratchDirectory directory("media");
+        for (const Hostile& hostile : cases) {
+            CAPTURE(hostile.name);
+            const fs::path file = directory.file("hostile.ogg");
+            write_bytes(file,
+                        ogg_stream({vorbis_identification(2, 44100), hostile.comments, Bytes(64, 0x05)}, 7, 4410));
+            auto decoder = detail::open_vorbis_decoder(file, ProbeResult{});
+            REQUIRE_FALSE(decoder.has_value());
+            CHECK(decoder.error().code == ErrorCode::CorruptAudio);
+            // Through the public entry points too (FFmpeg, when built in, gets the file next).
+            const auto probe = probe_file(file);
+            CHECK((probe.has_value() || probe.error().code != ErrorCode::Internal));
+            if (auto opened = open_decoder(file)) {
+                std::vector<float> buffer(4096);
+                const auto read = (*opened)->read(buffer);
+                CHECK((read.has_value() || read.error().code != ErrorCode::Internal));
+            }
+        }
+    }
+
+    TEST_CASE("probe_memory runs the same parsers over a buffer as probe_file over the file") {
+        ScratchDirectory directory("media");
+        const Bytes wav = small_wav(48);
+        const fs::path file = directory.file("tone.wav");
+        write_bytes(file, wav);
+        auto from_file = probe_file(file);
+        auto from_memory = probe_memory(wav, "tone.wav");
+        REQUIRE(from_file.has_value());
+        REQUIRE(from_memory.has_value());
+        CHECK(from_memory->format == from_file->format);
+        CHECK(from_memory->codec == from_file->codec);
+        CHECK(from_memory->frames == from_file->frames);
+        CHECK(from_memory->duration_us == from_file->duration_us);
+        CHECK(from_memory->bytes_read == from_file->bytes_read);
+
+        // The hint supplies the extension: junk before an MP3 frame is only scanned for an .mp3.
+        const Bytes junk_then_mp3 = concat({Bytes(100, 0x11), mp3_frames(4)});
+        auto as_mp3 = probe_memory(junk_then_mp3, "beat.mp3");
+        REQUIRE(as_mp3.has_value());
+        CHECK(as_mp3->format == "mp3");
+        CHECK(probe_memory(junk_then_mp3, "beat.bin").error().code == ErrorCode::UnsupportedCodec);
+
+        CHECK(probe_memory({}, "empty.wav").error().code == ErrorCode::CorruptAudio);
+        auto starved = probe_memory(wav, "tone.wav", ProbeLimits{20, std::chrono::milliseconds(2000)});
+        REQUIRE(starved.has_value());
+        CHECK(starved->partial);
+        CHECK(starved->bytes_read <= 20);
+    }
+
+    TEST_CASE("BoundedFileReader's read-ahead window returns the file's bytes and charges only what it hands out") {
+        ScratchDirectory directory("media");
+        Bytes content(3 * detail::BoundedFileReader::kReadAheadBytes + 123);
+        for (std::size_t index = 0; index < content.size(); ++index)
+            content[index] = static_cast<std::uint8_t>(index % 251);
+        const fs::path file = directory.file("pattern.bin");
+        write_bytes(file, content);
+        auto reader = detail::BoundedFileReader::open(file, ProbeLimits{1'000'000, std::chrono::milliseconds(5000)});
+        REQUIRE(reader.has_value());
+
+        std::mt19937 random(1234);
+        std::uint64_t charged = 0;
+        for (int read = 0; read < 400; ++read) {
+            // Mostly small header-sized reads, forwards and backwards, sometimes past the end.
+            const std::uint64_t offset = random() % (content.size() + 16);
+            const std::size_t length = read % 50 == 0 ? 20'000 : 1 + random() % 64;
+            CAPTURE(offset);
+            CAPTURE(length);
+            auto bytes = reader->read_available(offset, length);
+            REQUIRE(bytes.has_value());
+            const std::size_t expected =
+                offset < content.size() ? std::min<std::size_t>(length, content.size() - offset) : 0;
+            REQUIRE(bytes->size() == expected);
+            CHECK(std::equal(bytes->begin(), bytes->end(), content.begin() + static_cast<std::ptrdiff_t>(offset)));
+            charged += expected;
+        }
+        CHECK(reader->bytes_read() == charged);
+
+        std::vector<std::uint8_t> destination(100);
+        auto copied = reader->read_into(content.size() - 40, destination);
+        REQUIRE(copied.has_value());
+        CHECK(*copied == 40);
+        CHECK(std::equal(destination.begin(), destination.begin() + 40, content.end() - 40));
+
+        // The window never fetches more than the budget could hand out, and a tight budget still works.
+        auto tight = detail::BoundedFileReader::open(file, ProbeLimits{10, std::chrono::milliseconds(5000)});
+        REQUIRE(tight.has_value());
+        auto first = tight->read_exact(5, 10);
+        REQUIRE(first.has_value());
+        CHECK((*first)[0] == content[5]);
+        CHECK(tight->read_exact(15, 1).error().code == ErrorCode::ProbeLimit);
+    }
+
+    TEST_CASE("native_path judges a relative path by the absolute path it resolves to") {
+        ScratchDirectory directory("media");
+        // A relative path well under the classic limit whose absolute form is past it.
+        fs::path relative = "nested";
+        while (mso::path_to_utf8(fs::absolute(directory.path() / relative)).size() < 300)
+            relative /= "level-of-a-long-folder";
+        REQUIRE(mso::path_to_utf8(relative).size() < 240);
+        std::error_code error;
+        fs::create_directories(native_path(directory.path() / relative), error);
+        REQUIRE_FALSE(error);
+        write_bytes(directory.file("short.wav"), small_wav(16));
+        fs::rename(native_path(directory.file("short.wav")), native_path(directory.path() / relative / "tone.wav"));
+
+        const fs::path previous = fs::current_path();
+        fs::current_path(directory.path());
+        struct RestoreCurrentPath {
+            const fs::path& path;
+            ~RestoreCurrentPath() {
+                std::error_code ignored;
+                fs::current_path(path, ignored);
+            }
+        } restore{previous};
+        const fs::path file = relative / "tone.wav";
+#ifdef _WIN32
+        CHECK(native_path(file).native().starts_with(LR"(\\?\)"));
+#else
+        CHECK(native_path(file) == file);
+#endif
+        CHECK(native_path(fs::path("short.wav")) == fs::path("short.wav"));
+        auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        CHECK(probe->frames == 16);
+        fs::remove_all(native_path(directory.path() / "nested"), error);
+    }
+
+    TEST_CASE("MP3 gapless trim never ends inside the decoder delay, so the count matches what dr_mp3 delivers") {
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("short_padding.mp3");
+        // LAME states 100 frames of end padding, fewer than the 529-frame decoder delay.
+        write_bytes(file, concat({info_frame(10, 576, 100), mp3_frames(10)}));
+        auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        CHECK(probe->frames == 10 * 1152 - 576 - 529);
+        CHECK(probe->duration_exact);
+        auto decoder = open_decoder(file);
+        REQUIRE(decoder.has_value());
+        CHECK((*decoder)->frames_exact());
+        CHECK((*decoder)->total_frames() == probe->frames);
+        CHECK(static_cast<std::int64_t>(read_all(**decoder).size()) == *probe->frames * 2);
+    }
+
+    TEST_CASE("WavPack: custom rates and multichannel layouts from metadata sub-blocks, ID3v1-only tags") {
+        ScratchDirectory directory("media");
+        // 16-bit, initial block only (the channels continue in later blocks), rate index 15 (custom).
+        constexpr std::uint32_t kFlags = 0x1 | 0x800 | (15u << 23);
+        ByteWriter sub_blocks;
+        sub_blocks.u8(0x0D).u8(1).u8(6).u8(0x3F);                           // ID_CHANNEL_INFO: 6 channels, mask
+        sub_blocks.u8(0x27 | 0x40).u8(2).u8(0xA8).u8(0x93).u8(0x00).u8(0);  // ID_SAMPLE_RATE 37800, odd size
+        sub_blocks.u8(0x0A).u8(2).zeros(4);                                 // ID_WV_BITSTREAM: audio follows
+        ByteWriter block;
+        block.text("wvpk").u32le(24 + sub_blocks.size()).u16le(0x410).u8(0).u8(0).u32le(37800).u32le(0).u32le(37800);
+        block.u32le(kFlags).u32le(0).bytes(sub_blocks.result());
+        const fs::path file = directory.file("surround.wv");
+        write_bytes(file, concat({block.result(), id3v1_tag("Surround", "", 0, 0)}));
+        auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        CHECK(probe->codec == "wavpack");
+        CHECK(probe->sample_rate == 37800);
+        CHECK(probe->channels == 6);
+        CHECK(probe->frames == 37800);
+        CHECK(probe->duration_us == 1'000'000);
+        CHECK(probe->duration_exact);
+        CHECK(probe->tags.title == "Surround");
+    }
+
+    TEST_CASE("ASF linear PCM is named in the pcm_sNN vocabulary") {
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("pcm.wma");
+        write_bytes(file, asf_file({asf_stream_properties(0x0001)}));
+        auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        CHECK(probe->codec == "pcm_s16");
+        CHECK(probe->bit_depth == 16);
     }
 
 }  // TEST_SUITE("media")

@@ -22,8 +22,12 @@ Result<std::string> hash_file_bytes(const std::filesystem::path& file, std::int6
                                     const ProgressPhase& progress) {
     std::ifstream stream(file, std::ios::binary);
     if (!stream) {
+        // Only a definite "does not exist" is FILE_MISSING; when even the existence check fails
+        // (an unreachable share, an I/O error) the file may well be there, so the job is retried.
         std::error_code error;
-        if (!std::filesystem::exists(file, error)) return fail(ErrorCode::FileMissing, "file not found");
+        const bool exists = std::filesystem::exists(file, error);
+        if (error) return fail(ErrorCode::SourceOffline, "file cannot be reached", /*retryable=*/true);
+        if (!exists) return fail(ErrorCode::FileMissing, "file not found");
         return fail(ErrorCode::AccessDenied, "file cannot be opened for reading");
     }
 

@@ -18,9 +18,11 @@
 #include <print>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "mso/app/application.hpp"
+#include "mso/cli/value_parsing.hpp"
 
 namespace mso::cli {
 
@@ -34,6 +36,8 @@ inline constexpr int kExitInterrupted = 130;  ///< stopped by Ctrl+C (128 + SIGI
 /// Whether a command needs to write the library.
 enum class Access { Read, Write };
 
+/// Per-run state of the command line: global options, output streams, the Application started on
+/// first use, and the storage every subcommand's options are parsed into.
 class CommandContext {
 public:
     /// Output goes to `output`, diagnostics to `errors` (tests pass temporary files).
@@ -51,11 +55,25 @@ public:
 
     /// Starts the application on first use. Libraries are opened explicitly by path, the root
     /// monitor stays off, and the analysis supervisor runs only when the first caller asks for it.
-    Result<app::Application*> application(bool with_analysis = false);
+    [[nodiscard]] Result<app::Application*> application(bool with_analysis = false);
 
     /// Opens (or returns the already open) library at a directory. With Access::Write, a library
     /// another process holds (opened read-only) is refused with DB_BUSY.
-    Result<app::OpenLibraryInfo> open_library(const std::filesystem::path& directory, Access access = Access::Read);
+    [[nodiscard]] Result<app::OpenLibraryInfo> open_library(const std::filesystem::path& directory,
+                                                            Access access = Access::Read);
+
+    /// Storage for one subcommand's option values, owned by this context. CLI11 writes parsed
+    /// values through references into it during parse(), long after the register_* function that
+    /// bound them has returned, so binding targets must never be locals or objects whose last
+    /// owner is a callback capture (`mso collection --delete` once wrote into freed memory that
+    /// way). Every register_* function binds to members of one such object.
+    template <class Options>
+    Options& command_options() {
+        auto stored = std::make_shared<Options>();
+        Options& options = *stored;
+        option_storage_.push_back(std::move(stored));
+        return options;
+    }
 
     /// Prints one line of command output.
     template <class... Arguments>
@@ -78,9 +96,9 @@ public:
     }
 
     /// Prints an error in a consistent format and returns kExitFailure.
-    int report(const Error& error) const;
+    [[nodiscard]] int report(const Error& error) const;
     /// Prints a usage error and returns kExitUsage.
-    int usage(std::string_view message) const;
+    [[nodiscard]] int usage(std::string_view message) const;
 
     std::FILE* output() const { return output_; }
     std::FILE* errors() const { return errors_; }
@@ -91,27 +109,35 @@ private:
 
     std::FILE* output_;
     std::FILE* errors_;
+    /// Option values of every registered subcommand (see command_options()). Declared before
+    /// application_ so the Application, which may still be running work, is destroyed first.
+    std::vector<std::shared_ptr<void>> option_storage_;
     std::unique_ptr<app::Application> application_;
 };
 
-/// Each group registers its subcommands; the callback stores the exit code in `exit_code`.
+// Each group registers its subcommands on `root`; a subcommand's callback stores its exit code in
+// `exit_code`. Option values live in `context` (CommandContext::command_options), so `root`,
+// `context` and `exit_code` must outlive parsing.
+
+/// Registers create, info, add-root, import, undo, redo, history, backup, check and export.
 void register_library_commands(CLI::App& root, CommandContext& context, int& exit_code);
+/// Registers search, show, tags and collections.
 void register_search_commands(CLI::App& root, CommandContext& context, int& exit_code);
+/// Registers edit, tag and collection.
 void register_edit_commands(CLI::App& root, CommandContext& context, int& exit_code);
+/// Registers analyze.
 void register_analysis_commands(CLI::App& root, CommandContext& context, int& exit_code);
+/// Registers probe, play and capabilities.
 void register_media_commands(CLI::App& root, CommandContext& context, int& exit_code);
+/// Registers bench.
 void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_code);
 
 /// Runs one command line in-process. `arguments` excludes the program name and must be UTF-8.
 /// Never throws: parse errors exit kExitUsage, any escaping exception is reported and exits
 /// kExitFailure. Used by main() and by the CLI tests.
-int run(std::span<const std::string> arguments, std::FILE* output = stdout, std::FILE* errors = stderr);
+[[nodiscard]] int run(std::span<const std::string> arguments, std::FILE* output = stdout, std::FILE* errors = stderr);
 
 /// Process entry point: converts the native command line to UTF-8, then run().
-int run_main(int argc, char** argv);
-
-/// Parses a BPM value ("128", "92.5") into milli-BPM: full consumption, finite, 1..999 BPM.
-/// Locale-independent (std::from_chars).
-Result<std::int64_t> parse_bpm_milli(std::string_view text);
+[[nodiscard]] int run_main(int argc, char** argv);
 
 }  // namespace mso::cli

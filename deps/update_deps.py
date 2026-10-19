@@ -225,10 +225,15 @@ def update(dependency: dict) -> None:
     with tempfile.TemporaryDirectory(prefix="mso-deps-") as temporary:
         stage = stage_dependency(dependency, Path(temporary))
         digests = {destination: sha256_of(stage / "deps" / destination) for destination in produced}
+        # Each file is replaced atomically (copy next to it, then rename), so a reader never sees a
+        # half-written file. The set of files is not one transaction: an interrupted run can leave some
+        # files new and some old, which --check then reports until the run is repeated.
         for destination in produced:
             target = DEPS_DIR / destination
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(stage / "deps" / destination, target)
+            temporary_target = target.with_name(target.name + ".tmp")
+            shutil.copyfile(stage / "deps" / destination, temporary_target)
+            os.replace(temporary_target, target)
             print(f"  {destination}")
     for dropped in sorted(set(dependency.get("content_sha256", {})) - set(produced)):
         stale = DEPS_DIR / dropped
@@ -268,6 +273,8 @@ def check_entry(dependency: dict) -> list[str]:
     kind = dependency.get("kind")
     if kind == "git" and not COMMIT_PATTERN.match(dependency.get("commit", "")):
         problems.append(f"{name}: git dependency without a 40-hex 'commit' pin")
+    if kind == "git" and not dependency.get("ref"):
+        problems.append(f"{name}: git dependency without a 'ref' (the tag or branch the commit belongs to)")
     if kind == "archive" and not SHA256_PATTERN.match(dependency.get("sha256", "")):
         problems.append(f"{name}: archive without a 'sha256' pin")
     for item in dependency.get("downloads", []):

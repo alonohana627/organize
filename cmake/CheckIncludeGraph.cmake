@@ -3,8 +3,9 @@
 #
 # Every `#include "mso/<module>/..."` (or <...>) in include/mso/<m>/ and src/<m>/ must name module <m>
 # itself, a module <m> declares in CMakeLists.txt (directly or transitively), or the generated headers
-# (mso/generated/). Every directory under include/mso/ and src/ must be a declared module. tests/ and
-# tools/ are exempt. The graph file is written at configure time by mso_finalize_module_graph().
+# (mso/generated/). Headers under include/mso/<other>/detail/ are internal to <other>: no other module
+# may include them, even one it builds on. Every directory under include/mso/ and src/ must be a
+# declared module. tests/ and tools/ are exempt. The graph file is written at configure time by mso_finalize_module_graph().
 cmake_minimum_required(VERSION 3.28)
 
 if(NOT MSO_SOURCE_DIR OR NOT MSO_GRAPH_FILE)
@@ -41,6 +42,10 @@ foreach(module IN LISTS MSO_GRAPH_MODULES)
         string(STRIP "${line}" line)
         list(JOIN MSO_GRAPH_ALLOWED_${module} ", " allowed_text)
         list(APPEND violations "${relative}: ${line} (module '${module}' may include: ${allowed_text})")
+      elseif(NOT target STREQUAL module AND line MATCHES "[<\"]mso/${target}/detail/")
+        file(RELATIVE_PATH relative "${MSO_SOURCE_DIR}" "${file}")
+        string(STRIP "${line}" line)
+        list(APPEND violations "${relative}: ${line} (an internal header of module '${target}': include its public headers instead)")
       endif()
     endforeach()
   endforeach()
