@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <numeric>
 
 namespace mso::analysis {
@@ -23,7 +24,12 @@ constexpr double kMinimumChromaVariation = 0.3;   ///< std/mean of the 12 bins; 
 constexpr double kActivePitchClassFraction = 0.2;
 constexpr int kMinimumActivePitchClasses = 3;
 constexpr double kMinimumCorrelation = 0.5;
-constexpr double kMinimumMargin = 0.03;  ///< best minus second-best correlation
+/// Best correlation minus the best one of an unrelated key (neither the relative nor the parallel
+/// key of the winner). Relative keys share every pitch class and parallel keys their tonic, so on
+/// real music they routinely score within a few hundredths of the winner; rejecting those near
+/// ties would make most results "unknown". They lower the confidence instead.
+constexpr double kMinimumMargin = 0.03;
+/// Margin over the runner-up (any key) at which confidence is no longer reduced.
 constexpr double kMarginForFullConfidence = 0.15;
 
 /// Pearson correlation between the chroma and a key profile rotated so its tonic is `tonic`.
@@ -63,6 +69,22 @@ int active_pitch_classes(const std::array<double, 12>& chroma) {
     }));
 }
 
+/// Whether `candidate` is the relative key (same pitch set, other mode) or the parallel key (same
+/// tonic, other mode) of `key`.
+bool is_relative_or_parallel(const MusicalKey& key, const MusicalKey& candidate) {
+    if (candidate.mode == key.mode) return false;
+    if (candidate.pitch_class == key.pitch_class) return true;
+    // C major's relative minor is A minor (+9 semitones); A minor's relative major is C major (+3).
+    const int relative_offset = key.mode == KeyMode::Major ? 9 : 3;
+    return candidate.pitch_class == (key.pitch_class + relative_offset) % 12;
+}
+
+/// A key and how well the chroma correlates with its profile.
+struct KeyScore {
+    MusicalKey key;
+    double correlation = 0.0;
+};
+
 }  // namespace
 
 KeyResult estimate_key(const ChromaProfile& profile) {
@@ -72,30 +94,28 @@ KeyResult estimate_key(const ChromaProfile& profile) {
     if (chroma_variation(chroma) < kMinimumChromaVariation) return unknown;
     if (active_pitch_classes(chroma) < kMinimumActivePitchClasses) return unknown;
 
-    MusicalKey best_key;
-    double best_correlation = -2.0;
-    double second_correlation = -2.0;
+    std::array<KeyScore, 24> scores{};
+    std::size_t index = 0;
     for (const KeyMode mode : {KeyMode::Major, KeyMode::Minor}) {
         const auto& key_profile = mode == KeyMode::Major ? kMajorProfile : kMinorProfile;
-        for (int tonic = 0; tonic < 12; ++tonic) {
-            const double correlation = key_correlation(chroma, key_profile, tonic);
-            if (correlation > best_correlation) {
-                second_correlation = best_correlation;
-                best_correlation = correlation;
-                best_key = MusicalKey{tonic, mode};
-            } else if (correlation > second_correlation) {
-                second_correlation = correlation;
-            }
-        }
+        for (int tonic = 0; tonic < 12; ++tonic)
+            scores[index++] = KeyScore{MusicalKey{tonic, mode}, key_correlation(chroma, key_profile, tonic)};
     }
+    // Stable sort, so equal correlations keep the fixed major-then-minor, C-to-B order.
+    std::ranges::stable_sort(scores, std::ranges::greater{}, &KeyScore::correlation);
+    const KeyScore& best = scores[0];
+    const double runner_up = scores[1].correlation;
+    const auto unrelated = std::find_if(scores.begin() + 1, scores.end(), [&best](const KeyScore& score) {
+        return !is_relative_or_parallel(best.key, score.key);
+    });
+    const double best_unrelated = unrelated != scores.end() ? unrelated->correlation : -1.0;
 
-    const double margin = best_correlation - second_correlation;
-    if (best_correlation < kMinimumCorrelation || margin < kMinimumMargin) return unknown;
+    if (best.correlation < kMinimumCorrelation || best.correlation - best_unrelated < kMinimumMargin) return unknown;
 
     KeyResult result;
-    result.key = best_key;
-    result.confidence =
-        std::clamp(best_correlation, 0.0, 1.0) * std::clamp(margin / kMarginForFullConfidence, 0.0, 1.0);
+    result.key = best.key;
+    result.confidence = std::clamp(best.correlation, 0.0, 1.0) *
+                        std::clamp((best.correlation - runner_up) / kMarginForFullConfidence, 0.0, 1.0);
     return result;
 }
 

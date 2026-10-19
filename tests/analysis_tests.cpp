@@ -7,20 +7,18 @@
 #include <picosha2.h>
 
 #include <algorithm>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <iterator>
 #include <limits>
 #include <numbers>
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <utility>
@@ -30,13 +28,19 @@
 #include "mso/analysis/chroma_accumulator.hpp"
 #include "mso/analysis/decoded_stream_analysis.hpp"
 #include "mso/analysis/key_estimator.hpp"
+#include "mso/analysis/limits.hpp"
 #include "mso/analysis/loudness_meter.hpp"
+#include "mso/analysis/musical_features.hpp"
 #include "mso/analysis/onset_envelope.hpp"
 #include "mso/analysis/pcm_hasher.hpp"
 #include "mso/analysis/progress_reporter.hpp"
+#include "mso/analysis/spectrogram_stream.hpp"
+#include "mso/analysis/spectrum.hpp"
 #include "mso/analysis/tempo_estimator.hpp"
 #include "mso/analysis/waveform_builder.hpp"
+#include "mso/analysis/waveform_preview.hpp"
 #include "mso/domain/core.hpp"
+#include "test_support.hpp"
 
 using namespace mso;
 using namespace mso::analysis;
@@ -100,6 +104,42 @@ std::vector<float> drum_loop(double bpm, double seconds, int sample_rate, bool o
     return audio;
 }
 
+/// Adds a snare at `start`: a 190 Hz body (50 ms decay) under 60 ms of decaying noise.
+void add_snare(std::vector<float>& audio, std::size_t start, int sample_rate, float amplitude,
+               DeterministicNoise& noise) {
+    const std::size_t length = seconds_to_frames(0.18, sample_rate);
+    for (std::size_t offset = 0; offset < length && start + offset < audio.size(); ++offset) {
+        const double time = static_cast<double>(offset) / sample_rate;
+        const double body = std::sin(2.0 * std::numbers::pi * 190.0 * time) * std::exp(-time / 0.05);
+        audio[start + offset] +=
+            amplitude * static_cast<float>(0.5 * body + 0.7 * noise.next() * std::exp(-time / 0.06));
+    }
+}
+
+/// Drum groove shapes for the metrical-level fixtures.
+enum class Groove {
+    SixteenthHats,  ///< a kick on every beat and a hat on every 16th note
+    HalfTime,       ///< kick on beat 1, snare on beat 3 of each bar, a hat on every 8th note
+};
+
+/// Mono groove of `seconds` at `bpm`. Hats sit at 0.3 against a 0.8 kick, as in a typical mix.
+std::vector<float> groove(Groove shape, double bpm, double seconds, int sample_rate) {
+    std::vector<float> audio(seconds_to_frames(seconds, sample_rate), 0.0F);
+    DeterministicNoise noise(1234);
+    const double beat_seconds = 60.0 / bpm;
+    const int hats_per_beat = shape == Groove::SixteenthHats ? 4 : 2;
+    int beat = 0;
+    for (double beat_time = 0.05; beat_time < seconds; beat_time += beat_seconds, ++beat) {
+        const std::size_t start = seconds_to_frames(beat_time, sample_rate);
+        if (shape == Groove::SixteenthHats || beat % 4 == 0) add_kick(audio, start, sample_rate, 0.8F, noise);
+        if (shape == Groove::HalfTime && beat % 4 == 2) add_snare(audio, start, sample_rate, 0.7F, noise);
+        for (int hat = 0; hat < hats_per_beat; ++hat)
+            add_hat(audio, seconds_to_frames(beat_time + beat_seconds * hat / hats_per_beat, sample_rate), sample_rate,
+                    0.3F, noise);
+    }
+    return audio;
+}
+
 std::vector<float> white_noise(double seconds, int sample_rate, float amplitude) {
     DeterministicNoise noise(99);
     std::vector<float> audio(seconds_to_frames(seconds, sample_rate));
@@ -150,6 +190,15 @@ const std::vector<std::vector<double>> kCMajorCadence{
 const std::vector<std::vector<double>> kFSharpMinorCadence{
     {42, 54, 57, 61}, {47, 59, 62, 66}, {49, 61, 65, 68}, {42, 54, 57, 61}};
 
+/// `chords` moved by `semitones`.
+std::vector<std::vector<double>> transposed(const std::vector<std::vector<double>>& chords, int semitones) {
+    std::vector<std::vector<double>> moved = chords;
+    for (auto& chord : moved)
+        for (double& note : chord)
+            note += semitones;
+    return moved;
+}
+
 TempoResult tempo_of(const std::vector<float>& mono, int sample_rate) {
     OnsetEnvelopeBuilder envelope(sample_rate);
     envelope.add(mono);
@@ -187,10 +236,11 @@ public:
     int channels() const override { return channels_; }
     int sample_rate() const override { return sample_rate_; }
     std::optional<std::int64_t> total_frames() const override {
+        if (estimated_total_frames) return estimated_total_frames;
         if (!announce_length_) return std::nullopt;
         return static_cast<std::int64_t>(samples_.size() / static_cast<std::size_t>(channels_));
     }
-    bool frames_exact() const override { return announce_length_; }
+    bool frames_exact() const override { return announce_length_ && !estimated_total_frames; }
     Result<std::size_t> read(float* out, std::size_t frames) override {
         ++read_calls;
         if (on_read) on_read();
@@ -213,6 +263,8 @@ public:
     int read_calls = 0;
     std::function<void()> on_read;
     std::optional<int> fail_after_reads;
+    /// When set, announced as an inexact length estimate (like a VBR MP3 without a seek table).
+    std::optional<std::int64_t> estimated_total_frames;
 
 private:
     std::vector<float> samples_;
@@ -228,86 +280,14 @@ AnalysisRequest request_for(std::vector<Stage> stages) {
     return request;
 }
 
-// ---------------------------------------------------------------- WAV files for end-to-end tests
+// ---------------------------------------------------------------- files for end-to-end tests
 
-enum class WavEncoding { Int16, Int24, Float32 };
-
-/// Writes a canonical 44-byte-header RIFF/WAVE file. Samples are given as 16-bit integers so all
-/// three encodings carry exactly the same audio.
-void write_wav(const std::filesystem::path& file, const std::vector<std::int16_t>& interleaved, int channels,
-               int sample_rate, WavEncoding encoding) {
-    const std::uint16_t bits = encoding == WavEncoding::Int16 ? 16 : encoding == WavEncoding::Int24 ? 24 : 32;
-    const std::uint16_t format_tag = encoding == WavEncoding::Float32 ? 3 : 1;
-    const std::uint32_t bytes_per_sample = bits / 8U;
-    const auto data_size = static_cast<std::uint32_t>(interleaved.size() * bytes_per_sample);
-
-    std::vector<std::uint8_t> bytes;
-    const auto put = [&bytes](std::uint64_t value, int count) {
-        for (int byte = 0; byte < count; ++byte)
-            bytes.push_back(static_cast<std::uint8_t>(value >> (8 * byte)));
-    };
-    const auto put_tag = [&bytes](const char* tag) { bytes.insert(bytes.end(), tag, tag + 4); };
-    put_tag("RIFF");
-    put(36 + data_size, 4);
-    put_tag("WAVE");
-    put_tag("fmt ");
-    put(16, 4);
-    put(format_tag, 2);
-    put(static_cast<std::uint64_t>(channels), 2);
-    put(static_cast<std::uint64_t>(sample_rate), 4);
-    put(static_cast<std::uint64_t>(sample_rate) * static_cast<std::uint64_t>(channels) * bytes_per_sample, 4);
-    put(static_cast<std::uint64_t>(channels) * bytes_per_sample, 2);
-    put(bits, 2);
-    put_tag("data");
-    put(data_size, 4);
-    for (const std::int16_t sample : interleaved) {
-        switch (encoding) {
-            case WavEncoding::Int16:
-                put(static_cast<std::uint16_t>(sample), 2);
-                break;
-            case WavEncoding::Int24:
-                put(static_cast<std::uint32_t>(static_cast<std::int32_t>(sample) * 256), 3);
-                break;
-            case WavEncoding::Float32:
-                put(std::bit_cast<std::uint32_t>(static_cast<float>(sample) / 32768.0F), 4);
-                break;
-        }
-    }
-    std::ofstream stream(file, std::ios::binary);
-    stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-}
-
-std::vector<std::int16_t> to_int16(const std::vector<float>& samples) {
-    std::vector<std::int16_t> converted(samples.size());
-    for (std::size_t index = 0; index < samples.size(); ++index)
-        converted[index] = static_cast<std::int16_t>(std::lround(std::clamp(samples[index], -1.0F, 1.0F) * 32767.0F));
-    return converted;
-}
-
-/// A fresh directory under the system temp directory, removed with its contents on destruction.
-class TemporaryDirectory {
-public:
-    TemporaryDirectory()
-        : path_(std::filesystem::temp_directory_path() / ("mso-analysis-test-" + uuids::to_string(new_uuid()))) {
-        std::filesystem::create_directories(path_);
-    }
-    ~TemporaryDirectory() {
-        std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
-    }
-    TemporaryDirectory(const TemporaryDirectory&) = delete;
-    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
-
-    std::filesystem::path file(const std::string& name) const { return path_ / name; }
-
-private:
-    std::filesystem::path path_;
-};
+using test::ScratchDirectory;
+using test::WavEncoding;
+using test::WavFormat;
 
 std::string sha256_of_file(const std::filesystem::path& file) {
-    std::ifstream stream(file, std::ios::binary);
-    const std::string content((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
-    return picosha2::hash256_hex_string(content);
+    return picosha2::hash256_hex_string(test::read_file(file));
 }
 
 }  // namespace
@@ -802,12 +782,12 @@ TEST_SUITE("analysis") {
 
     TEST_CASE("analyze_file hashes the same audio equally across WAV sample formats") {
         constexpr int kSampleRate = 44100;
-        TemporaryDirectory directory;
+        ScratchDirectory directory("analysis");
         const std::vector<float> mono = chord_progression(kCMajorCadence, 2, kSampleRate);
         std::vector<float> stereo;
         for (const float sample : mono)
             stereo.insert(stereo.end(), {sample, 0.5F * sample});
-        const std::vector<std::int16_t> pcm = to_int16(stereo);
+        const std::vector<std::int16_t> pcm = test::to_int16(stereo);
 
         const AnalysisRequest base =
             request_for({Stage::PcmHash, Stage::ByteHash, Stage::Waveform, Stage::Loudness, Stage::Key});
@@ -817,7 +797,7 @@ TEST_SUITE("analysis") {
                                              std::pair{std::string("f32.wav"), WavEncoding::Float32}}) {
             CAPTURE(name);
             const auto file = directory.file(name);
-            write_wav(file, pcm, 2, kSampleRate, encoding);
+            test::write_wav(file, pcm, WavFormat{2, kSampleRate, encoding});
             AnalysisRequest request = base;
             request.file = file;
             std::vector<double> progress;
@@ -841,8 +821,8 @@ TEST_SUITE("analysis") {
         CHECK(reports[0].waveform->maximum == reports[2].waveform->maximum);
 
         // Same samples at another rate, or as mono, never collide.
-        write_wav(directory.file("s16-48k.wav"), pcm, 2, 48000, WavEncoding::Int16);
-        write_wav(directory.file("s16-mono.wav"), pcm, 1, kSampleRate, WavEncoding::Int16);
+        test::write_wav(directory.file("s16-48k.wav"), pcm, WavFormat{2, 48000, WavEncoding::Int16});
+        test::write_wav(directory.file("s16-mono.wav"), pcm, WavFormat{1, kSampleRate, WavEncoding::Int16});
         for (const char* name : {"s16-48k.wav", "s16-mono.wav"}) {
             AnalysisRequest request = request_for({Stage::PcmHash});
             request.file = directory.file(name);
@@ -854,9 +834,10 @@ TEST_SUITE("analysis") {
 
     TEST_CASE("analyze_file finds the tempo of a generated loop") {
         constexpr int kSampleRate = 44100;
-        TemporaryDirectory directory;
+        ScratchDirectory directory("analysis");
         const auto file = directory.file("loop-140.wav");
-        write_wav(file, to_int16(drum_loop(140.0, 12.0, kSampleRate, true)), 1, kSampleRate, WavEncoding::Int16);
+        test::write_wav(file, test::to_int16(drum_loop(140.0, 12.0, kSampleRate, true)),
+                        WavFormat{1, kSampleRate, WavEncoding::Int16});
         AnalysisRequest request = request_for({Stage::Tempo, Stage::Key});
         request.file = file;
         const auto report = analyze_file(request, {});
@@ -868,7 +849,7 @@ TEST_SUITE("analysis") {
     }
 
     TEST_CASE("analyze_file reports missing files, cancellation and changed input") {
-        TemporaryDirectory directory;
+        ScratchDirectory directory("analysis");
 
         AnalysisRequest missing = request_for({Stage::ByteHash});
         missing.file = directory.file("does-not-exist.wav");
@@ -905,6 +886,292 @@ TEST_SUITE("analysis") {
         REQUIRE(unchanged.has_value());
         CHECK(unchanged->hashes.byte_sha256 == sha256_of_file(file));
         CHECK(unchanged->evidence.unchanged());
+    }
+
+    // ---------------------------------------------------------------- FFT building blocks
+
+    TEST_CASE("magnitude spectrum reads a bin-centred full-scale sine as 1 and accepts split frames") {
+        constexpr std::size_t kSize = 1024;
+        MagnitudeSpectrum spectrum(kSize);
+        CHECK(spectrum.frame_size() == kSize);
+        CHECK(spectrum.bin_count() == kSize / 2 + 1);
+        CHECK(MagnitudeSpectrum(0).frame_size() == 2);
+
+        std::vector<float> sine(kSize);
+        for (std::size_t index = 0; index < kSize; ++index)
+            sine[index] =
+                static_cast<float>(std::sin(2.0 * std::numbers::pi * 64.0 * static_cast<double>(index) / kSize));
+        const auto whole_span = spectrum.compute(sine);
+        const std::vector<float> whole(whole_span.begin(), whole_span.end());
+        CHECK(whole[64] == doctest::Approx(1.0).epsilon(0.001));
+        CHECK(whole[63] == doctest::Approx(0.5).epsilon(0.01));  // Hann main lobe: half at one bin off
+        CHECK(whole[10] < 1e-4F);
+
+        // The same frame handed over in two pieces (a wrapped ring buffer) gives the same spectrum.
+        const std::span<const float> frame(sine);
+        const auto split = spectrum.compute(frame.first(300), frame.subspan(300));
+        CHECK(std::ranges::equal(whole, split));
+
+        // A constant reads its level at DC (scaled like every bin), and a short frame is zero-padded.
+        const std::vector<float> constant(kSize, 0.5F);
+        CHECK(spectrum.compute(constant)[0] == doctest::Approx(1.0).epsilon(0.001));
+        std::vector<float> padded(kSize, 0.0F);
+        std::copy_n(sine.begin(), 100, padded.begin());
+        const auto padded_span = spectrum.compute(padded);
+        const std::vector<float> padded_spectrum(padded_span.begin(), padded_span.end());
+        CHECK(std::ranges::equal(padded_spectrum, spectrum.compute(frame.first(100))));
+    }
+
+    TEST_CASE("autocorrelation matches the direct sum") {
+        DeterministicNoise noise(3);
+        std::vector<double> signal(257);
+        for (double& value : signal)
+            value = noise.next();
+        const std::vector<double> fast = autocorrelation(signal);
+        REQUIRE(fast.size() == signal.size());
+        for (const std::size_t lag : {0, 1, 2, 17, 100, 256}) {
+            CAPTURE(lag);
+            double direct = 0.0;
+            for (std::size_t index = 0; index + lag < signal.size(); ++index)
+                direct += signal[index] * signal[index + lag];
+            CHECK(std::abs(fast[lag] - direct) < 1e-9 * static_cast<double>(signal.size()));
+        }
+        CHECK(autocorrelation({}).empty());
+    }
+
+    TEST_CASE("nearest_power_of_two rounds in log terms and clamps") {
+        CHECK(nearest_power_of_two(1000.0, 1, 1 << 20) == 1024);
+        CHECK(nearest_power_of_two(1400.0, 1, 1 << 20) == 1024);
+        CHECK(nearest_power_of_two(1500.0, 1, 1 << 20) == 2048);
+        CHECK(nearest_power_of_two(10.0, 64, 4096) == 64);
+        CHECK(nearest_power_of_two(1e12, 64, 4096) == 4096);
+        CHECK(nearest_power_of_two(0.5, 64, 4096) == 64);
+        CHECK(nearest_power_of_two(std::numeric_limits<double>::quiet_NaN(), 64, 4096) == 64);
+    }
+
+    TEST_CASE("spectrogram stream emits every full frame once, independent of block size") {
+        constexpr std::size_t kFrame = 256;
+        constexpr std::size_t kHop = 64;
+        const std::vector<float> audio = white_noise(2000.0 / 22050.0, 22050, 0.5F);
+        REQUIRE(audio.size() == 2000);
+        const auto collect = [](SpectrogramStream& stream, std::span<const float> samples,
+                                std::vector<std::vector<float>>& frames) {
+            stream.add(samples, [&frames](std::span<const float> magnitudes) {
+                frames.emplace_back(magnitudes.begin(), magnitudes.end());
+            });
+        };
+
+        SpectrogramStream whole(kFrame, kHop);
+        std::vector<std::vector<float>> whole_frames;
+        collect(whole, audio, whole_frames);
+        CHECK(whole_frames.size() == 1 + (audio.size() - kFrame) / kHop);
+
+        SpectrogramStream pieces(kFrame, kHop);
+        std::vector<std::vector<float>> piece_frames;
+        const std::size_t block_sizes[] = {1, 7, 300, 64, 1000};
+        std::size_t offset = 0;
+        for (std::size_t block = 0; offset < audio.size(); ++block) {
+            const std::size_t size = std::min(block_sizes[block % std::size(block_sizes)], audio.size() - offset);
+            collect(pieces, std::span(audio).subspan(offset, size), piece_frames);
+            offset += size;
+        }
+        CHECK(piece_frames == whole_frames);
+
+        // Frame k is the spectrum of samples [k * hop, k * hop + frame).
+        MagnitudeSpectrum direct(kFrame);
+        for (const std::size_t frame : {std::size_t{0}, std::size_t{5}, whole_frames.size() - 1}) {
+            CAPTURE(frame);
+            const auto expected = direct.compute(std::span(audio).subspan(frame * kHop, kFrame));
+            CHECK(std::ranges::equal(whole_frames[frame], expected));
+        }
+
+        SpectrogramStream short_input(kFrame, kHop);
+        std::vector<std::vector<float>> none;
+        collect(short_input, std::span(audio).first(kFrame - 1), none);
+        CHECK(none.empty());
+    }
+
+    TEST_CASE("musical feature extractor downmixes, honours its window and runs only requested stages") {
+        constexpr int kSampleRate = 22050;
+        const std::vector<float> mono = drum_loop(120.0, 12.0, kSampleRate, false);
+        std::vector<float> stereo;
+        std::vector<float> opposed;
+        for (const float sample : mono) {
+            stereo.insert(stereo.end(), {sample, sample});
+            opposed.insert(opposed.end(), {sample, -sample});
+        }
+        const std::int64_t window = 10 * kSampleRate;
+
+        MusicalFeatureExtractor from_stereo(kSampleRate, 2, window, true, false);
+        from_stereo.add(stereo);
+        CHECK(from_stereo.saturated());
+        CHECK(from_stereo.frames_analyzed() == window);
+        CHECK_FALSE(from_stereo.key().has_value());
+        const auto stereo_tempo = from_stereo.tempo();
+        REQUIRE(stereo_tempo.has_value());
+        REQUIRE(stereo_tempo->milli_bpm.has_value());
+
+        MusicalFeatureExtractor from_mono(kSampleRate, 1, window, true, false);
+        from_mono.add(mono);
+        CHECK(from_mono.tempo()->milli_bpm == stereo_tempo->milli_bpm);  // (a + a) / 2 == a exactly
+
+        // Opposite polarity cancels to silence: equal 1/N downmix weights.
+        MusicalFeatureExtractor from_opposed(kSampleRate, 2, window, true, true);
+        from_opposed.add(opposed);
+        CHECK_FALSE(from_opposed.tempo()->milli_bpm.has_value());
+        CHECK_FALSE(from_opposed.key()->key.has_value());
+
+        MusicalFeatureExtractor key_only(kSampleRate, 1, window, false, true);
+        key_only.add(mono);
+        CHECK_FALSE(key_only.tempo().has_value());
+        CHECK(key_only.key().has_value());
+    }
+
+    // ---------------------------------------------------------------- tempo: metrical levels and rates
+
+    TEST_CASE("16th-note hats over a kick on every beat keep the kick tempo") {
+        struct Case {
+            double bpm;
+            int sample_rate;
+        };
+        for (const Case test_case :
+             {Case{85.0, 44100}, Case{90.0, 44100}, Case{95.0, 44100}, Case{90.0, 48000}, Case{90.0, 96000}}) {
+            CAPTURE(test_case.bpm);
+            CAPTURE(test_case.sample_rate);
+            const TempoResult result = tempo_of(
+                groove(Groove::SixteenthHats, test_case.bpm, 15.0, test_case.sample_rate), test_case.sample_rate);
+            REQUIRE(result.milli_bpm.has_value());
+            const double measured = static_cast<double>(*result.milli_bpm) / 1000.0;
+            MESSAGE("16th hats " << test_case.bpm << " BPM @" << test_case.sample_rate << " -> " << measured);
+            CHECK(std::abs(measured - test_case.bpm) / test_case.bpm < 0.01);
+        }
+    }
+
+    TEST_CASE("a half-time groove reads at its conventional tempo, not an octave off") {
+        // Kick on 1, snare on 3, 8th-note hats. At 85 BPM the hats must not double it to 170; at
+        // 140 BPM the prior keeps the conventional 140 rather than the 70 BPM backbeat.
+        for (const double bpm : {85.0, 140.0}) {
+            CAPTURE(bpm);
+            const TempoResult result = tempo_of(groove(Groove::HalfTime, bpm, 15.0, 44100), 44100);
+            REQUIRE(result.milli_bpm.has_value());
+            const double measured = static_cast<double>(*result.milli_bpm) / 1000.0;
+            MESSAGE("half-time " << bpm << " BPM -> " << measured);
+            CHECK(std::abs(measured - bpm) / bpm < 0.01);
+        }
+    }
+
+    TEST_CASE("tempo of kick loops is within 1% at 48 and 96 kHz") {
+        for (const int sample_rate : {48000, 96000}) {
+            for (const double bpm : {90.0, 128.0, 174.0}) {
+                CAPTURE(sample_rate);
+                CAPTURE(bpm);
+                const TempoResult result = tempo_of(drum_loop(bpm, 15.0, sample_rate, false), sample_rate);
+                REQUIRE(result.milli_bpm.has_value());
+                CHECK(std::abs(static_cast<double>(*result.milli_bpm) / 1000.0 - bpm) / bpm < 0.01);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- key: every key and other rates
+
+    TEST_CASE("key of all 24 major and minor keys") {
+        constexpr int kSampleRate = 22050;
+        for (int shift = -5; shift <= 6; ++shift) {
+            for (const KeyMode mode : {KeyMode::Major, KeyMode::Minor}) {
+                const bool major = mode == KeyMode::Major;
+                const MusicalKey expected{((major ? 0 : 9) + shift + 12) % 12, mode};
+                CAPTURE(format_key(expected));
+                const auto chords = transposed(major ? kCMajorCadence : kAMinorCadence, shift);
+                const KeyResult result = key_of(chord_progression(chords, 2, kSampleRate), kSampleRate);
+                REQUIRE(result.key.has_value());
+                CHECK(*result.key == expected);
+                CHECK(result.confidence > 0.0);
+            }
+        }
+    }
+
+    TEST_CASE("key estimation at 48 and 96 kHz") {
+        for (const int sample_rate : {48000, 96000}) {
+            CAPTURE(sample_rate);
+            const KeyResult a_minor = key_of(chord_progression(kAMinorCadence, 2, sample_rate), sample_rate);
+            REQUIRE(a_minor.key.has_value());
+            CHECK(*a_minor.key == MusicalKey{9, KeyMode::Minor});
+            const KeyResult c_major = key_of(chord_progression(kCMajorCadence, 2, sample_rate), sample_rate);
+            REQUIRE(c_major.key.has_value());
+            CHECK(*c_major.key == MusicalKey{0, KeyMode::Major});
+        }
+    }
+
+    // ---------------------------------------------------------------- waveform resolution, work, preview
+
+    TEST_CASE("an inexact length estimate never leaves the waveform too coarse") {
+        MemoryDecoder decoder(white_noise(10'000.0 / 8000.0, 8000, 0.5F), 1, 8000);
+        decoder.estimated_total_frames = 1'000'000;  // a 100x overestimate, as from a VBR header
+        ProgressReporter reporter{ProgressCallback{}};
+        AnalysisRequest request = request_for({Stage::Waveform});
+        request.waveform_bins = 100;
+        const auto report = analyze_decoded_stream(decoder, request, {}, ProgressPhase(reporter, 0, 1));
+        REQUIRE(report.has_value());
+        REQUIRE(report->waveform.has_value());
+        CHECK(report->waveform->minimum.size() > 50);
+        CHECK(report->waveform->minimum.size() <= 100);
+        CHECK(report->waveform->complete);
+        CHECK(report->waveform->total_frames == 10'000);
+    }
+
+    TEST_CASE("analyze_file counts one unit of work per decoded block and hashed chunk") {
+        constexpr int kSampleRate = 44100;
+        ScratchDirectory directory("analysis-work");
+        const auto file = directory.file("three-seconds.wav");
+        test::write_sine_wav(file, 3.0, 440.0, kSampleRate);
+        AnalysisRequest request = request_for({Stage::Loudness, Stage::ByteHash});
+        request.file = file;
+        WorkCounter work{0};
+        const auto report = analyze_file(request, {}, {}, &work);
+        REQUIRE(report.has_value());
+        const auto blocks = (report->frames_decoded + static_cast<std::int64_t>(kDecodeBlockFrames) - 1) /
+                            static_cast<std::int64_t>(kDecodeBlockFrames);
+        const auto chunks = (report->evidence.size_before + (1 << 20) - 1) / (1 << 20);
+        CHECK(work.load() == static_cast<std::uint64_t>(blocks + chunks));
+    }
+
+    TEST_CASE("the preview waveform equals the analysis waveform and fails cleanly") {
+        ScratchDirectory directory("analysis-preview");
+        const auto file = directory.file("preview.wav");
+        test::write_sine_wav(file, 2.0, 220.0, 44100);
+
+        std::vector<double> progress;
+        const auto preview =
+            compute_waveform_overview(file, 300, {}, [&progress](double fraction) { progress.push_back(fraction); });
+        REQUIRE_MESSAGE(preview.has_value(), preview.error().message());
+        AnalysisRequest request = request_for({Stage::Waveform});
+        request.file = file;
+        request.waveform_bins = 300;
+        const auto analyzed = analyze_file(request, {});
+        REQUIRE(analyzed.has_value());
+        CHECK(preview->minimum == analyzed->waveform->minimum);
+        CHECK(preview->maximum == analyzed->waveform->maximum);
+        CHECK(preview->rms == analyzed->waveform->rms);
+        CHECK(preview->complete);
+        REQUIRE_FALSE(progress.empty());
+        CHECK(progress.back() == 1.0);
+
+        CHECK(error_code(compute_waveform_overview(file, 0, {})) == ErrorCode::InvalidArgument);
+        CHECK(error_code(compute_waveform_overview(file, kMaximumWaveformBins + 1, {})) == ErrorCode::InvalidArgument);
+        CHECK(error_code(compute_waveform_overview(directory.file("missing.wav"), 100, {})) == ErrorCode::FileMissing);
+        std::stop_source stop;
+        stop.request_stop();
+        CHECK(error_code(compute_waveform_overview(file, 100, stop.get_token())) == ErrorCode::Cancelled);
+        const auto throwing =
+            compute_waveform_overview(file, 100, {}, [](double) { throw std::runtime_error("callback failure"); });
+        CHECK(error_code(throwing) == ErrorCode::Internal);
+    }
+
+    TEST_CASE("analyze_file refuses a directory") {
+        ScratchDirectory directory("analysis-directory");
+        AnalysisRequest request = request_for({Stage::ByteHash});
+        request.file = directory.path();
+        CHECK(error_code(analyze_file(request, {})) == ErrorCode::InvalidArgument);
     }
 
 }  // TEST_SUITE

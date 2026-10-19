@@ -1,15 +1,17 @@
 /// @file
-/// Progress throttling.
+/// Progress throttling and work counting.
 #include "mso/analysis/progress_reporter.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <utility>
 
 namespace mso::analysis {
 
-ProgressReporter::ProgressReporter(ProgressCallback callback, std::chrono::milliseconds minimum_interval)
-    : callback_(std::move(callback)), minimum_interval_(minimum_interval) {}
+ProgressReporter::ProgressReporter(ProgressCallback callback, std::chrono::milliseconds minimum_interval,
+                                   WorkCounter* work_counter)
+    : callback_(std::move(callback)), minimum_interval_(minimum_interval), work_counter_(work_counter) {}
 
 void ProgressReporter::report(double fraction) {
     if (!callback_ || finished_ || !std::isfinite(fraction)) return;
@@ -27,6 +29,10 @@ void ProgressReporter::finish() {
     if (!callback_ || finished_) return;
     finished_ = true;
     callback_(1.0);
+}
+
+void ProgressReporter::record_work() noexcept {
+    if (work_counter_ != nullptr) work_counter_->fetch_add(1, std::memory_order_relaxed);
 }
 
 void ProgressPhase::report(double phase_fraction) const {

@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <format>
 
-#include "mso/media/decoder_backends.hpp"
+#include "mso/media/detail/decoder_backends.hpp"
 #include "mso/media/media.hpp"
 
 namespace mso::media {
@@ -13,8 +13,30 @@ Result<std::unique_ptr<Decoder>> open_decoder(const std::filesystem::path& file)
     if (!probe) return std::unexpected(probe.error());
     if (probe->codec.empty()) return fail(ErrorCode::UnsupportedCodec, "could not identify the audio codec");
 
-    if (detail::miniaudio_can_decode(*probe)) return detail::open_miniaudio_decoder(file, *probe);
-    if (probe->format == "ogg" && probe->codec == "vorbis") return detail::open_vorbis_decoder(file, *probe);
+    if (detail::miniaudio_can_decode(*probe)) {
+        auto decoder = detail::open_miniaudio_decoder(file, *probe);
+#ifdef MSO_HAVE_FFMPEG
+        // dr_wav refuses a few valid variants (AIFF-C in24/in32, unusual fmt layouts): let FFmpeg try
+        // before reporting the file as damaged.
+        if (!decoder && decoder.error().code == ErrorCode::CorruptAudio) {
+            if (auto fallback = detail::open_ffmpeg_decoder(file, *probe)) return fallback;
+        }
+#endif
+        return decoder;
+    }
+    if (probe->format == "ogg" && probe->codec == "vorbis") {
+        // stb_vorbis first: FFmpeg's Vorbis decoder drops the first 128 frames of every stream
+        // (measured: 43972 of 44100 encoded frames), which cuts the attack of one-shot samples.
+        auto decoder = detail::open_vorbis_decoder(file, *probe);
+#ifdef MSO_HAVE_FFMPEG
+        // Files stb_vorbis refuses (over 2 GiB, or streams it cannot parse) still play through FFmpeg.
+        if (!decoder &&
+            (decoder.error().code == ErrorCode::CorruptAudio || decoder.error().code == ErrorCode::UnsupportedCodec)) {
+            if (auto fallback = detail::open_ffmpeg_decoder(file, *probe)) return fallback;
+        }
+#endif
+        return decoder;
+    }
 #ifdef MSO_HAVE_FFMPEG
     return detail::open_ffmpeg_decoder(file, *probe);
 #else

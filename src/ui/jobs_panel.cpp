@@ -92,13 +92,7 @@ JobsPanel::JobsPanel(QWidget* parent) : QWidget(parent) {
         for (int index = tree_->topLevelItemCount() - 1; index >= 0; --index) {
             QTreeWidgetItem* item = tree_->topLevelItem(index);
             if (!is_finished_state(item->data(TaskColumn, StateRole).toString())) continue;
-            const int kind = item->data(TaskColumn, KindRole).toInt();
-            const auto number = item->data(TaskColumn, OperationRole).toULongLong();
-            if (kind == ImportTask) imports_.erase(number);
-            if (kind == LocalTask) {
-                local_tasks_.erase(number);
-                local_cancellers_.erase(number);
-            }
+            forget(item);
             delete item;
         }
         update_buttons();
@@ -184,6 +178,7 @@ void JobsPanel::finish_operation(const app::OperationFinishedEvent& event) {
         summary = tr("Failed: %1").arg(DisplayFormat::error(*event.error));
     item->setText(StatusColumn, summary);
     item->setToolTip(StatusColumn, summary);
+    prune_finished_rows();
     update_buttons();
 }
 
@@ -192,14 +187,9 @@ void JobsPanel::update_analysis(const app::AnalysisProgressEvent& event, const Q
     std::set<std::int64_t> present;
     for (const auto& run : event.runs) {
         present.insert(run.id);
-        QTreeWidgetItem* item = nullptr;
-        for (int index = 0; index < tree_->topLevelItemCount() && !item; ++index) {
-            QTreeWidgetItem* candidate = tree_->topLevelItem(index);
-            if (candidate->data(TaskColumn, KindRole).toInt() == AnalysisTask &&
-                candidate->data(TaskColumn, LibraryRole).toString() == library_text &&
-                candidate->data(TaskColumn, RunRole).toLongLong() == run.id)
-                item = candidate;
-        }
+        const RunKey key{event.library, run.id};
+        if (dismissed_runs_.contains(key)) continue;  // cleared by the user: do not bring it back
+        QTreeWidgetItem*& item = analysis_runs_[key];
         if (!item) {
             item =
                 make_task_item(tr("Analysis “%1” in %2").arg(DisplayFormat::from_utf8(run.profile_name), library_name));
@@ -217,12 +207,59 @@ void JobsPanel::update_analysis(const app::AnalysisProgressEvent& event, const Q
                                              DisplayFormat::count(run.failed), DisplayFormat::count(run.skipped),
                                              DisplayFormat::count(run.queued), DisplayFormat::count(run.running)));
     }
-    worker_status_[library_name] = DisplayFormat::from_utf8(event.worker_status);
+    // Runs the Application no longer reports have ended; dismissals of such runs can be forgotten.
+    for (auto& [key, item] : analysis_runs_) {
+        if (key.first != event.library || present.contains(key.second)) continue;
+        if (!is_finished_state(item->data(TaskColumn, StateRole).toString())) {
+            item->setData(TaskColumn, StateRole, QStringLiteral("finished"));
+            item->setText(StatusColumn, tr("Finished"));
+        }
+    }
+    std::erase_if(dismissed_runs_, [&event, &present](const RunKey& key) {
+        return key.first == event.library && !present.contains(key.second);
+    });
+
+    worker_status_[event.library] = {library_name, DisplayFormat::from_utf8(event.worker_status)};
     QStringList lines;
     for (const auto& [library, status] : worker_status_)
-        if (!status.isEmpty()) lines << tr("%1: %2").arg(library, status);
+        if (!status.second.isEmpty()) lines << tr("%1: %2").arg(status.first, status.second);
     worker_label_->setText(lines.join(QLatin1Char('\n')));
+    prune_finished_rows();
     update_buttons();
+}
+
+void JobsPanel::prune_finished_rows() {
+    int finished = 0;
+    for (int index = 0; index < tree_->topLevelItemCount(); ++index)
+        if (is_finished_state(tree_->topLevelItem(index)->data(TaskColumn, StateRole).toString())) ++finished;
+    // The oldest finished rows go first; running jobs are never removed.
+    for (int index = 0; index < tree_->topLevelItemCount() && finished > kMaxFinishedRows;) {
+        QTreeWidgetItem* item = tree_->topLevelItem(index);
+        if (!is_finished_state(item->data(TaskColumn, StateRole).toString())) {
+            ++index;
+            continue;
+        }
+        forget(item);
+        delete item;
+        --finished;
+    }
+}
+
+void JobsPanel::forget(QTreeWidgetItem* item) {
+    const int kind = item->data(TaskColumn, KindRole).toInt();
+    const auto number = item->data(TaskColumn, OperationRole).toULongLong();
+    if (kind == ImportTask) imports_.erase(number);
+    if (kind == LocalTask) {
+        local_tasks_.erase(number);
+        local_cancellers_.erase(number);
+    }
+    if (kind == AnalysisTask) {
+        if (const auto library = DisplayFormat::to_uuid(item->data(TaskColumn, LibraryRole).toString())) {
+            const RunKey key{*library, item->data(TaskColumn, RunRole).toLongLong()};
+            analysis_runs_.erase(key);
+            dismissed_runs_.insert(key);
+        }
+    }
 }
 
 std::uint64_t JobsPanel::start_local_task(const QString& description, std::function<void()> cancel) {
@@ -244,7 +281,12 @@ void JobsPanel::finish_local_task(std::uint64_t task, const QString& summary, bo
     found->second->setText(StatusColumn, succeeded ? tr("Done. %1").arg(summary) : tr("Failed: %1").arg(summary));
     found->second->setToolTip(StatusColumn, summary);
     local_cancellers_.erase(task);
+    prune_finished_rows();
     update_buttons();
+}
+
+int JobsPanel::row_count() const {
+    return tree_->topLevelItemCount();
 }
 
 void JobsPanel::set_analysis_paused(bool paused) {

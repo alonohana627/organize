@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <format>
 #include <random>
+#include <utility>
 
 namespace mso {
 
@@ -27,19 +28,63 @@ std::int64_t now_unix_ms() noexcept {
 
 // ---------------------------------------------------------------- text
 
-std::string fold_key(std::string_view utf8) {
+namespace {
+
+/// Applies a utf8proc normalization to well-formed UTF-8; returns the input unchanged if utf8proc
+/// rejects it (it cannot for valid input, but the key must stay deterministic regardless).
+std::string map_valid_utf8(std::string_view utf8, utf8proc_option_t options) {
+    if (utf8.empty()) return {};
     utf8proc_uint8_t* mapped = nullptr;
-    const auto options = static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_COMPAT |
-                                                        UTF8PROC_CASEFOLD | UTF8PROC_IGNORE);
     const utf8proc_ssize_t length = utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(utf8.data()),
                                                  static_cast<utf8proc_ssize_t>(utf8.size()), &mapped, options);
-    std::string normalized;
-    if (length >= 0 && mapped) {
-        normalized.assign(reinterpret_cast<const char*>(mapped), static_cast<std::size_t>(length));
-    } else {
-        normalized.assign(utf8);  // malformed input: keep bytes so the key is still deterministic
-    }
+    std::string result = (length >= 0 && mapped)
+                             ? std::string(reinterpret_cast<const char*>(mapped), static_cast<std::size_t>(length))
+                             : std::string(utf8);
     std::free(mapped);
+    return result;
+}
+
+/// Normalizes every maximal well-formed run of `utf8` and copies malformed bytes verbatim between
+/// them, so a stray invalid byte never disables folding of the rest of the text ("KICK\xFF" and
+/// "kick\xFF" fold alike) while distinct invalid bytes stay distinct.
+std::string map_utf8_runs(std::string_view utf8, utf8proc_option_t options) {
+    const auto* bytes = reinterpret_cast<const utf8proc_uint8_t*>(utf8.data());
+    const auto size = static_cast<utf8proc_ssize_t>(utf8.size());
+    std::string result;
+    result.reserve(utf8.size());
+    utf8proc_ssize_t run_start = 0;
+    utf8proc_ssize_t offset = 0;
+    while (offset < size) {
+        utf8proc_int32_t code_point = 0;
+        const utf8proc_ssize_t consumed = utf8proc_iterate(bytes + offset, size - offset, &code_point);
+        if (consumed > 0) {
+            offset += consumed;
+            continue;
+        }
+        result += map_valid_utf8(
+            utf8.substr(static_cast<std::size_t>(run_start), static_cast<std::size_t>(offset - run_start)), options);
+        result.push_back(static_cast<char>(bytes[offset]));
+        run_start = ++offset;
+    }
+    result += map_valid_utf8(utf8.substr(static_cast<std::size_t>(run_start)), options);
+    return result;
+}
+
+/// Separator conversion of `path_key`: '\' is a path separator only on Windows.
+constexpr utf8proc_int32_t native_separator_to_slash(utf8proc_int32_t code_point) noexcept {
+#ifdef _WIN32
+    return code_point == U'\\' ? U'/' : code_point;
+#else
+    return code_point;
+#endif
+}
+
+}  // namespace
+
+std::string fold_key(std::string_view utf8) {
+    const auto options = static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_COMPAT |
+                                                        UTF8PROC_CASEFOLD | UTF8PROC_IGNORE);
+    const std::string normalized = map_utf8_runs(utf8, options);
 
     // Collapse whitespace runs (NFKC already mapped exotic spaces to U+0020) and trim.
     std::string key;
@@ -59,18 +104,18 @@ std::string fold_key(std::string_view utf8) {
     return key;
 }
 
-std::string fold_path_key(std::string_view relative_path_utf8) {
+std::string path_key(std::string_view relative_path, bool case_sensitive) {
+    if (case_sensitive) {
+        std::string key(relative_path);
+#ifdef _WIN32
+        std::ranges::replace(key, '\\', '/');
+#endif
+        return key;
+    }
     // NFC, then simple (1:1) lowercase mapping per code point: like NTFS's case-insensitive
     // comparison, and unlike full case folding, it never merges distinct names such as "ﬁ"/"fi".
-    utf8proc_uint8_t* composed = nullptr;
-    const utf8proc_ssize_t length = utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(relative_path_utf8.data()),
-                                                 static_cast<utf8proc_ssize_t>(relative_path_utf8.size()), &composed,
-                                                 static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
-    const std::string normalized = (length >= 0 && composed) ? std::string(reinterpret_cast<const char*>(composed),
-                                                                           static_cast<std::size_t>(length))
-                                                             : std::string(relative_path_utf8);
-    std::free(composed);
-
+    const std::string normalized =
+        map_utf8_runs(relative_path, static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
     std::string key;
     key.reserve(normalized.size());
     const auto* bytes = reinterpret_cast<const utf8proc_uint8_t*>(normalized.data());
@@ -84,12 +129,15 @@ std::string fold_path_key(std::string_view relative_path_utf8) {
             continue;
         }
         offset += consumed;
-        if (code_point == U'\\') code_point = U'/';
         utf8proc_uint8_t encoded[4];
-        const auto written = utf8proc_encode_char(utf8proc_tolower(code_point), encoded);
+        const auto written = utf8proc_encode_char(utf8proc_tolower(native_separator_to_slash(code_point)), encoded);
         key.append(reinterpret_cast<const char*>(encoded), static_cast<std::size_t>(written));
     }
     return key;
+}
+
+std::string fold_path_key(std::string_view relative_path_utf8) {
+    return path_key(relative_path_utf8, false);
 }
 
 bool is_valid_utf8(std::string_view text) noexcept {
@@ -117,6 +165,34 @@ std::size_t count_code_points(std::string_view utf8) noexcept {
     return count;
 }
 
+bool has_letter_or_digit(std::string_view utf8) noexcept {
+    const auto* bytes = reinterpret_cast<const utf8proc_uint8_t*>(utf8.data());
+    const auto size = static_cast<utf8proc_ssize_t>(utf8.size());
+    for (utf8proc_ssize_t offset = 0; offset < size;) {
+        utf8proc_int32_t code_point = 0;
+        const utf8proc_ssize_t consumed = utf8proc_iterate(bytes + offset, size - offset, &code_point);
+        if (consumed <= 0) {
+            ++offset;
+            continue;
+        }
+        offset += consumed;
+        switch (utf8proc_category(code_point)) {
+            case UTF8PROC_CATEGORY_LU:
+            case UTF8PROC_CATEGORY_LL:
+            case UTF8PROC_CATEGORY_LT:
+            case UTF8PROC_CATEGORY_LM:
+            case UTF8PROC_CATEGORY_LO:
+            case UTF8PROC_CATEGORY_ND:
+            case UTF8PROC_CATEGORY_NL:
+            case UTF8PROC_CATEGORY_NO:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 std::string path_to_utf8(const std::filesystem::path& path) {
     const auto text = path.generic_u8string();
     return std::string(reinterpret_cast<const char*>(text.data()), text.size());
@@ -126,18 +202,65 @@ std::filesystem::path path_from_utf8(std::string_view utf8) {
     return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()));
 }
 
+namespace {
+
+#ifdef _WIN32
+constexpr std::string_view kPathSeparators = "/\\";
+
+/// True for Win32 device names, which open a device in every directory: CON, PRN, AUX, NUL,
+/// CONIN$, CONOUT$, COM0-9 and LPT0-9 (also with the superscript digits 1-3), with any extension
+/// and trailing spaces ("nul.wav", "COM1 .txt").
+bool is_reserved_windows_name(std::string_view segment) noexcept {
+    std::string_view base = segment.substr(0, segment.find('.'));
+    while (!base.empty() && base.back() == ' ')
+        base.remove_suffix(1);
+    if (base.size() < 3 || base.size() > 7) return false;
+    std::string lowered(base);
+    for (char& character : lowered)
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + ('a' - 'A'));
+    if (lowered == "con" || lowered == "prn" || lowered == "aux" || lowered == "nul" || lowered == "conin$" ||
+        lowered == "conout$")
+        return true;
+    if (!lowered.starts_with("com") && !lowered.starts_with("lpt")) return false;
+    const std::string_view digit = std::string_view(lowered).substr(3);
+    return (digit.size() == 1 && digit[0] >= '0' && digit[0] <= '9') || digit == "\u00b9" || digit == "\u00b2" ||
+           digit == "\u00b3";
+}
+
+/// True for a segment Win32 would reinterpret or reject: an alternate data stream (':'), a
+/// trailing dot or space (Win32 strips them, so "a." aliases "a"), a reserved device name, a
+/// control character or one of <>"|?*.
+bool is_unsafe_windows_segment(std::string_view segment) noexcept {
+    if (segment.back() == '.' || segment.back() == ' ') return true;
+    for (const char character : segment) {
+        if (static_cast<unsigned char>(character) < 0x20) return true;
+        if (std::string_view(":<>\"|?*").find(character) != std::string_view::npos) return true;
+    }
+    return is_reserved_windows_name(segment);
+}
+#else
+constexpr std::string_view kPathSeparators = "/";
+#endif
+
+}  // namespace
+
 bool is_safe_relative_path(std::string_view relative) noexcept {
     constexpr std::size_t kMaxWindowsPathUtf16 = 32767;
     if (relative.empty() || relative.size() > kMaxWindowsPathUtf16 * 3) return false;
     if (relative.find('\0') != std::string_view::npos) return false;
-    if (relative.front() == '/' || relative.front() == '\\') return false;
-    if (relative.size() >= 2 && relative[1] == ':') return false;  // drive letter
+    if (kPathSeparators.find(relative.front()) != std::string_view::npos) return false;
+    // A drive prefix is rejected on every platform so a catalog never stores a path that Windows
+    // would resolve against a drive instead of the root.
+    if (relative.size() >= 2 && relative[1] == ':') return false;
     std::size_t segment_start = 0;
     while (segment_start <= relative.size()) {
-        auto segment_end = relative.find_first_of("/\\", segment_start);
+        auto segment_end = relative.find_first_of(kPathSeparators, segment_start);
         if (segment_end == std::string_view::npos) segment_end = relative.size();
         const auto segment = relative.substr(segment_start, segment_end - segment_start);
         if (segment.empty() || segment == "." || segment == "..") return false;
+#ifdef _WIN32
+        if (is_unsafe_windows_segment(segment)) return false;
+#endif
         segment_start = segment_end + 1;
     }
     return true;
@@ -190,6 +313,11 @@ std::string format_key(const MusicalKey& key) {
 
 std::optional<MusicalKey> parse_key(std::string_view text) {
     std::string compact = to_lower_ascii(trim(text));
+    // Unicode accidentals: U+266F MUSIC SHARP SIGN and U+266D MUSIC FLAT SIGN.
+    constexpr std::pair<std::string_view, std::string_view> kAccidentals[] = {{"\u266f", "#"}, {"\u266d", "b"}};
+    for (const auto& [symbol, ascii] : kAccidentals)
+        for (auto found = compact.find(symbol); found != std::string::npos; found = compact.find(symbol, found))
+            compact.replace(found, symbol.size(), ascii);
     std::erase_if(compact, [](char character) { return character == ' ' || character == '_' || character == '-'; });
     if (compact.empty() || compact[0] < 'a' || compact[0] > 'g') return std::nullopt;
 

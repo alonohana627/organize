@@ -5,6 +5,7 @@
 #include <QHeaderView>
 #include <QKeySequenceEdit>
 #include <QLabel>
+#include <QLocale>
 #include <QPushButton>
 #include <QStringList>
 #include <QTabWidget>
@@ -103,7 +104,7 @@ void PreferencesDialog::check_conflicts() {
             conflicting.insert(id);
             labels << ShortcutCatalog::label(id);
         }
-        descriptions << labels.join(tr(" and "));
+        descriptions << QLocale().createSeparatedList(labels);  // "A and B", localized
     }
     const auto& definitions = ShortcutCatalog::definitions();
     for (std::size_t row = 0; row < definitions.size(); ++row) {

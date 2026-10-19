@@ -1,28 +1,62 @@
 #include "mso/ui/drag_path_resolver.hpp"
 
+#include <algorithm>
+
 #include "mso/ui/application_session.hpp"
 
 namespace mso::ui {
 
-DragPathResolver::DragPathResolver(ApplicationSession& session, QObject* parent) : QObject(parent), session_(session) {}
+DragPathResolver::DragPathResolver(ApplicationSession& session, QObject* parent) : QObject(parent), session_(session) {
+    pool_.setMaxThreadCount(1);
+    pool_.setObjectName(QStringLiteral("DragPathResolver"));
+    debounce_.setSingleShot(true);
+    debounce_.setInterval(kDebounceMilliseconds);
+    connect(&debounce_, &QTimer::timeout, this, &DragPathResolver::start_check);
+}
+
+DragPathResolver::~DragPathResolver() {
+    stop_.request_stop();
+    pool_.clear();
+    pool_.waitForDone();
+}
 
 void DragPathResolver::resolve(std::vector<SampleKey> keys) {
-    const std::uint64_t generation = ++generation_;
+    // Same selection (e.g. after an in-place row refresh): a finished, pending or running check
+    // already covers it.
+    if (keys == keys_ && (ready_ || checking_ || debounce_.isActive())) return;
+    ++generation_;
+    stop_.request_stop();  // the previous check is obsolete
     ready_ = false;
+    checking_ = false;
     keys_ = std::move(keys);
     results_.clear();
-    if (keys_.empty() || keys_.size() > kMaxDragSamples || !session_.is_ready()) return;
-    session_.run(
-        this,
-        [keys = keys_](app::Application& application) {
+    if (keys_.empty() || keys_.size() > kMaxDragSamples) {
+        debounce_.stop();
+        return;
+    }
+    debounce_.start();
+}
+
+void DragPathResolver::start_check() {
+    if (!session_.is_ready() || keys_.empty()) return;
+    stop_ = std::stop_source();
+    checking_ = true;
+    const std::uint64_t generation = generation_;
+    session_.run_on(
+        pool_, this,
+        [keys = keys_, stop = stop_.get_token()](app::Application& application) {
             std::vector<Result<std::filesystem::path>> results;
             results.reserve(keys.size());
-            for (const SampleKey& key : keys)
+            for (const SampleKey& key : keys) {
+                if (stop.stop_requested()) return std::vector<Result<std::filesystem::path>>{};
                 results.push_back(application.resolve_playable_path(key.library, key.sample_id));
+            }
             return results;
         },
         [this, generation](std::vector<Result<std::filesystem::path>> results) {
-            if (generation != generation_) return;  // the selection changed meanwhile
+            if (generation != generation_) return;  // superseded by a newer selection
+            checking_ = false;
+            if (results.size() != keys_.size()) return;  // cancelled
             results_ = std::move(results);
             ready_ = true;
             emit resolved();
@@ -55,9 +89,11 @@ std::vector<SampleKey> DragPathResolver::available_keys() const {
 }
 
 std::optional<std::filesystem::path> DragPathResolver::path_of(const SampleKey& key) const {
-    for (std::size_t index = 0; index < results_.size(); ++index)
-        if (keys_[index] == key && results_[index]) return *results_[index];
-    return std::nullopt;
+    const auto found = std::ranges::find(keys_, key);
+    if (found == keys_.end() || !ready_) return std::nullopt;
+    const auto& result = results_[static_cast<std::size_t>(found - keys_.begin())];
+    if (!result) return std::nullopt;
+    return *result;
 }
 
 }  // namespace mso::ui

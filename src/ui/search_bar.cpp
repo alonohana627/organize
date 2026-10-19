@@ -1,5 +1,6 @@
 #include "mso/ui/search_bar.hpp"
 
+#include <QAction>
 #include <QLabel>
 #include <QLineEdit>
 #include <QStyle>
@@ -34,6 +35,9 @@ SearchBar::SearchBar(QWidget* parent) : QWidget(parent) {
         tr("Words search names, paths, tags and notes. Fields: tag, category, folder, collection, "
            "bpm, key, duration, rating, favorite, format, codec, rate, channels, bits, size, "
            "available, analyzed, name, path, notes. Combine with AND, OR, NOT and parentheses."));
+
+    error_action_ = input_->addAction(style()->standardIcon(QStyle::SP_MessageBoxWarning), QLineEdit::TrailingPosition);
+    error_action_->setVisible(false);
 
     error_label_ = new QLabel(this);
     error_label_->setTextFormat(Qt::RichText);
@@ -104,15 +108,19 @@ void SearchBar::show_error(const QString& message, int character_index) {
                               .arg(message.toHtmlEscaped(), before, at, after));
     error_label_->setAccessibleDescription(tr("Error at position %1: %2").arg(clamped + 1).arg(message));
     error_label_->show();
-    input_->setProperty("invalid", true);
-    input_->setStyleSheet(QStringLiteral("QLineEdit { border: 1px solid #c42b1c; }"));
+    // The style's warning icon inside the box marks the error in every theme, without colors.
+    error_action_->setToolTip(error_label_->accessibleDescription());
+    error_action_->setVisible(true);
 }
 
 void SearchBar::clear_error() {
     error_label_->hide();
     error_label_->clear();
-    input_->setProperty("invalid", false);
-    input_->setStyleSheet({});
+    error_action_->setVisible(false);
+}
+
+QString SearchBar::error_text() const {
+    return error_label_->isHidden() ? QString() : error_label_->accessibleDescription();
 }
 
 }  // namespace mso::ui

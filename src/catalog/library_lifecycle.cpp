@@ -1,9 +1,14 @@
 // Library creation, opening, migrations, crash recovery, reader pool and backups.
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <format>
 #include <fstream>
 #include <sstream>
 
-#include "mso/catalog/catalog_internal.hpp"
+#include "mso/catalog/detail/catalog_internal.hpp"
+#include "mso/catalog/detail/reader_pool.hpp"
+#include "mso/catalog/durable_file.hpp"
 #include "mso/catalog/library.hpp"
 #include "mso/catalog/migrations.hpp"
 
@@ -13,6 +18,9 @@ namespace {
 
 constexpr std::string_view kBackupDirectory = "backups";
 constexpr std::string_view kStagingDirectory = "staging";
+constexpr std::size_t kMaximumBackupReasonLength = 48;
+constexpr std::array<std::string_view, 5> kLibrarySubdirectories = {"media", "derived/waveforms", "derived/features",
+                                                                    "backups", "staging"};
 
 /// The identity manifest stored next to the database.
 struct LibraryManifest {
@@ -21,48 +29,33 @@ struct LibraryManifest {
     int format_version = 0;
 };
 
-Result<void> write_file_atomically(const std::filesystem::path& target, std::string_view contents) {
-    auto temporary = target;
-    temporary += ".tmp";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) return fail(ErrorCode::AccessDenied, std::format("cannot write {}", path_to_utf8(target)));
-        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        out.flush();
-        if (!out) return fail(ErrorCode::DiskFull, std::format("write failed for {}", path_to_utf8(target)));
-    }
-    std::error_code error;
-    std::filesystem::rename(temporary, target, error);
-    if (error)
-        return fail(ErrorCode::AccessDenied,
-                    std::format("cannot replace {}: {}", path_to_utf8(target), error.message()));
-    return {};
-}
-
 Result<LibraryManifest> read_manifest(const std::filesystem::path& file) {
     std::ifstream in(file, std::ios::binary);
     if (!in) return fail(ErrorCode::NotFound, std::format("no library manifest at {}", path_to_utf8(file)));
     std::stringstream contents;
     contents << in.rdbuf();
-    auto document = nlohmann::json::parse(contents.str(), nullptr, false);
+    const auto document = detail::parse_json(contents.str());
     if (document.is_discarded() || !document.is_object())
         return fail(ErrorCode::DbCorrupt, "library.json is not valid JSON");
     LibraryManifest manifest;
-    const auto uuid_text = document.value("library_uuid", std::string());
-    auto uuid = uuids::uuid::from_string(uuid_text);
+    const auto uuid_text = detail::json_string_member(document, "library_uuid");
+    const auto uuid = uuid_text ? uuids::uuid::from_string(*uuid_text) : std::nullopt;
     if (!uuid) return fail(ErrorCode::DbCorrupt, "library.json has no valid library_uuid");
     manifest.uuid = *uuid;
-    manifest.name = document.value("name", std::string());
-    manifest.format_version = document.value("format_version", 0);
+    manifest.name = detail::json_string_member(document, "name").value_or("");
+    const auto format_version = detail::json_integer_member(document, "format_version");
+    if (!format_version || *format_version < 0 || *format_version > 1'000'000)
+        return fail(ErrorCode::DbCorrupt, "library.json has no valid format_version");
+    manifest.format_version = static_cast<int>(*format_version);
     return manifest;
 }
 
 Result<void> write_manifest(const std::filesystem::path& file, const LibraryManifest& manifest) {
-    nlohmann::json document = {{"format_version", manifest.format_version},
-                               {"library_uuid", uuids::to_string(manifest.uuid)},
-                               {"name", manifest.name},
-                               {"application", "Music Sample Organizer"}};
-    return write_file_atomically(file, document.dump(2));
+    const nlohmann::json document = {{"format_version", manifest.format_version},
+                                     {"library_uuid", uuids::to_string(manifest.uuid)},
+                                     {"name", manifest.name},
+                                     {"application", "Music Sample Organizer"}};
+    return write_file_atomically(file, document.dump(2, ' ', false, nlohmann::json::error_handler_t::replace));
 }
 
 /// Verifies a backup copy: integrity check, foreign keys and identity.
@@ -96,12 +89,18 @@ Result<int> applied_schema_version(sqlite::Connection& connection) {
     return static_cast<int>(*version);
 }
 
-/// Released migrations must be byte-identical to what this build ships.
+/// Released migrations must be byte-identical to what this build ships, and applied without gaps
+/// (1, 2, 3, …). Versions newer than this build are allowed (the library then opens read-only).
 Result<void> verify_migration_checksums(sqlite::Connection& connection) {
     auto statement = connection.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version");
     if (!statement) return std::unexpected(statement.error());
-    return detail::for_each_row(*statement, [](sqlite::PreparedStatement& row) -> Result<void> {
-        const auto version = static_cast<int>(row.column_int64(0));
+    int expected_version = 1;
+    return detail::for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
+        const auto version = row.column_int64(0);
+        if (version != expected_version)
+            return fail(ErrorCode::DbCorrupt,
+                        std::format("schema migration {} is missing (found {} next)", expected_version, version));
+        ++expected_version;
         for (const auto& migration : migrations()) {
             if (migration.version == version && migration.checksum != row.column_text(1))
                 return fail(ErrorCode::DbCorrupt,
@@ -111,33 +110,83 @@ Result<void> verify_migration_checksums(sqlite::Connection& connection) {
     });
 }
 
-/// Applies one migration in its own transaction, recording its checksum.
-Result<void> apply_migration(sqlite::Connection& connection, const Migration& migration) {
-    sqlite::WriteTransaction transaction(connection);
-    if (auto began = transaction.begin(); !began) return began;
+/// Runs one migration's script and records it, inside the caller's transaction.
+Result<void> apply_migration_body(sqlite::Connection& connection, const Migration& migration) {
     if (auto applied = connection.execute_script(migration.sql); !applied) return applied;
     auto record = connection.prepare("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?1,?2,?3)");
     if (!record) return std::unexpected(record.error());
     record->bind(1, migration.version).bind(2, migration.checksum).bind(3, now_unix_ms());
     if (auto recorded = record->run(); !recorded) return recorded;
-    if (auto has_state = connection.query_int64("SELECT count(*) FROM library_state"); has_state && *has_state > 0) {
-        auto update = connection.prepare("UPDATE library_state SET schema_version=?1 WHERE singleton=1");
-        if (!update) return std::unexpected(update.error());
-        update->bind(1, migration.version);
-        if (auto updated = update->run(); !updated) return updated;
-    }
-    if (auto version = connection.execute_script(std::format("PRAGMA user_version={}", migration.version)); !version)
-        return version;
+    auto update = connection.prepare("UPDATE library_state SET schema_version=?1 WHERE singleton=1");
+    if (!update) return std::unexpected(update.error());
+    update->bind(1, migration.version);
+    if (auto updated = update->run(); !updated) return updated;
+    return connection.execute_script(std::format("PRAGMA user_version={}", migration.version));
+}
+
+/// Applies one pending migration of an existing library in its own transaction.
+Result<void> apply_migration(sqlite::Connection& connection, const Migration& migration) {
+    sqlite::WriteTransaction transaction(connection);
+    if (auto began = transaction.begin(); !began) return began;
+    if (auto applied = apply_migration_body(connection, migration); !applied) return applied;
     return transaction.commit();
 }
 
 /// Removes temporary files left by interrupted operations in staging/ (only our own *.partial).
+/// Best effort: a file that cannot be removed now is retried at the next open.
 void sweep_staging(const std::filesystem::path& staging) {
     std::error_code error;
     if (!std::filesystem::is_directory(staging, error)) return;
-    for (const auto& entry : std::filesystem::directory_iterator(staging, error)) {
-        if (entry.is_regular_file(error) && entry.path().extension() == ".partial")
-            std::filesystem::remove(entry.path(), error);
+    std::filesystem::directory_iterator entries(staging, error);
+    for (; !error && entries != std::filesystem::directory_iterator(); entries.increment(error)) {
+        std::error_code entry_error;
+        if (entries->is_regular_file(entry_error) && entries->path().extension() == ".partial")
+            std::filesystem::remove(entries->path(), entry_error);
+    }
+}
+
+/// A backup reason reduced to [A-Za-z0-9_-] (others become '-'), at most 48 characters.
+std::string sanitized_backup_reason(std::string_view reason) {
+    std::string sanitized;
+    for (const char character : reason.substr(0, kMaximumBackupReasonLength)) {
+        const auto byte = static_cast<unsigned char>(character);
+        sanitized.push_back(std::isalnum(byte) != 0 || character == '-' || character == '_' ? character : '-');
+    }
+    return sanitized.empty() ? std::string("backup") : sanitized;
+}
+
+/// True for files named by create_backup(): "<13-digit ms>-<reason>-<id>.sqlite".
+bool is_backup_file_name(const std::string& name) {
+    return name.size() > 21 && name.ends_with(".sqlite") &&
+           std::all_of(name.begin(), name.begin() + 13,
+                       [](char character) { return character >= '0' && character <= '9'; }) &&
+           name[13] == '-';
+}
+
+/// Deletes all but the newest `keep` backups. Best effort: a backup that cannot be deleted now (e.g.
+/// open in another program) is retried after the next backup.
+void prune_backups(const std::filesystem::path& directory, std::size_t keep) {
+    std::error_code error;
+    std::vector<std::filesystem::path> backups;
+    std::filesystem::directory_iterator entries(directory, error);
+    for (; !error && entries != std::filesystem::directory_iterator(); entries.increment(error)) {
+        std::error_code entry_error;
+        if (entries->is_regular_file(entry_error) && is_backup_file_name(path_to_utf8(entries->path().filename())))
+            backups.push_back(entries->path());
+    }
+    if (backups.size() <= keep) return;
+    std::ranges::sort(backups, std::greater<>{}, [](const std::filesystem::path& file) { return file.filename(); });
+    for (std::size_t index = keep; index < backups.size(); ++index) {
+        std::error_code remove_error;
+        std::filesystem::remove(backups[index], remove_error);
+    }
+}
+
+/// Raises `published` to `revision` unless another thread already published a newer one.
+void publish_revision(std::atomic<std::int64_t>& published, std::int64_t revision) noexcept {
+    std::int64_t current = published.load();
+    while (current < revision && !published.compare_exchange_weak(current, revision)) {
+        // compare_exchange_weak reloaded `current`; retry until ours is not newer or it is stored
     }
 }
 
@@ -145,38 +194,70 @@ void sweep_staging(const std::filesystem::path& staging) {
 
 // ---------------------------------------------------------------- ReaderLease
 
-ReaderLease::ReaderLease(Library* owner, std::unique_ptr<sqlite::Connection> connection)
-    : owner_(owner), connection_(std::move(connection)) {}
-
-ReaderLease::ReaderLease(ReaderLease&& other) noexcept
-    : owner_(other.owner_), connection_(std::move(other.connection_)) {
-    other.owner_ = nullptr;
-}
+ReaderLease::ReaderLease(std::shared_ptr<detail::ReaderPool> pool, std::unique_ptr<sqlite::Connection> connection)
+    : pool_(std::move(pool)), connection_(std::move(connection)) {}
 
 ReaderLease::~ReaderLease() {
-    if (owner_ && connection_) owner_->release_reader(std::move(connection_));
+    if (pool_ && connection_) pool_->give_back(std::move(connection_));
 }
 
 // ---------------------------------------------------------------- creation and opening
 
 Result<std::unique_ptr<Library>> Library::create(const std::filesystem::path& directory, std::string_view name) {
     std::error_code error;
-    if (std::filesystem::exists(directory, error) && !std::filesystem::is_empty(directory, error))
-        return fail(ErrorCode::InvalidArgument, "the library folder must be new or empty");
-    std::filesystem::create_directories(directory, error);
-    if (error) return fail(ErrorCode::AccessDenied, std::format("cannot create library folder: {}", error.message()));
-    for (auto sub : {"media", "derived/waveforms", "derived/features", "backups", "staging"})
-        std::filesystem::create_directories(directory / sub, error);
+    const bool existed = std::filesystem::exists(directory, error);
+    if (error)
+        return fail(ErrorCode::AccessDenied, std::format("cannot examine the library folder: {}", error.message()));
+    if (existed) {
+        const bool empty = std::filesystem::is_empty(directory, error);
+        if (error)
+            return fail(ErrorCode::AccessDenied, std::format("cannot read the library folder: {}", error.message()));
+        if (!empty) return fail(ErrorCode::InvalidArgument, "the library folder must be new or empty");
+    }
 
-    std::unique_ptr<Library> library(new Library());
-    library->directory_ = directory;
-    library->catalog_file_ = directory / kCatalogFileName;
-    library->uuid_ = new_uuid();
-    if (auto initialized = library->initialize_new(name); !initialized) return std::unexpected(initialized.error());
+    // Everything below is undone on failure, so a failed creation never leaves a half library.
+    auto remove_created = [&] {
+        std::error_code cleanup_error;
+        if (!existed) {
+            std::filesystem::remove_all(directory, cleanup_error);
+            return;
+        }
+        std::filesystem::directory_iterator entries(directory, cleanup_error);
+        std::vector<std::filesystem::path> created;
+        for (; !cleanup_error && entries != std::filesystem::directory_iterator(); entries.increment(cleanup_error))
+            created.push_back(entries->path());
+        for (const auto& entry : created) {
+            std::error_code entry_error;
+            std::filesystem::remove_all(entry, entry_error);
+        }
+    };
 
-    const LibraryManifest manifest{library->uuid_, std::string(name), kLibraryFormatVersion};
-    if (auto written = write_manifest(directory / kManifestFileName, manifest); !written)
-        return std::unexpected(written.error());
+    auto build = [&]() -> Result<std::unique_ptr<Library>> {
+        std::error_code create_error;
+        std::filesystem::create_directories(directory, create_error);
+        if (create_error)
+            return fail(ErrorCode::AccessDenied,
+                        std::format("cannot create library folder: {}", create_error.message()));
+        for (const auto subdirectory : kLibrarySubdirectories) {
+            std::filesystem::create_directories(directory / subdirectory, create_error);
+            if (create_error)
+                return fail(ErrorCode::AccessDenied,
+                            std::format("cannot create {}: {}", subdirectory, create_error.message()));
+        }
+        std::unique_ptr<Library> library(new Library());
+        library->directory_ = directory;
+        library->catalog_file_ = directory / kCatalogFileName;
+        library->uuid_ = new_uuid();
+        library->readers_ = std::make_shared<detail::ReaderPool>(library->catalog_file_, OpenOptions{}.max_readers);
+        if (auto initialized = library->initialize_new(name); !initialized) return std::unexpected(initialized.error());
+        const LibraryManifest manifest{library->uuid_, std::string(name), kLibraryFormatVersion};
+        if (auto written = write_manifest(directory / kManifestFileName, manifest); !written)
+            return std::unexpected(written.error());
+        return library;
+    };
+
+    auto library = build();  // destroyed (closing the database) before any cleanup below
+    if (!library) remove_created();
     return library;
 }
 
@@ -186,9 +267,13 @@ Result<void> Library::initialize_new(std::string_view name) {
     auto connection = sqlite::Connection::open(catalog_file_, {.create = true});
     if (!connection) return std::unexpected(connection.error());
     writer_ = std::move(*connection);
+
+    // One transaction for the whole schema: a crash leaves either nothing or a complete catalog.
+    sqlite::WriteTransaction transaction(writer_);
+    if (auto began = transaction.begin(); !began) return began;
     for (const auto& migration : migrations()) {
-        if (auto applied = apply_migration(writer_, migration); !applied) return applied;
         if (migration.version == 1) {
+            if (auto applied = writer_.execute_script(migration.sql); !applied) return applied;
             auto insert = writer_.prepare(
                 "INSERT INTO library_state(singleton,library_uuid,name,schema_version,catalog_revision,created_at,"
                 "normalization_version) VALUES(1,?1,?2,?3,0,?4,?5)");
@@ -196,12 +281,20 @@ Result<void> Library::initialize_new(std::string_view name) {
             insert->bind(1, uuids::to_string(uuid_)).bind(2, name).bind(3, migration.version).bind(4, now_unix_ms());
             insert->bind(5, kFoldVersion);
             if (auto inserted = insert->run(); !inserted) return inserted;
+            auto record =
+                writer_.prepare("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?1,?2,?3)");
+            if (!record) return std::unexpected(record.error());
+            record->bind(1, migration.version).bind(2, migration.checksum).bind(3, now_unix_ms());
+            if (auto recorded = record->run(); !recorded) return recorded;
+            continue;
         }
+        if (auto applied = apply_migration_body(writer_, migration); !applied) return applied;
     }
-    auto update = writer_.prepare("UPDATE library_state SET schema_version=?1");
-    if (!update) return std::unexpected(update.error());
-    update->bind(1, latest_schema_version());
-    return update->run();
+    if (auto version = writer_.execute_script(std::format("PRAGMA user_version={}", latest_schema_version())); !version)
+        return version;
+    if (auto committed = transaction.commit(); !committed) return committed;
+    if (auto tracking = detail::prepare_change_tracking(writer_); !tracking) return tracking;
+    return load_cached_identity();
 }
 
 Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& directory, const OpenOptions& options) {
@@ -215,7 +308,7 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& dire
     library->catalog_file_ = directory / kCatalogFileName;
     library->uuid_ = manifest->uuid;
     library->read_only_ = options.read_only;
-    library->max_readers_ = std::max(1, options.max_readers);
+    library->readers_ = std::make_shared<detail::ReaderPool>(library->catalog_file_, options.max_readers);
 
     auto connection = sqlite::Connection::open(library->catalog_file_, {.read_only = options.read_only});
     if (!connection) return std::unexpected(connection.error());
@@ -223,8 +316,11 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& dire
 
     if (auto verified = library->verify_and_migrate(); !verified) return std::unexpected(verified.error());
     if (!library->read_only_) {
+        if (auto tracking = detail::prepare_change_tracking(library->writer_); !tracking)
+            return std::unexpected(tracking.error());
         if (auto recovered = library->recover_after_crash(); !recovered) return std::unexpected(recovered.error());
     }
+    if (auto identity = library->load_cached_identity(); !identity) return std::unexpected(identity.error());
     return library;
 }
 
@@ -238,15 +334,19 @@ Result<void> Library::verify_and_migrate() {
     if (!statement) return std::unexpected(statement.error());
     auto has_row = statement->next_row();
     if (!has_row) return std::unexpected(has_row.error());
-    if (!*has_row || statement->column_text(0) != uuids::to_string(uuid_))
-        return fail(ErrorCode::DbCorrupt, "library.json and catalog.sqlite belong to different libraries");
+    const bool matches = *has_row && statement->column_text(0) == uuids::to_string(uuid_);
     statement->reset();
+    if (!matches) return fail(ErrorCode::DbCorrupt, "library.json and catalog.sqlite belong to different libraries");
 
     if (*version > latest_schema_version()) {
         read_only_ = true;  // SCHEMA_TOO_NEW: browse only, never write a newer catalog
         return {};
     }
-    if (*version == latest_schema_version() || read_only_) return {};
+    if (*version == latest_schema_version()) return {};
+    if (read_only_)
+        return fail(ErrorCode::InvalidArgument,
+                    std::format("this library uses catalog schema {} and must be opened writable once to upgrade to {}",
+                                *version, latest_schema_version()));
 
     auto backup = create_backup(std::format("pre-migration-v{}", *version));
     if (!backup) return std::unexpected(backup.error());
@@ -263,7 +363,7 @@ Result<void> Library::verify_and_migrate() {
 }
 
 Result<void> Library::recover_after_crash() {
-    std::lock_guard lock(writer_mutex_);
+    const std::lock_guard lock(writer_mutex_);
     sqlite::WriteTransaction transaction(writer_);
     if (auto began = transaction.begin(); !began) return began;
 
@@ -278,6 +378,10 @@ Result<void> Library::recover_after_crash() {
     recovery_.partial_history_actions = writer_.changed_row_count();
     if (auto cleared = writer_.execute_script("UPDATE history_state SET active_action_id=NULL"); !cleared)
         return cleared;
+    // A chunked edit interrupted mid-way: its receipt says so, and a retry resumes or reports it.
+    if (auto receipts = writer_.execute_script("UPDATE command_receipts SET state='partial' WHERE state='running'");
+        !receipts)
+        return receipts;
 
     // Background analysis stays paused after an unclean shutdown until the user resumes it.
     if (auto interrupted = writer_.execute_script(
@@ -297,23 +401,36 @@ Result<void> Library::recover_after_crash() {
     return {};
 }
 
-Library::~Library() {
-    std::lock_guard lock(readers_mutex_);
-    idle_readers_.clear();
-}
-
-LibraryIdentity Library::identity() {
-    LibraryIdentity identity;
-    identity.uuid = uuid_;
-    std::lock_guard lock(writer_mutex_);
+Result<void> Library::load_cached_identity() {
+    const std::lock_guard lock(writer_mutex_);
     auto statement =
         writer_.prepare("SELECT name, schema_version, catalog_revision FROM library_state WHERE singleton=1");
-    if (statement && statement->next_row().value_or(false)) {
-        identity.name = statement->column_text(0);
-        identity.schema_version = static_cast<int>(statement->column_int64(1));
-        identity.catalog_revision = statement->column_int64(2);
-    }
-    return identity;
+    if (!statement) return std::unexpected(statement.error());
+    auto has_row = statement->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    if (!*has_row) return fail(ErrorCode::DbCorrupt, "library_state row is missing");
+    name_ = statement->column_text(0);
+    schema_version_ = static_cast<int>(statement->column_int64(1));
+    published_revision_.store(statement->column_int64(2));
+    statement->reset();
+    return {};
+}
+
+Library::~Library() {
+    if (readers_) readers_->close();
+}
+
+LibraryIdentity Library::identity() const {
+    return LibraryIdentity{uuid_, name_, schema_version_, published_revision_.load()};
+}
+
+Result<std::int64_t> Library::catalog_revision() {
+    auto reader = acquire_reader();
+    if (!reader) return std::unexpected(reader.error());
+    auto revision = reader->connection().query_int64("SELECT catalog_revision FROM library_state WHERE singleton=1");
+    if (!revision) return std::unexpected(revision.error());
+    publish_revision(published_revision_, *revision);
+    return *revision;
 }
 
 Result<void> Library::ensure_writable() const {
@@ -321,33 +438,18 @@ Result<void> Library::ensure_writable() const {
     return {};
 }
 
-// ---------------------------------------------------------------- reader pool
-
-Result<ReaderLease> Library::acquire_reader() {
-    std::unique_lock lock(readers_mutex_);
-    reader_available_.wait(lock, [&] { return !idle_readers_.empty() || open_readers_ < max_readers_; });
-    if (!idle_readers_.empty()) {
-        auto connection = std::move(idle_readers_.back());
-        idle_readers_.pop_back();
-        return ReaderLease(this, std::move(connection));
-    }
-    ++open_readers_;
-    lock.unlock();
-    auto connection = sqlite::Connection::open(catalog_file_, {.read_only = true, .page_cache_kib = 8 * 1024});
-    if (!connection) {
-        std::lock_guard relock(readers_mutex_);
-        --open_readers_;
-        reader_available_.notify_one();
-        return std::unexpected(connection.error());
-    }
-    return ReaderLease(this, std::make_unique<sqlite::Connection>(std::move(*connection)));
+Result<void> Library::commit_revision(sqlite::WriteTransaction& transaction, std::int64_t revision) {
+    if (auto committed = transaction.commit(); !committed) return committed;
+    publish_revision(published_revision_, revision);
+    return {};
 }
 
-void Library::release_reader(std::unique_ptr<sqlite::Connection> connection) {
-    std::lock_guard lock(readers_mutex_);
-    connection->rollback();  // never return a connection with an open read transaction
-    idle_readers_.push_back(std::move(connection));
-    reader_available_.notify_one();
+// ---------------------------------------------------------------- reader pool
+
+Result<ReaderLease> Library::acquire_reader(std::chrono::milliseconds timeout) {
+    auto connection = readers_->acquire(timeout);
+    if (!connection) return std::unexpected(connection.error());
+    return ReaderLease(readers_, std::move(*connection));
 }
 
 // ---------------------------------------------------------------- maintenance
@@ -356,9 +458,11 @@ Result<std::filesystem::path> Library::create_backup(std::string_view reason) {
     const auto directory = directory_ / kBackupDirectory;
     std::error_code error;
     std::filesystem::create_directories(directory, error);
-    const auto file = directory / std::format("{}-{}.sqlite", now_unix_ms(), reason);
+    if (error) return fail(ErrorCode::AccessDenied, std::format("cannot create backups folder: {}", error.message()));
+    const auto file = directory / std::format("{:013}-{}-{}.sqlite", now_unix_ms(), sanitized_backup_reason(reason),
+                                              uuids::to_string(new_uuid()).substr(0, 8));
     {
-        std::lock_guard lock(writer_mutex_);
+        const std::lock_guard lock(writer_mutex_);
         if (auto copied = writer_.backup_to(file); !copied) {
             std::filesystem::remove(file, error);
             return std::unexpected(copied.error());
@@ -368,11 +472,12 @@ Result<std::filesystem::path> Library::create_backup(std::string_view reason) {
         std::filesystem::remove(file, error);
         return std::unexpected(verified.error());
     }
+    prune_backups(directory, kMaximumBackups);
     return file;
 }
 
 Result<std::string> Library::integrity_report() {
-    std::lock_guard lock(writer_mutex_);
+    const std::lock_guard lock(writer_mutex_);
     auto integrity = writer_.integrity_check();
     if (!integrity) return std::unexpected(integrity.error());
     auto violations = writer_.foreign_key_violations();
@@ -385,7 +490,7 @@ Result<std::string> Library::integrity_report() {
 
 Result<void> Library::rebuild_search_index() {
     if (auto writable = ensure_writable(); !writable) return writable;
-    std::lock_guard lock(writer_mutex_);
+    const std::lock_guard lock(writer_mutex_);
     sqlite::WriteTransaction transaction(writer_);
     if (auto began = transaction.begin(); !began) return began;
     if (auto rebuilt = writer_.execute_script("INSERT INTO sample_fts(sample_fts) VALUES('rebuild')"); !rebuilt)

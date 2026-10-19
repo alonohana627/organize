@@ -1,71 +1,214 @@
 #include "mso/app/application.hpp"
 
+#include <BS_thread_pool.hpp>
+
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <thread>
 
-#include "mso/analysis/worker_process.hpp"
+#include <nlohmann/json.hpp>
+
 #include "mso/app/analysis_supervisor.hpp"
+#include "mso/app/file_lock.hpp"
+#include "mso/app/json_fields.hpp"
 #include "mso/app/metadata_export.hpp"
+#include "mso/catalog/root_paths.hpp"
+#include "mso/worker/worker_process.hpp"
 
 namespace mso::app {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
 constexpr auto kRootPollInterval = std::chrono::seconds(2);
+/// Catch-up interval of the index maintenance thread when nobody asked for an update.
+constexpr auto kIndexPollInterval = std::chrono::seconds(1);
+/// Above this many changed rows an event asks for a full reload instead of listing them.
+constexpr std::size_t kMaximumEventSampleIds = 4096;
+constexpr std::string_view kAutomaticProfilePreference = "analysis.automatic_profile";
+constexpr std::string_view kDefaultAutomaticProfile = "Full";
+/// Runs listed in an AnalysisProgressEvent.
+constexpr std::size_t kRunsPerProgressEvent = 20;
+
+/// Depth of event-handler calls on this thread (set_event_handler must not wait for itself).
+thread_local int event_handler_depth = 0;
+
+/// The library UUID recorded in a folder's library.json, read before anything else is touched.
+Result<uuids::uuid> peek_library_uuid(const std::filesystem::path& directory) {
+    std::ifstream in(directory / catalog::Library::kManifestFileName, std::ios::binary);
+    if (!in) return fail(ErrorCode::NotFound, std::format("no library at {}", path_to_utf8(directory)));
+    std::stringstream contents;
+    contents << in.rdbuf();
+    const auto document = nlohmann::json::parse(contents.str(), nullptr, false);
+    const auto uuid = uuids::uuid::from_string(string_field(document, "library_uuid").value_or(""));
+    if (!uuid) return fail(ErrorCode::DbCorrupt, "library.json has no valid library_uuid");
+    return *uuid;
 }
 
-/// A background operation and the means to cancel and await it.
-struct RunningOperation {
-    std::string description;
-    std::stop_source stop;
-    std::jthread thread;
+/// A folder name Windows accepts for `name`: forbidden characters replaced, no trailing dots or
+/// spaces, and never a reserved device name (CON, NUL, COM1...).
+std::string safe_folder_name(std::string_view name) {
+    std::string folder;
+    for (const char character : name)
+        folder.push_back(std::string_view("<>:\"/\\|?*").find(character) == std::string_view::npos &&
+                                 static_cast<unsigned char>(character) >= 0x20
+                             ? character
+                             : '_');
+    while (!folder.empty() && (folder.back() == '.' || folder.back() == ' '))
+        folder.pop_back();
+    if (folder.empty()) folder = "Library";
+    const std::string stem = to_lower_ascii(folder.substr(0, folder.find('.')));
+    static constexpr std::string_view kReserved[] = {"con", "prn", "aux", "nul"};
+    const bool numbered_device =
+        stem.size() == 4 && (stem.starts_with("com") || stem.starts_with("lpt")) && stem[3] >= '0' && stem[3] <= '9';
+    if (numbered_device || std::ranges::find(kReserved, std::string_view(stem)) != std::end(kReserved))
+        folder.insert(0, "_");
+    return folder;
+}
+
+/// An INTERNAL error for an exception caught by a thread barrier.
+Error internal_error(std::string_view where, const std::exception& exception) {
+    return Error{ErrorCode::Internal, true, std::format("{}: {}", where, exception.what()), std::nullopt, std::nullopt};
+}
+
+}  // namespace
+
+/// One open library: its lock, catalog, index and announcement state. Shared by everything that
+/// works on it, so close_library() never destroys it under running work.
+struct Application::LibraryEntry {
+    /// Changes of this library waiting to be announced (coalescing state).
+    struct PendingAnnouncement {
+        std::vector<std::int64_t> sample_ids;
+        bool structure_changed = false;
+        bool full_reload = false;
+        bool catalog_pending = false;
+        std::optional<std::string> analysis_status;
+        Clock::time_point last_catalog_event{};
+        Clock::time_point last_analysis_event{};
+        std::string last_reported_error;  ///< repeated identical background errors are reported once
+    };
+
+    FileLock lock;  ///< first member: released last, after the catalog is closed
+    std::unique_ptr<catalog::Library> library;
+    std::unique_ptr<SampleIndex> index;  ///< null when ApplicationOptions::in_memory_index is off
+    uuids::uuid uuid;
+    std::string name;  ///< cached: identity() takes the writer mutex, which imports hold for long
+    bool in_use_elsewhere = false;
+    std::stop_source closing;  ///< cancels an index load when the library closes
+    std::atomic<bool> update_requested{false};
+    std::mutex announcement_mutex;
+    PendingAnnouncement pending;
+
+    ~LibraryEntry() {
+        index.reset();
+        library.reset();  // close the catalog before the lock is released
+    }
 };
 
 struct Application::State {
+    /// A queued or running background operation.
+    struct Operation {
+        std::string description;
+        uuids::uuid library;
+        std::stop_source stop;
+        std::mutex mutex;
+        std::condition_variable finished_signal;
+        bool finished = false;
+    };
+
     ApplicationOptions options;
     Workspace workspace;
 
     mutable std::mutex libraries_mutex;
-    std::map<std::string, std::shared_ptr<catalog::Library>> libraries;  ///< keyed by UUID text
+    std::map<std::string, std::shared_ptr<LibraryEntry>> libraries;  ///< keyed by UUID text
+    std::set<std::string> opening;  ///< UUIDs being opened (reserve a slot against races)
 
     std::mutex handler_mutex;
-    EventHandler handler;
+    std::condition_variable handler_idle;
+    std::shared_ptr<const EventHandler> handler;
+    std::size_t emissions_in_flight = 0;
 
     std::mutex operations_mutex;
-    std::map<OperationId, std::unique_ptr<RunningOperation>> operations;
+    std::map<OperationId, std::shared_ptr<Operation>> operations;  ///< finished ones are erased
     OperationId next_operation = 1;
-
-    std::unique_ptr<AnalysisSupervisor> supervisor;
-    std::jthread root_monitor;
-    Application* owner = nullptr;  ///< for automatic rescans started by the root monitor
-
-    /// Roots with an import in flight ("<library uuid>/<root id>"), so rescans never overlap.
+    std::unique_ptr<BS::thread_pool<>> import_pool;
+    /// Roots with an import queued or running ("<library uuid>/<root id>"), so rescans never overlap.
     std::mutex imports_mutex;
     std::set<std::string> imports_in_flight;
 
-    explicit State(ApplicationOptions application_options, Workspace loaded)
+    std::unique_ptr<AnalysisSupervisor> supervisor;
+
+    std::mutex maintenance_mutex;
+    std::condition_variable_any maintenance_wake;
+    bool maintenance_requested = false;
+    std::mutex loads_mutex;
+    std::condition_variable_any loads_wake;
+    std::deque<std::weak_ptr<LibraryEntry>> load_queue;
+
+    // Threads last: they start after everything above exists and are joined explicitly.
+    std::jthread index_loader;
+    std::jthread index_maintainer;
+    std::jthread root_monitor;
+
+    State(ApplicationOptions application_options, Workspace loaded)
         : options(std::move(application_options)), workspace(std::move(loaded)) {}
 
+    // ------------------------------------------------------------ events
+
     void emit(const ApplicationEvent& event) {
-        EventHandler current;
+        std::shared_ptr<const EventHandler> current;
         {
             std::lock_guard lock(handler_mutex);
             current = handler;
+            ++emissions_in_flight;
         }
-        if (current) current(event);
+        ++event_handler_depth;
+        try {
+            if (current && *current) (*current)(event);
+        } catch (const std::exception&) {
+            // A throwing handler must not take a background thread down, and there is no one left
+            // to report to: the handler is the reporting channel.
+        }
+        --event_handler_depth;
+        {
+            std::lock_guard lock(handler_mutex);
+            --emissions_in_flight;
+        }
+        handler_idle.notify_all();
     }
 
-    std::vector<std::shared_ptr<catalog::Library>> library_snapshot() const {
+    void report(std::optional<uuids::uuid> library, std::string context, Error error) {
+        emit(BackgroundErrorEvent{library, std::move(context), std::move(error)});
+    }
+
+    // ------------------------------------------------------------ libraries
+
+    /// The open libraries a request covers (one library, or all of them).
+    std::vector<std::shared_ptr<LibraryEntry>> entries_for(const std::optional<uuids::uuid>& scope) const {
+        auto entries = entry_snapshot();
+        if (scope) std::erase_if(entries, [&](const auto& entry) { return entry->uuid != *scope; });
+        return entries;
+    }
+
+    std::vector<std::shared_ptr<LibraryEntry>> entry_snapshot() const {
         std::lock_guard lock(libraries_mutex);
-        std::vector<std::shared_ptr<catalog::Library>> snapshot;
-        for (const auto& [key, library] : libraries)
-            snapshot.push_back(library);
+        std::vector<std::shared_ptr<LibraryEntry>> snapshot;
+        snapshot.reserve(libraries.size());
+        for (const auto& [key, entry] : libraries)
+            snapshot.push_back(entry);
         return snapshot;
     }
 
-    std::shared_ptr<catalog::Library> find(const uuids::uuid& uuid) const {
+    std::shared_ptr<LibraryEntry> find(const uuids::uuid& uuid) const {
         std::lock_guard lock(libraries_mutex);
         const auto found = libraries.find(uuids::to_string(uuid));
         return found == libraries.end() ? nullptr : found->second;
@@ -74,18 +217,20 @@ struct Application::State {
     /// Absolute folder of a root: managed roots live inside the library, referenced roots use
     /// the machine-local binding.
     std::optional<std::filesystem::path> root_folder(const catalog::Library& library, const uuids::uuid& root,
-                                                     catalog::RootMode mode) {
+                                                     catalog::RootMode mode) const {
         if (mode == catalog::RootMode::Managed) return library.directory() / "media" / uuids::to_string(root);
         return workspace.root_binding(library.uuid(), root);
     }
 
-    Result<std::filesystem::path> resolve(catalog::Library& library, std::int64_t sample_id) {
+    Result<std::filesystem::path> resolve(catalog::Library& library, std::int64_t sample_id) const {
         auto detail = library.sample_detail(sample_id);
         if (!detail) return std::unexpected(detail.error());
         if (detail->deleted) return fail(ErrorCode::NotFound, "the sample was removed from the library");
         bool any_offline = false;
         for (const auto& location : detail->locations) {
             if (location.state == catalog::LocationState::Retired) continue;
+            // Never join a catalog path that could escape its root ("..", absolute, drive letters).
+            if (!is_safe_relative_path(location.relative_path)) continue;
             auto base = root_folder(library, location.root_uuid, location.root_mode);
             std::error_code error;
             if (!base || !std::filesystem::is_directory(*base, error)) {
@@ -100,58 +245,219 @@ struct Application::State {
         return fail(ErrorCode::FileMissing, "the file is no longer at its recorded location");
     }
 
-    /// Polls every bound root; availability flips are committed and announced.
-    void monitor_roots(std::stop_token stop) {
-        std::mutex sleep_mutex;
-        std::condition_variable_any sleeper;
+    // ------------------------------------------------------------ index maintenance
+
+    void wake_maintainer() {
+        {
+            std::lock_guard lock(maintenance_mutex);
+            maintenance_requested = true;
+        }
+        maintenance_wake.notify_all();
+    }
+
+    void request_update(LibraryEntry& entry) {
+        entry.update_requested.store(true, std::memory_order_release);
+        wake_maintainer();
+    }
+
+    void queue_load(const std::shared_ptr<LibraryEntry>& entry) {
+        {
+            std::lock_guard lock(loads_mutex);
+            load_queue.push_back(entry);
+        }
+        loads_wake.notify_all();
+    }
+
+    /// Marks changes for the next coalesced CatalogChangedEvent.
+    void note_catalog_change(LibraryEntry& entry, const std::vector<std::int64_t>& sample_ids, bool structure_changed,
+                             bool full_reload) {
+        {
+            std::lock_guard lock(entry.announcement_mutex);
+            auto& pending = entry.pending;
+            pending.catalog_pending = true;
+            pending.structure_changed = pending.structure_changed || structure_changed;
+            pending.full_reload = pending.full_reload || full_reload;
+            if (!pending.full_reload) {
+                pending.sample_ids.insert(pending.sample_ids.end(), sample_ids.begin(), sample_ids.end());
+                if (pending.sample_ids.size() > kMaximumEventSampleIds) pending.full_reload = true;
+            }
+            if (pending.full_reload) pending.sample_ids.clear();
+        }
+        wake_maintainer();
+    }
+
+    void note_analysis_status(LibraryEntry& entry, std::string status) {
+        {
+            std::lock_guard lock(entry.announcement_mutex);
+            entry.pending.analysis_status = std::move(status);
+        }
+        wake_maintainer();
+    }
+
+    /// Reports a background error once per distinct message and library.
+    void report_once(LibraryEntry& entry, std::string context, const Error& error) {
+        {
+            std::lock_guard lock(entry.announcement_mutex);
+            const auto message = context + ": " + error.message();
+            if (entry.pending.last_reported_error == message) return;
+            entry.pending.last_reported_error = message;
+        }
+        report(entry.uuid, std::move(context), error);
+    }
+
+    /// Brings one index up to date with its library's outbox (any thread).
+    void update_index(const std::shared_ptr<LibraryEntry>& entry) {
+        if (!entry->index) {
+            // Without an index nothing knows which rows changed: ask views to re-query.
+            note_catalog_change(*entry, {}, true, true);
+            return;
+        }
+        if (!entry->index->ready()) return;  // the loader catches up after the load
+        auto change = entry->index->synchronize(*entry->library);
+        if (!change) {
+            report_once(*entry, "updating the sample index", change.error());
+            return;
+        }
+        if (change->acknowledge_error)
+            report_once(*entry, "recording the sample index position", *change->acknowledge_error);
+        if (change->reload_required) {
+            queue_load(entry);
+            return;
+        }
+        if (!change->empty())
+            note_catalog_change(*entry, change->sample_ids, change->structure_changed, change->rows_added_or_removed);
+    }
+
+    /// Emits the coalesced events of one library that are due; returns when the next one is due.
+    std::optional<Clock::time_point> announce(LibraryEntry& entry, Clock::time_point now) {
+        std::optional<CatalogChangedEvent> catalog_event;
+        std::optional<std::string> analysis_status;
+        std::optional<Clock::time_point> next_due;
+        {
+            std::lock_guard lock(entry.announcement_mutex);
+            auto& pending = entry.pending;
+            if (pending.catalog_pending) {
+                if (now - pending.last_catalog_event >= Application::kEventInterval) {
+                    catalog_event = CatalogChangedEvent{entry.uuid, std::move(pending.sample_ids),
+                                                        pending.structure_changed, pending.full_reload};
+                    pending.sample_ids = {};
+                    pending.structure_changed = pending.full_reload = pending.catalog_pending = false;
+                    pending.last_catalog_event = now;
+                } else {
+                    next_due = pending.last_catalog_event + Application::kEventInterval;
+                }
+            }
+            if (pending.analysis_status) {
+                if (now - pending.last_analysis_event >= Application::kEventInterval) {
+                    analysis_status = std::move(pending.analysis_status);
+                    pending.analysis_status.reset();
+                    pending.last_analysis_event = now;
+                } else {
+                    const auto due = pending.last_analysis_event + Application::kEventInterval;
+                    next_due = next_due ? std::min(*next_due, due) : due;
+                }
+            }
+        }
+        if (catalog_event) {
+            std::ranges::sort(catalog_event->sample_ids);
+            catalog_event->sample_ids.erase(std::ranges::unique(catalog_event->sample_ids).begin(),
+                                            catalog_event->sample_ids.end());
+            emit(*catalog_event);
+        }
+        if (analysis_status) {
+            AnalysisProgressEvent event{entry.uuid, {}, std::move(*analysis_status)};
+            if (auto runs = entry.library->list_analysis_runs(kRunsPerProgressEvent))
+                event.runs = std::move(*runs);
+            else
+                report_once(entry, "listing analysis runs", runs.error());
+            emit(event);
+        }
+        return next_due;
+    }
+
+    /// Body of the index maintenance thread: incremental updates and coalesced announcements.
+    void maintain_indexes(std::stop_token stop) {
+        auto next_poll = Clock::now() + kIndexPollInterval;
         while (!stop.stop_requested()) {
-            check_roots_once();
-            std::unique_lock lock(sleep_mutex);
-            sleeper.wait_for(lock, stop, kRootPollInterval, [] { return false; });
+            std::optional<Clock::time_point> next_due;
+            // Exception barrier per pass: report and keep maintaining.
+            try {
+                auto now = Clock::now();
+                const bool poll = now >= next_poll;
+                if (poll) next_poll = now + kIndexPollInterval;
+                for (const auto& entry : entry_snapshot()) {
+                    if (entry->update_requested.exchange(false, std::memory_order_acq_rel) ||
+                        (poll && entry->index && entry->index->ready()))
+                        update_index(entry);
+                    if (auto due = announce(*entry, Clock::now()); due)
+                        next_due = next_due ? std::min(*next_due, *due) : *due;
+                }
+            } catch (const std::exception& exception) {
+                report(std::nullopt, "maintaining the sample indexes", internal_error("index maintenance", exception));
+            }
+            const auto wake_at = next_due ? std::min(*next_due, next_poll) : next_poll;
+            std::unique_lock lock(maintenance_mutex);
+            maintenance_wake.wait_until(lock, stop, wake_at, [&] { return maintenance_requested; });
+            maintenance_requested = false;
         }
     }
 
-    /// Compares each root's reachability with its catalog projection and commits changes.
-    void check_roots_once() {
-        for (const auto& library : library_snapshot()) {
-            if (library->read_only()) continue;
-            auto roots = library->list_roots();
-            if (!roots) continue;
-            const auto library_uuid = library->uuid();
-            for (const auto& root : *roots) {
-                auto folder = root_folder(*library, root.uuid, root.mode);
-                std::error_code error;
-                const bool reachable = folder && std::filesystem::is_directory(*folder, error);
-                const auto now = reachable ? catalog::Availability::Online : catalog::Availability::Offline;
-                if (now == root.availability || (root.availability == catalog::Availability::Unknown && reachable))
+    /// Body of the index loader thread: full loads (at open and when the outbox asks for one).
+    void load_indexes(std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            std::shared_ptr<LibraryEntry> entry;
+            {
+                std::unique_lock lock(loads_mutex);
+                loads_wake.wait(lock, stop, [&] { return !load_queue.empty(); });
+                if (stop.stop_requested()) return;
+                entry = load_queue.front().lock();
+                load_queue.pop_front();
+            }
+            if (!entry || !entry->index) continue;  // closed meanwhile
+            try {
+                auto loaded = entry->index->load(*entry->library, entry->closing.get_token());
+                if (!loaded) {
+                    if (loaded.error().code != ErrorCode::Cancelled)
+                        report(entry->uuid, "loading the sample index", loaded.error());
                     continue;
-                if (library->set_root_availability(root.id, now)) {
-                    emit(RootAvailabilityEvent{library_uuid, root.id, now});
-                    emit(CatalogChangedEvent{library_uuid});
                 }
+                update_index(entry);  // catch up with what was committed during the load
+                note_catalog_change(*entry, {}, true, true);
+            } catch (const std::exception& exception) {
+                report(entry->uuid, "loading the sample index", internal_error("index loader", exception));
             }
         }
     }
 };
 
+// ---------------------------------------------------------------- lifetime
+
 Application::Application(std::unique_ptr<State> state) : state_(std::move(state)) {}
 
 Application::~Application() {
-    // Stop admission first, then cancel and join background work, then close libraries.
-    state_->root_monitor = {};
-    state_->supervisor.reset();
-    std::vector<std::unique_ptr<RunningOperation>> finishing;
+    auto& state = *state_;
+    // 1. No new automatic work.
+    state.root_monitor = {};
+    // 2. Cancel and drain imports: they call into the supervisor and the indexes.
     {
-        std::lock_guard lock(state_->operations_mutex);
-        for (auto& [id, operation] : state_->operations) {
+        std::lock_guard lock(state.operations_mutex);
+        for (auto& [id, operation] : state.operations)
             operation->stop.request_stop();
-            finishing.push_back(std::move(operation));
-        }
-        state_->operations.clear();
     }
-    finishing.clear();  // joins the jthreads
-    std::lock_guard lock(state_->libraries_mutex);
-    state_->libraries.clear();
+    if (state.import_pool) {
+        state.import_pool->wait();
+        state.import_pool.reset();
+    }
+    // 3. Analysis (uses libraries and emits events).
+    state.supervisor.reset();
+    // 4. Index maintenance; abort loads in progress.
+    for (const auto& entry : state.entry_snapshot())
+        entry->closing.request_stop();
+    state.index_loader = {};
+    state.index_maintainer = {};
+    // 5. Libraries (each closes its catalog, then releases its lock).
+    std::lock_guard lock(state.libraries_mutex);
+    state.libraries.clear();
 }
 
 Result<std::unique_ptr<Application>> Application::start(const ApplicationOptions& options) {
@@ -161,46 +467,86 @@ Result<std::unique_ptr<Application>> Application::start(const ApplicationOptions
     std::unique_ptr<Application> application(new Application(std::move(state)));
     auto& shared = *application->state_;
 
-    if (options.reopen_libraries) {
-        for (const auto& known : shared.workspace.known_libraries()) {
-            if (!known.open) continue;
-            if (!application->open_library(known.directory)) (void)shared.workspace.set_library_open(known.uuid, false);
-        }
-    }
+    shared.import_pool = std::make_unique<BS::thread_pool<>>(std::max<std::size_t>(1, options.import_threads));
+    shared.index_loader = std::jthread([&shared](std::stop_token stop) { shared.load_indexes(stop); });
+    shared.index_maintainer = std::jthread([&shared](std::stop_token stop) { shared.maintain_indexes(stop); });
+
+    // The supervisor exists before any library opens, so the paused-after-crash check in
+    // open_library() applies to every library, including the ones reopened here.
     if (options.run_analysis_supervisor) {
         AnalysisSupervisor::Hooks hooks{
-            [&shared] { return shared.library_snapshot(); },
+            [&shared] {
+                std::vector<std::shared_ptr<catalog::Library>> libraries;
+                for (const auto& entry : shared.entry_snapshot())
+                    libraries.emplace_back(entry, entry->library.get());  // shares the entry's lifetime
+                return libraries;
+            },
             [&shared](catalog::Library& library, std::int64_t sample_id) { return shared.resolve(library, sample_id); },
             [&shared](catalog::Library& library, const std::string& status) {
-                AnalysisProgressEvent event{library.identity().uuid, {}, status};
-                if (auto runs = library.list_analysis_runs(20)) event.runs = std::move(*runs);
-                shared.emit(event);
-                shared.emit(CatalogChangedEvent{event.library});
+                if (auto entry = shared.find(library.uuid())) {
+                    shared.note_analysis_status(*entry, status);
+                    shared.request_update(*entry);
+                }
+            },
+            [&shared](catalog::Library* library, const std::string& context, const Error& error) {
+                shared.report(library ? std::optional(library->uuid()) : std::nullopt, context, error);
             }};
         shared.supervisor = std::make_unique<AnalysisSupervisor>(
             options.worker_executable.value_or(worker::default_worker_executable()), std::move(hooks));
-        // After an unclean shutdown, analysis stays paused until the user resumes it.
-        for (const auto& library : shared.library_snapshot())
-            if (library->recovery_report().interrupted_jobs > 0) shared.supervisor->set_paused(true);
     }
-    shared.owner = application.get();
-    if (options.automatic_mode) {
-        if (shared.library_snapshot().empty()) (void)application->default_library();
-        for (const auto& library : shared.library_snapshot()) {
-            if (library->read_only()) continue;
-            if (auto roots = library->list_roots())
-                for (const auto& root : *roots)
-                    (void)application->start_import(library->uuid(), root.id);
+
+    if (options.reopen_libraries) {
+        for (const auto& known : shared.workspace.known_libraries()) {
+            if (!known.open) continue;
+            if (auto opened = application->open_library(known.directory); !opened) {
+                shared.report(known.uuid, std::format("reopening '{}'", known.name), opened.error());
+                if (options.persist_open_libraries)
+                    if (auto closed = shared.workspace.set_library_open(known.uuid, false); !closed)
+                        shared.report(known.uuid, "updating the workspace", closed.error());
+            }
         }
     }
-    if (options.monitor_roots)
-        shared.root_monitor = std::jthread([&shared](std::stop_token stop) { shared.monitor_roots(stop); });
+    if (options.automatic_mode) {
+        if (shared.entry_snapshot().empty())
+            if (auto created = application->default_library(); !created)
+                shared.report(std::nullopt, "creating the default library", created.error());
+        for (const auto& entry : shared.entry_snapshot()) {
+            if (entry->library->read_only()) continue;
+            auto roots = entry->library->list_roots();
+            if (!roots) {
+                shared.report(entry->uuid, "listing sample folders", roots.error());
+                continue;
+            }
+            for (const auto& root : *roots)
+                if (auto started = application->start_import(entry->uuid, root.id); !started)
+                    shared.report(entry->uuid, std::format("rescanning '{}'", root.name), started.error());
+        }
+    }
+    if (options.monitor_roots) {
+        auto* owner = application.get();
+        shared.root_monitor = std::jthread([owner](std::stop_token stop) {
+            std::mutex sleep_mutex;
+            std::condition_variable_any sleeper;
+            while (!stop.stop_requested()) {
+                try {
+                    owner->refresh_root_availability();
+                } catch (const std::exception& exception) {
+                    owner->state_->report(std::nullopt, "checking sample folders",
+                                          internal_error("root monitor", exception));
+                }
+                std::unique_lock lock(sleep_mutex);
+                sleeper.wait_for(lock, stop, kRootPollInterval, [] { return false; });
+            }
+        });
+    }
     return application;
 }
 
 void Application::set_event_handler(EventHandler handler) {
-    std::lock_guard lock(state_->handler_mutex);
-    state_->handler = std::move(handler);
+    std::unique_lock lock(state_->handler_mutex);
+    state_->handler = std::make_shared<const EventHandler>(std::move(handler));
+    // Quiescence: once this returns, no call of the previous handler is still running.
+    if (event_handler_depth == 0) state_->handler_idle.wait(lock, [&] { return state_->emissions_in_flight == 0; });
 }
 
 Workspace& Application::workspace() {
@@ -210,15 +556,30 @@ Workspace& Application::workspace() {
 // ---------------------------------------------------------------- libraries
 
 namespace {
-OpenLibraryInfo describe(catalog::Library& library) {
-    const auto identity = library.identity();
-    const auto roots = library.list_roots();
-    return OpenLibraryInfo{identity.uuid, identity.name, library.directory(), library.read_only(),
-                           roots ? static_cast<std::int64_t>(roots->size()) : 0};
+/// The OpenLibraryInfo of an open library.
+OpenLibraryInfo describe(const catalog::Library& library, const uuids::uuid& uuid, const std::string& name,
+                         bool in_use_elsewhere, std::int64_t root_count) {
+    return OpenLibraryInfo{uuid, name, library.directory(), library.read_only(), in_use_elsewhere, root_count};
 }
 }  // namespace
 
+std::shared_ptr<catalog::Library> Application::hold_library(const uuids::uuid& library) const {
+    auto entry = state_->find(library);
+    if (!entry) return nullptr;
+    auto* pointer = entry->library.get();
+    return std::shared_ptr<catalog::Library>(std::move(entry), pointer);
+}
+
+void Application::request_index_update(const uuids::uuid& library) const {
+    if (auto entry = state_->find(library)) state_->request_update(*entry);
+}
+
 Result<OpenLibraryInfo> Application::create_library(const std::filesystem::path& directory, std::string_view name) {
+    {
+        std::lock_guard lock(state_->libraries_mutex);
+        if (state_->libraries.size() + state_->opening.size() >= kMaxOpenLibraries)
+            return fail(ErrorCode::ResourceLimit, "at most 8 libraries can be open at the same time");
+    }
     auto created = catalog::Library::create(directory, name);
     if (!created) return std::unexpected(created.error());
     created->reset();  // close; open_library() registers it like any other library
@@ -233,18 +594,14 @@ bool Application::is_library_folder(const std::filesystem::path& directory) {
 Result<OpenLibraryInfo> Application::create_library_in_workspace(std::string_view name) {
     const std::string trimmed = trim(name);
     if (trimmed.empty()) return fail(ErrorCode::InvalidArgument, "a library needs a name");
-    // Folder name: the library name without characters Windows forbids in file names.
-    std::string folder_name;
-    for (const char character : trimmed)
-        folder_name.push_back(std::string_view("<>:\"/\\|?*").find(character) == std::string_view::npos &&
-                                      static_cast<unsigned char>(character) >= 0x20
-                                  ? character
-                                  : '_');
+    const std::string folder_name = safe_folder_name(trimmed);
     const auto base = state_->workspace.directory() / "Libraries";
     std::error_code error;
     auto directory = base / path_from_utf8(folder_name);
     for (int suffix = 2; std::filesystem::exists(directory, error); ++suffix)
         directory = base / path_from_utf8(std::format("{} {}", folder_name, suffix));
+    if (error)
+        return fail(ErrorCode::AccessDenied, std::format("cannot inspect {}: {}", path_to_utf8(base), error.message()));
     return create_library(directory, trimmed);
 }
 
@@ -255,98 +612,213 @@ Result<OpenLibraryInfo> Application::default_library() {
 }
 
 Result<OpenLibraryInfo> Application::open_library(const std::filesystem::path& directory) {
+    auto& state = *state_;
     std::error_code error;
     const auto canonical = std::filesystem::weakly_canonical(directory, error);
-    auto opened = catalog::Library::open(error ? directory : canonical);
-    if (!opened) return std::unexpected(opened.error());
-    std::shared_ptr<catalog::Library> library = std::move(*opened);
-    const auto info = describe(*library);
+    const auto folder = error ? directory : canonical;
+
+    // 1. Identity first: refuse a duplicate or a ninth library before touching the catalog.
+    auto manifest_uuid = peek_library_uuid(folder);
+    if (!manifest_uuid) return std::unexpected(manifest_uuid.error());
+    const auto key = uuids::to_string(*manifest_uuid);
     {
-        std::lock_guard lock(state_->libraries_mutex);
-        if (state_->libraries.contains(uuids::to_string(info.uuid)))
+        std::lock_guard lock(state.libraries_mutex);
+        if (state.libraries.contains(key) || state.opening.contains(key))
             return fail(ErrorCode::InvalidArgument,
                         "a library with the same identity is already open (a copied library must be cloned first)");
-        if (state_->libraries.size() >= kMaxOpenLibraries)
+        if (state.libraries.size() + state.opening.size() >= kMaxOpenLibraries)
             return fail(ErrorCode::ResourceLimit, "at most 8 libraries can be open at the same time");
-        state_->libraries.emplace(uuids::to_string(info.uuid), std::move(library));
+        state.opening.insert(key);
     }
-    (void)state_->workspace.remember_library(KnownLibrary{info.uuid, info.name, info.directory, true});
-    state_->emit(CatalogChangedEvent{info.uuid});
-    if (state_->supervisor) state_->supervisor->notify();
+    /// Releases the reserved slot on every early return.
+    struct OpeningSlot {
+        State& state;
+        const std::string& key;
+        ~OpeningSlot() {
+            std::lock_guard lock(state.libraries_mutex);
+            state.opening.erase(key);
+        }
+    } slot{state, key};
+
+    // 2. The lock: only its holder may migrate, recover after a crash, or write.
+    auto entry = std::make_shared<LibraryEntry>();
+    entry->uuid = *manifest_uuid;
+    catalog::OpenOptions open_options;
+    if (auto lock = FileLock::try_acquire(folder / FileLock::kLibraryLockFileName); lock) {
+        entry->lock = std::move(*lock);
+    } else if (lock.error().code == ErrorCode::DbBusy) {
+        open_options.read_only = true;  // another process writes it: browse only, no recovery
+        entry->in_use_elsewhere = true;
+    } else if (lock.error().code == ErrorCode::AccessDenied) {
+        open_options.read_only = true;  // read-only media: the lock file cannot even be created
+    } else {
+        return std::unexpected(lock.error());
+    }
+
+    // 3. Open (migration and crash recovery run only on a writable open, i.e. with the lock).
+    auto opened = catalog::Library::open(folder, open_options);
+    if (!opened) return std::unexpected(opened.error());
+    if ((*opened)->uuid() != *manifest_uuid)
+        return fail(ErrorCode::DbCorrupt, "library.json changed while the library was being opened");
+    entry->library = std::move(*opened);
+    entry->name = entry->library->identity().name;
+    if (state.options.in_memory_index) entry->index = std::make_unique<SampleIndex>(entry->uuid);
+    auto roots = entry->library->list_roots();
+    const auto info = describe(*entry->library, entry->uuid, entry->name, entry->in_use_elsewhere,
+                               roots ? static_cast<std::int64_t>(roots->size()) : 0);
+
+    // 4. After an unclean shutdown analysis stays paused until the user resumes it; applied before
+    // the library becomes visible to the supervisor.
+    const bool interrupted_analysis =
+        !entry->library->read_only() && entry->library->recovery_report().interrupted_jobs > 0;
+    if (interrupted_analysis && state.supervisor) state.supervisor->set_paused(true);
+
+    {
+        std::lock_guard lock(state.libraries_mutex);
+        state.libraries.emplace(key, entry);
+    }
+    if (state.options.persist_open_libraries)
+        if (auto remembered =
+                state.workspace.remember_library(KnownLibrary{info.uuid, info.name, info.directory, true});
+            !remembered)
+            state.report(info.uuid, "remembering the library in the workspace", remembered.error());
+    if (entry->index) state.queue_load(entry);
+    state.note_catalog_change(*entry, {}, true, true);
+    if (interrupted_analysis) state.note_analysis_status(*entry, "paused after an unclean shutdown");
+    if (state.supervisor) state.supervisor->notify();
     return info;
 }
 
 Result<void> Application::close_library(const uuids::uuid& uuid) {
+    std::shared_ptr<LibraryEntry> entry;
     {
         std::lock_guard lock(state_->libraries_mutex);
-        if (state_->libraries.erase(uuids::to_string(uuid)) == 0)
-            return fail(ErrorCode::NotFound, "library is not open");
+        const auto found = state_->libraries.find(uuids::to_string(uuid));
+        if (found == state_->libraries.end()) return fail(ErrorCode::NotFound, "library is not open");
+        entry = std::move(found->second);
+        state_->libraries.erase(found);
     }
+    entry->closing.request_stop();
+    {
+        std::lock_guard lock(state_->operations_mutex);
+        for (auto& [id, operation] : state_->operations)
+            if (operation->library == uuid) operation->stop.request_stop();
+    }
+    entry.reset();  // destroyed here unless running work still holds it
+    if (!state_->options.persist_open_libraries) return {};
     return state_->workspace.set_library_open(uuid, false);
 }
 
 std::vector<OpenLibraryInfo> Application::libraries() const {
     std::vector<OpenLibraryInfo> infos;
-    for (const auto& library : state_->library_snapshot())
-        infos.push_back(describe(*library));
+    for (const auto& entry : state_->entry_snapshot()) {
+        auto roots = entry->library->list_roots();
+        infos.push_back(describe(*entry->library, entry->uuid, entry->name, entry->in_use_elsewhere,
+                                 roots ? static_cast<std::int64_t>(roots->size()) : 0));
+    }
     return infos;
-}
-
-catalog::Library* Application::library(const uuids::uuid& uuid) const {
-    return state_->find(uuid).get();
-}
-
-std::vector<catalog::Library*> Application::open_libraries() const {
-    std::vector<catalog::Library*> pointers;
-    for (const auto& library : state_->library_snapshot())
-        pointers.push_back(library.get());
-    return pointers;
 }
 
 // ---------------------------------------------------------------- roots
 
 Result<catalog::RootRecord> Application::add_root(const uuids::uuid& library_uuid, const std::filesystem::path& folder,
                                                   std::string_view name) {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
     std::error_code error;
     if (!std::filesystem::is_directory(folder, error)) return fail(ErrorCode::FileMissing, "the folder does not exist");
-    const auto absolute = std::filesystem::absolute(folder, error);
+    const auto canonical = std::filesystem::canonical(folder, error);
+    if (error) return fail(ErrorCode::AccessDenied, std::format("cannot resolve the folder: {}", error.message()));
+    for (const auto& binding : state_->workspace.root_bindings(library_uuid)) {
+        std::error_code ignored;  // an unreachable binding simply cannot be the same folder
+        if (std::filesystem::equivalent(binding.path, canonical, ignored))
+            return fail(ErrorCode::InvalidArgument, "this folder is already a sample folder of the library");
+    }
     std::string root_name = trim(name);
     if (root_name.empty())
-        root_name = path_to_utf8(absolute.filename().empty() ? absolute.parent_path().filename() : absolute.filename());
-    if (root_name.empty()) root_name = path_to_utf8(absolute);
-    auto root = library->add_root(root_name, catalog::RootMode::Referenced);
+        root_name =
+            path_to_utf8(canonical.filename().empty() ? canonical.parent_path().filename() : canonical.filename());
+    if (root_name.empty()) root_name = path_to_utf8(canonical);
+    // Location keys are exact on case-sensitive volumes, so the root records what its volume does.
+    auto case_sensitive = catalog::detect_case_sensitivity(canonical);
+    if (!case_sensitive) return std::unexpected(case_sensitive.error());
+    auto root = entry->library->add_root(root_name, catalog::RootMode::Referenced, *case_sensitive);
     if (!root) return std::unexpected(root.error());
-    if (auto bound = state_->workspace.bind_root(RootBinding{library_uuid, root->uuid, absolute}); !bound)
-        return std::unexpected(bound.error());
-    (void)library->set_root_availability(root->id, catalog::Availability::Online);
-    state_->emit(CatalogChangedEvent{library_uuid});
+    // The catalog has no root removal; a root whose binding failed stays and can be rebound.
+    if (auto bound = state_->workspace.bind_root(RootBinding{library_uuid, root->uuid, canonical}); !bound)
+        return fail(bound.error().code,
+                    std::format("the folder was added as root {} but could not be bound on this computer ({}); "
+                                "rebind it to use it",
+                                root->id, bound.error().message()));
+    if (auto online = entry->library->set_root_availability(root->id, catalog::Availability::Online); !online) {
+        state_->report(library_uuid, "marking a new sample folder online", online.error());
+    } else {
+        root->availability = catalog::Availability::Online;
+        state_->emit(RootAvailabilityEvent{library_uuid, root->id, catalog::Availability::Online});
+    }
+    state_->request_update(*entry);
     return root;
 }
 
 Result<void> Application::rebind_root(const uuids::uuid& library_uuid, std::int64_t root_id,
                                       const std::filesystem::path& folder) {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
-    auto roots = library->list_roots();
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    auto roots = entry->library->list_roots();
     if (!roots) return std::unexpected(roots.error());
     const auto root = std::ranges::find(*roots, root_id, &catalog::RootRecord::id);
     if (root == roots->end()) return fail(ErrorCode::NotFound, "no such root");
     std::error_code error;
     if (!std::filesystem::is_directory(folder, error)) return fail(ErrorCode::FileMissing, "the folder does not exist");
-    return state_->workspace.bind_root(RootBinding{library_uuid, root->uuid, std::filesystem::absolute(folder, error)});
+    const auto canonical = std::filesystem::canonical(folder, error);
+    if (error) return fail(ErrorCode::AccessDenied, std::format("cannot resolve the folder: {}", error.message()));
+    for (const auto& binding : state_->workspace.root_bindings(library_uuid)) {
+        std::error_code ignored;  // an unreachable binding simply cannot be the same folder
+        if (binding.root != root->uuid && std::filesystem::equivalent(binding.path, canonical, ignored))
+            return fail(ErrorCode::InvalidArgument, "this folder is already another sample folder of the library");
+    }
+    if (auto bound = state_->workspace.bind_root(RootBinding{library_uuid, root->uuid, canonical}); !bound)
+        return bound;
+    refresh_root_availability();
+    return {};
 }
 
 std::optional<std::filesystem::path> Application::root_path(const uuids::uuid& library_uuid,
                                                             const catalog::RootRecord& root) const {
-    auto library = state_->find(library_uuid);
-    if (!library) return std::nullopt;
-    return state_->root_folder(*library, root.uuid, root.mode);
+    auto entry = state_->find(library_uuid);
+    if (!entry) return std::nullopt;
+    return state_->root_folder(*entry->library, root.uuid, root.mode);
 }
 
 void Application::refresh_root_availability() {
-    state_->check_roots_once();
+    auto& state = *state_;
+    for (const auto& entry : state.entry_snapshot()) {
+        if (entry->library->read_only()) continue;
+        auto roots = entry->library->list_roots();
+        if (!roots) {
+            state.report_once(*entry, "listing sample folders", roots.error());
+            continue;
+        }
+        for (const auto& root : *roots) {
+            auto folder = state.root_folder(*entry->library, root.uuid, root.mode);
+            std::error_code error;
+            const bool reachable = folder && std::filesystem::is_directory(*folder, error);
+            const auto now = reachable ? catalog::Availability::Online : catalog::Availability::Offline;
+            if (now == root.availability || (root.availability == catalog::Availability::Unknown && reachable))
+                continue;
+            if (auto changed = entry->library->set_root_availability(root.id, now); !changed) {
+                state.report_once(*entry, std::format("updating the availability of '{}'", root.name), changed.error());
+                continue;
+            }
+            state.emit(RootAvailabilityEvent{entry->uuid, root.id, now});
+            state.request_update(*entry);
+            // Desktop: a folder that comes back is rescanned (files may have changed while away).
+            if (state.options.automatic_mode && now == catalog::Availability::Online)
+                if (auto started = start_import(entry->uuid, root.id);
+                    !started && started.error().code != ErrorCode::DbBusy)
+                    state.report(entry->uuid, std::format("rescanning '{}'", root.name), started.error());
+        }
+    }
 }
 
 // ---------------------------------------------------------------- import
@@ -354,55 +826,78 @@ void Application::refresh_root_availability() {
 Result<files::ImportSummary> Application::import_now(const uuids::uuid& library_uuid, std::int64_t root_id,
                                                      std::stop_token stop,
                                                      const files::ImportProgressCallback& progress) {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
-    auto roots = library->list_roots();
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    auto roots = entry->library->list_roots();
     if (!roots) return std::unexpected(roots.error());
     const auto root = std::ranges::find(*roots, root_id, &catalog::RootRecord::id);
-    if (root == roots->end()) return fail(ErrorCode::NotFound, "no such root");
-    auto folder = state_->root_folder(*library, root->uuid, root->mode);
+    if (root == roots->end()) return fail(ErrorCode::NotFound, std::format("the library has no root {}", root_id));
+    auto folder = state_->root_folder(*entry->library, root->uuid, root->mode);
     if (!folder) return fail(ErrorCode::SourceOffline, "this root is not bound to a folder on this computer");
-    auto summary = files::import_root(*library, root_id, *folder, stop, progress);
-    state_->emit(CatalogChangedEvent{library_uuid});
+    auto* state = state_.get();
+    auto summary =
+        files::import_root(*entry->library, root_id, *folder, stop, [&](const files::ImportProgress& current) {
+            if (progress) progress(current);
+            state->request_update(*entry);  // committed batches reach the index
+        });
+    state->request_update(*entry);
     return summary;
 }
 
 Result<OperationId> Application::start_import(const uuids::uuid& library_uuid, std::int64_t root_id) {
-    if (!state_->find(library_uuid)) return fail(ErrorCode::NotFound, "library is not open");
+    auto& state = *state_;
+    if (!state.find(library_uuid)) return fail(ErrorCode::NotFound, "library is not open");
+    const auto import_key = std::format("{}/{}", uuids::to_string(library_uuid), root_id);
     {
-        std::lock_guard lock(state_->imports_mutex);
-        if (!state_->imports_in_flight.insert(std::format("{}/{}", uuids::to_string(library_uuid), root_id)).second)
+        std::lock_guard lock(state.imports_mutex);
+        if (!state.imports_in_flight.insert(import_key).second)
             return fail(ErrorCode::DbBusy, "this folder is already being scanned", /*retryable=*/true);
     }
-    auto operation = std::make_unique<RunningOperation>();
+    auto operation = std::make_shared<State::Operation>();
     operation->description = "Import";
+    operation->library = library_uuid;
     OperationId id = 0;
     {
-        std::lock_guard lock(state_->operations_mutex);
-        id = state_->next_operation++;
+        // Registered before it is queued, so a cancel right after this returns is never lost.
+        std::lock_guard lock(state.operations_mutex);
+        id = state.next_operation++;
+        state.operations.emplace(id, operation);
     }
-    auto* raw = operation.get();
-    auto stop = raw->stop.get_token();
-    auto* shared = state_.get();
-    auto* application = this;
-    raw->thread = std::jthread([=](std::stop_token) {
-        auto result = application->import_now(library_uuid, root_id, stop, [=](const files::ImportProgress& progress) {
-            shared->emit(ImportProgressEvent{id, library_uuid, root_id, progress});
-            shared->emit(CatalogChangedEvent{library_uuid});
-        });
-        OperationFinishedEvent finished{id, "Import", std::nullopt};
-        if (!result)
-            finished.error = result.error();
-        else if (shared->options.automatic_mode)
-            application->queue_automatic_analysis(library_uuid, root_id);
-        {
-            std::lock_guard lock(shared->imports_mutex);
-            shared->imports_in_flight.erase(std::format("{}/{}", uuids::to_string(library_uuid), root_id));
+    state.import_pool->detach_task([this, operation, id, library_uuid, root_id, import_key] {
+        auto& shared = *state_;
+        OperationFinishedEvent finished{id, operation->description, std::nullopt};
+        // Exception barrier: a throw is reported as the operation's error.
+        try {
+            const auto stop = operation->stop.get_token();
+            if (stop.stop_requested()) {
+                finished.error = Error{ErrorCode::Cancelled, false, "import cancelled", {}, {}};
+            } else {
+                auto result = import_now(library_uuid, root_id, stop, [&](const files::ImportProgress& progress) {
+                    shared.emit(ImportProgressEvent{id, library_uuid, root_id, progress});
+                });
+                if (!result)
+                    finished.error = result.error();
+                else if (shared.options.automatic_mode && !stop.stop_requested())
+                    queue_automatic_analysis(library_uuid, root_id);
+            }
+        } catch (const std::exception& exception) {
+            finished.error = internal_error("import", exception);
         }
-        shared->emit(finished);
+        {
+            std::lock_guard lock(shared.imports_mutex);
+            shared.imports_in_flight.erase(import_key);
+        }
+        shared.emit(finished);
+        {
+            std::lock_guard lock(shared.operations_mutex);
+            shared.operations.erase(id);  // pruned as soon as it ends
+        }
+        {
+            std::lock_guard lock(operation->mutex);
+            operation->finished = true;
+        }
+        operation->finished_signal.notify_all();
     });
-    std::lock_guard lock(state_->operations_mutex);
-    state_->operations.emplace(id, std::move(operation));
     return id;
 }
 
@@ -413,79 +908,142 @@ void Application::cancel_operation(OperationId operation) {
 }
 
 void Application::wait_for_operation(OperationId operation) {
-    std::unique_ptr<RunningOperation> finished;
+    std::shared_ptr<State::Operation> running;
     {
         std::lock_guard lock(state_->operations_mutex);
         auto found = state_->operations.find(operation);
-        if (found == state_->operations.end()) return;
-        finished = std::move(found->second);
-        state_->operations.erase(found);
+        if (found == state_->operations.end()) return;  // unknown or already finished
+        running = found->second;
     }
-    if (finished->thread.joinable()) finished->thread.join();
+    std::unique_lock lock(running->mutex);
+    running->finished_signal.wait(lock, [&] { return running->finished; });
 }
 
-// ---------------------------------------------------------------- search and resolution
-
-namespace {
-std::vector<catalog::Library*> scoped_libraries(const std::vector<std::shared_ptr<catalog::Library>>& all,
-                                                const std::optional<uuids::uuid>& scope) {
-    std::vector<catalog::Library*> selected;
-    for (const auto& library : all)
-        if (!scope || library->identity().uuid == *scope) selected.push_back(library.get());
-    return selected;
-}
-}  // namespace
+// ---------------------------------------------------------------- search, rows and edits
 
 Result<search::SearchPage> Application::search(const search::SearchRequest& request,
-                                               std::optional<uuids::uuid> scope) const {
-    const auto snapshot = state_->library_snapshot();  // keeps libraries alive during the call
-    const auto selected = scoped_libraries(snapshot, scope);
+                                               std::optional<uuids::uuid> only_library) const {
+    const auto entries = state_->entries_for(only_library);  // keeps them alive
+    const bool indexed =
+        !entries.empty() && SampleIndex::serves(request) &&
+        std::ranges::all_of(entries, [](const auto& entry) { return entry->index && entry->index->ready(); });
+    if (indexed) {
+        std::vector<IndexedLibrary> sources;
+        for (const auto& entry : entries)
+            sources.push_back(IndexedLibrary{entry->index.get(), entry->library.get(), entry->name});
+        return search_indexes(sources, request);
+    }
+    std::vector<catalog::Library*> selected;
+    for (const auto& entry : entries)
+        selected.push_back(entry->library.get());
     return search::SearchService().search(selected, request);
 }
 
 Result<search::CountResult> Application::count(const search::SearchRequest& request,
-                                               std::optional<uuids::uuid> scope) const {
-    const auto snapshot = state_->library_snapshot();
-    const auto selected = scoped_libraries(snapshot, scope);
+                                               std::optional<uuids::uuid> only_library) const {
+    const auto entries = state_->entries_for(only_library);
+    const bool indexed = !entries.empty() && std::ranges::all_of(entries, [](const auto& entry) {
+        return entry->index && entry->index->ready();
+    });
+    if (indexed) {
+        std::vector<IndexedLibrary> sources;
+        for (const auto& entry : entries)
+            sources.push_back(IndexedLibrary{entry->index.get(), entry->library.get(), entry->name});
+        return count_indexes(sources, request);
+    }
+    std::vector<catalog::Library*> selected;
+    for (const auto& entry : entries)
+        selected.push_back(entry->library.get());
     return search::SearchService().count(selected, request);
+}
+
+std::vector<search::SampleRow> Application::rows(const std::vector<SampleKey>& keys) const {
+    std::map<uuids::uuid, std::vector<std::int64_t>> by_library;
+    for (const auto& key : keys)
+        by_library[key.library].push_back(key.sample_id);
+    std::vector<search::SampleRow> found;
+    for (const auto& [library, sample_ids] : by_library) {
+        auto entry = state_->find(library);
+        if (!entry) continue;
+        if (entry->index && entry->index->ready()) {
+            auto rows = entry->index->rows(sample_ids);
+            std::ranges::move(rows, std::back_inserter(found));
+        } else if (auto rows = search::load_rows(*entry->library, sample_ids); rows) {
+            std::ranges::move(*rows, std::back_inserter(found));
+        } else {
+            state_->report_once(*entry, "reading sample rows", rows.error());
+        }
+    }
+    return found;
+}
+
+std::vector<IndexedFolder> Application::folders(const uuids::uuid& library, std::int64_t root_id) const {
+    auto entry = state_->find(library);
+    if (!entry || !entry->index || !entry->index->ready()) return {};
+    return entry->index->folders(root_id);
+}
+
+bool Application::index_ready(const uuids::uuid& library) const {
+    auto entry = state_->find(library);
+    return entry && entry->index && entry->index->ready();
+}
+
+Result<catalog::MutationReceipt> Application::mutate_and_patch(
+    const uuids::uuid& library, const std::function<Result<catalog::MutationReceipt>(catalog::Library&)>& mutate) {
+    auto entry = state_->find(library);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    auto receipt = mutate(*entry->library);
+    // Patch the index on this thread right after the commit: rows() reflects the edit when this
+    // returns, before the coalesced event goes out.
+    if (receipt) state_->update_index(entry);
+    return receipt;
+}
+
+Result<catalog::MutationReceipt> Application::apply_edit(const uuids::uuid& library,
+                                                         const catalog::EditCommand& command) {
+    return mutate_and_patch(library, [&](catalog::Library& opened) { return opened.apply_edit(command); });
+}
+
+Result<catalog::MutationReceipt> Application::apply_taxonomy(const uuids::uuid& library,
+                                                             const catalog::TaxonomyCommand& command) {
+    return mutate_and_patch(library, [&](catalog::Library& opened) { return opened.apply_taxonomy(command); });
+}
+
+Result<catalog::MutationReceipt> Application::undo(const uuids::uuid& library, const uuids::uuid& operation) {
+    return mutate_and_patch(library, [&](catalog::Library& opened) { return opened.undo(operation); });
+}
+
+Result<catalog::MutationReceipt> Application::redo(const uuids::uuid& library, const uuids::uuid& operation) {
+    return mutate_and_patch(library, [&](catalog::Library& opened) { return opened.redo(operation); });
 }
 
 Result<std::filesystem::path> Application::resolve_playable_path(const uuids::uuid& library_uuid,
                                                                  std::int64_t sample_id) const {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
-    return state_->resolve(*library, sample_id);
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    return state_->resolve(*entry->library, sample_id);
 }
 
 // ---------------------------------------------------------------- analysis
 
 std::string Application::automatic_analysis_profile() const {
-    const auto stored = state_->workspace.preference("analysis.automatic_profile");
-    return stored.is_string() ? stored.get<std::string>() : std::string("Full");
+    const auto stored = state_->workspace.preference(kAutomaticProfilePreference);
+    return stored.is_string() ? stored.get<std::string>() : std::string(kDefaultAutomaticProfile);
 }
 
-void Application::set_automatic_analysis_profile(std::string_view profile) {
-    (void)state_->workspace.set_preference("analysis.automatic_profile", std::string(profile));
+Result<void> Application::set_automatic_analysis_profile(std::string_view profile) {
+    if (!profile.empty() && profile_stages(profile).empty())
+        return fail(ErrorCode::InvalidArgument, std::format("unknown analysis profile '{}'", profile));
+    return state_->workspace.set_preference(kAutomaticProfilePreference, std::string(profile));
 }
 
 void Application::queue_automatic_analysis(const uuids::uuid& library_uuid, std::int64_t root_id) {
     const std::string profile = automatic_analysis_profile();
     if (profile.empty()) return;
-    // Every sample of the folder: the run skips samples whose results are already current, so
-    // only what this import added or changed is actually analyzed.
-    std::vector<std::int64_t> samples;
-    search::SearchRequest request{.scope = {.root_id = root_id},
-                                  .sort = search::SortField::Added,
-                                  .page_size = search::SearchService::kMaxPageSize};
-    while (true) {
-        auto page = search(request, library_uuid);
-        if (!page) return;
-        for (const auto& row : page->rows)
-            samples.push_back(row.sample_id);
-        if (!page->next) break;
-        request.cursor = page->next;
-    }
-    if (!samples.empty()) (void)start_analysis(library_uuid, profile, samples, /*force=*/false);
+    // Every sample of the folder, set-based in the catalog: the run skips samples whose results are
+    // already current, so only what this import added or changed is actually analyzed.
+    if (auto run = start_root_analysis(library_uuid, root_id, profile, /*force=*/false); !run)
+        state_->report(library_uuid, "queueing automatic analysis", run.error());
 }
 
 std::vector<std::string> Application::profile_stages(std::string_view profile) {
@@ -500,32 +1058,48 @@ Result<catalog::Library::AnalysisRunStatus> Application::start_analysis(const uu
                                                                         std::string_view profile,
                                                                         const std::vector<std::int64_t>& sample_ids,
                                                                         bool force) {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
     auto stages = profile_stages(profile);
     if (stages.empty()) return fail(ErrorCode::InvalidArgument, std::format("unknown analysis profile '{}'", profile));
-    auto run = library->create_analysis_run({std::string(profile), std::move(stages), sample_ids, force});
+    auto run = entry->library->create_analysis_run({std::string(profile), std::move(stages), sample_ids, force});
+    if (run && state_->supervisor) state_->supervisor->notify();
+    return run;
+}
+
+Result<catalog::Library::AnalysisRunStatus> Application::start_root_analysis(const uuids::uuid& library_uuid,
+                                                                             std::int64_t root_id,
+                                                                             std::string_view profile, bool force) {
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    const auto stages = profile_stages(profile);
+    if (stages.empty()) return fail(ErrorCode::InvalidArgument, std::format("unknown analysis profile '{}'", profile));
+    auto run = entry->library->create_analysis_run_for_root(root_id, profile, stages, force);
     if (run && state_->supervisor) state_->supervisor->notify();
     return run;
 }
 
 Result<void> Application::control_analysis(const uuids::uuid& library_uuid, std::int64_t run_id,
                                            catalog::Library::RunControl control) {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
-    auto controlled = library->control_run(run_id, control);
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    auto controlled = entry->library->control_run(run_id, control);
     if (controlled && state_->supervisor) state_->supervisor->notify();
     return controlled;
 }
 
 void Application::set_analysis_paused(bool paused) {
-    if (!state_->supervisor) return;
-    state_->supervisor->set_paused(paused);
-    state_->supervisor->notify();
+    if (state_->supervisor) state_->supervisor->set_paused(paused);
 }
 
 bool Application::analysis_paused() const {
     return state_->supervisor ? state_->supervisor->paused() : true;
+}
+
+AnalysisQueueStatus Application::analysis_status() const {
+    if (!state_->supervisor) return AnalysisQueueStatus{true, false, "analysis is not running in this session"};
+    const auto status = state_->supervisor->status();
+    return AnalysisQueueStatus{status.paused, status.worker_unavailable, status.detail};
 }
 
 // ---------------------------------------------------------------- export
@@ -533,12 +1107,15 @@ bool Application::analysis_paused() const {
 Result<ExportSummary> Application::export_metadata(const uuids::uuid& library_uuid,
                                                    const std::filesystem::path& destination,
                                                    const ExportOptions& options, std::stop_token stop) const {
-    auto library = state_->find(library_uuid);
-    if (!library) return fail(ErrorCode::NotFound, "library is not open");
-    auto* shared = state_.get();
+    auto entry = state_->find(library_uuid);
+    if (!entry) return fail(ErrorCode::NotFound, "library is not open");
+    const auto* shared = state_.get();
+    const auto* library = entry->library.get();
     return write_metadata_export(
-        *library, destination, options,
-        [shared, library_uuid](const uuids::uuid& root) { return shared->workspace.root_binding(library_uuid, root); },
+        *entry->library, destination, options,
+        [shared, library](const uuids::uuid& root, catalog::RootMode mode) {
+            return shared->root_folder(*library, root, mode);
+        },
         stop);
 }
 

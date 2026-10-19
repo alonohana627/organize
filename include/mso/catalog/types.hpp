@@ -20,19 +20,25 @@ enum class Availability { Online, Offline, Unknown, Denied };
 /// State of one file occurrence.
 enum class LocationState { Present, Missing, Unknown, Denied, Changed, Retired };
 
+/// Stored text of a root mode ("referenced", "managed").
 std::string_view to_string(RootMode mode) noexcept;
+/// Stored text of an availability ("online", "offline", "unknown", "denied").
 std::string_view to_string(Availability availability) noexcept;
+/// Stored text of a location state ("present", "missing", …).
 std::string_view to_string(LocationState state) noexcept;
+/// Parses stored root-mode text; nullopt for anything else.
 std::optional<RootMode> parse_root_mode(std::string_view text) noexcept;
+/// Parses stored availability text; nullopt for anything else.
 std::optional<Availability> parse_availability(std::string_view text) noexcept;
+/// Parses stored location-state text; nullopt for anything else.
 std::optional<LocationState> parse_location_state(std::string_view text) noexcept;
 
 /// Identity and revision of an open library.
 struct LibraryIdentity {
-    uuids::uuid uuid;
-    std::string name;
-    int schema_version = 0;
-    std::int64_t catalog_revision = 0;
+    uuids::uuid uuid;                   ///< immutable library identity
+    std::string name;                   ///< display name stored in the catalog
+    int schema_version = 0;             ///< applied catalog schema version
+    std::int64_t catalog_revision = 0;  ///< latest revision committed or observed by this process
 };
 
 /// A source directory registered in the library. Its absolute path is a machine-local binding
@@ -46,6 +52,9 @@ struct RootRecord {
     std::int64_t scan_generation = 0;
     std::optional<std::int64_t> last_seen_at;
     std::int64_t sample_count = 0;
+    /// File names on this root differ by case ("Kick.wav" ≠ "kick.wav"); location keys are then exact
+    /// paths instead of case-folded ones (see root_paths.hpp).
+    bool case_sensitive = false;
 };
 
 /// A folder below a root, for folder navigation.
@@ -104,9 +113,10 @@ struct ScannedFile {
     std::int64_t byte_size = 0;
     std::int64_t mtime_ns = 0;
     std::optional<std::string> volume_id;  ///< volume serial, hex
-    std::optional<std::string> file_id;    ///< 128-bit file id, hex
+    std::optional<std::string> file_id;    ///< 128-bit file id as 16 raw bytes (stored as a BLOB)
     std::optional<ObservedMetadata> metadata;
-    std::optional<ErrorCode> probe_error;  ///< probe failed: record stays searchable by name/path
+    std::optional<ErrorCode> probe_error;  ///< probe failed: recorded as a `probe_error` observation;
+                                           ///< the record stays searchable by name/path
 };
 
 /// Handle for a running scan of one root.
@@ -121,13 +131,14 @@ struct ScanBatchOutcome {
     std::int64_t added = 0;
     std::int64_t updated = 0;  ///< content possibly changed: revision bumped, analysis invalidated
     std::int64_t unchanged = 0;
-    std::int64_t relinked = 0;  ///< same-volume rename recognized by file identity
+    std::int64_t relinked = 0;        ///< same-volume rename recognized by file identity
+    std::int64_t rejected_paths = 0;  ///< unsafe or invalid-UTF-8 relative paths that were not stored
 };
 
 /// Result of finishing a scan.
 struct ScanFinishOutcome {
-    std::int64_t marked_missing = 0;
-    bool complete_coverage = false;
+    std::int64_t marked_missing = 0;  ///< unseen locations outside denied/failed subtrees, now missing
+    bool complete_coverage = false;   ///< no directory of the scan was denied or failed
 };
 
 /// One file occurrence of a sample.
@@ -158,7 +169,9 @@ struct ObservationRecord {
 
 /// Override state for user-editable musical facts (BPM, key).
 enum class OverrideState { Automatic, Value, Unknown };
+/// Stored text of an override state ("auto", "value", "unknown").
 std::string_view to_string(OverrideState state) noexcept;
+/// Parses stored override-state text; nullopt for anything else.
 std::optional<OverrideState> parse_override_state(std::string_view text) noexcept;
 
 /// Everything the inspector shows about one sample.
@@ -206,6 +219,17 @@ struct MutationReceipt {
     std::int64_t skipped = 0;
     std::int64_t conflicted = 0;
     bool replayed = false;  ///< the same operation was already committed; stored receipt returned
+    /// Only part of the request was applied (a chunk failed and the action could not be resumed
+    /// because later history exists). Never reported together with a complete result.
+    bool partial = false;
+};
+
+/// Committed changes after a revision, read from catalog_outbox (Library::changes_since).
+struct ChangeSet {
+    std::int64_t revision = 0;             ///< latest revision covered
+    std::vector<std::int64_t> sample_ids;  ///< samples whose row data may have changed (deduplicated)
+    bool structure_changed = false;        ///< roots/folders/tags/categories/collections changed
+    bool full_reload = false;              ///< too many changes, or history gap: reload everything
 };
 
 /// One user-visible history entry.
@@ -213,7 +237,7 @@ struct HistoryEntry {
     std::int64_t id = 0;
     uuids::uuid uuid;
     std::string label;
-    std::string state;  ///< applied, partial, undone, superseded, conflict
+    std::string state;  ///< applied, partial, undone, conflict (superseded entries are not listed)
     std::int64_t created_at = 0;
     bool is_cursor = false;  ///< the next Undo would revert this action
 };
@@ -222,10 +246,10 @@ struct HistoryEntry {
 struct ReviewItem {
     std::int64_t id = 0;
     uuids::uuid uuid;
-    std::string kind;
+    std::string kind;  ///< history_conflict, ambiguous_relink, possible_move, content_changed
     std::optional<std::int64_t> sample_id;
-    std::string evidence_json;
-    std::string state;
+    std::string evidence_json;  ///< kind-specific JSON evidence
+    std::string state;          ///< open, accepted, rejected, resolved
     std::int64_t created_at = 0;
 };
 

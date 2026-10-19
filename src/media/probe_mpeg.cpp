@@ -1,9 +1,12 @@
 // MPEG audio (MP3/MP2/MP1) and ADTS AAC metadata probe.
 #include <algorithm>
+#include <optional>
+#include <vector>
 
-#include "mso/media/id3.hpp"
-#include "mso/media/mpeg_audio_header.hpp"
-#include "mso/media/probe_formats.hpp"
+#include "mso/media/detail/ape_tag.hpp"
+#include "mso/media/detail/id3.hpp"
+#include "mso/media/detail/mpeg_audio_header.hpp"
+#include "mso/media/detail/probe_formats.hpp"
 
 namespace mso::media::detail {
 
@@ -19,6 +22,7 @@ constexpr std::size_t kLameDelayOffset = 21;  // encoder string(9), revision, lo
 constexpr std::size_t kVbriOffset = 4 + 32;   // fixed position after the header in the first frame
 constexpr std::int64_t kMicrosecondsPerSecond = 1'000'000;
 
+/// The big-endian 32-bit word at `offset` (0 when the span is too short).
 std::uint32_t header_word_at(Bytes bytes, std::size_t offset) {
     ByteCursor cursor(bytes.subspan(offset));
     return cursor.u32_be();
@@ -111,21 +115,38 @@ Result<std::optional<LocatedFrame>> find_first_frame(BoundedFileReader& reader, 
     return std::optional<LocatedFrame>{};
 }
 
+/// Codec name of an MPEG audio layer.
 std::string_view layer_codec(int layer) noexcept {
     if (layer == 1) return "mp1";
     if (layer == 2) return "mp2";
     return "mp3";
 }
 
-/// Reads a trailing ID3v1 tag; true when one is present. Budget exhaustion marks the result partial.
-bool read_trailing_id3v1(BoundedFileReader& reader, std::uint64_t audio_start, ProbeResult& result) {
-    if (reader.file_size() < audio_start + kId3v1TagSize) return false;
-    auto tail = reader.read_within_budget(reader.file_size() - kId3v1TagSize, kId3v1TagSize);
-    if (!tail || tail->size() != kId3v1TagSize) {
-        result.partial = true;
-        return false;
+/// Reads the tags at the end of the stream: an APEv2 tag and/or an ID3v1 tag (APE values win over
+/// ID3v1, whose fields are cut at 30 bytes). Returns where the audio data ends. Running out of
+/// budget marks the result partial instead of failing the probe.
+std::uint64_t read_trailing_tags(BoundedFileReader& reader, std::uint64_t audio_start, ProbeResult& result) {
+    std::uint64_t audio_end = reader.file_size();
+    std::optional<std::vector<std::uint8_t>> id3v1_tail;
+    if (reader.file_size() >= audio_start + kId3v1TagSize) {
+        auto tail = reader.read_within_budget(reader.file_size() - kId3v1TagSize, kId3v1TagSize);
+        if (!tail || tail->size() != kId3v1TagSize) {
+            result.partial = true;
+            return audio_end;
+        }
+        if (has_magic(*tail, 0, "TAG")) {
+            audio_end -= kId3v1TagSize;
+            id3v1_tail = std::move(*tail);
+        }
     }
-    return parse_id3v1(*tail, result.tags);
+    auto ape = read_ape_tag(reader, audio_end, result.tags);
+    if (!ape) {
+        result.partial = true;
+    } else if (*ape && **ape >= audio_start) {
+        audio_end = **ape;
+    }
+    if (id3v1_tail) parse_id3v1(*id3v1_tail, result.tags);
+    return audio_end;
 }
 
 }  // namespace
@@ -143,7 +164,7 @@ Result<void> probe_mpeg_audio(BoundedFileReader& reader, std::uint64_t search_of
 
     auto vbr = header.layer == 3 ? parse_xing_header(first.frame_bytes, header) : std::nullopt;
     if (!vbr) vbr = parse_vbri_header(first.frame_bytes);
-    const bool has_id3v1 = read_trailing_id3v1(reader, first.offset, result);
+    const std::uint64_t audio_end = read_trailing_tags(reader, first.offset, result);
 
     if (vbr && vbr->frame_count) {
         const std::uint64_t encoded = *vbr->frame_count * header.samples_per_frame;  // 32-bit count: no overflow
@@ -151,10 +172,11 @@ Result<void> probe_mpeg_audio(BoundedFileReader& reader, std::uint64_t search_of
         return {};
     }
     // No frame count: estimate from the first frame's bitrate. Never exact (VBR, junk, tags).
-    const std::uint64_t audio_end = reader.file_size() - (has_id3v1 ? kId3v1TagSize : 0);
+    // duration [us] = bytes * 8 [bits] / (kbps * 1000 [bits/s]) * 1e6 = bytes * 8000 / kbps.
     const std::uint64_t audio_bytes = audio_end > first.offset ? audio_end - first.offset : 0;
-    if (const auto bits = checked_multiply(audio_bytes, 8 * kMicrosecondsPerSecond / 1000)) {
-        result.duration_us = static_cast<std::int64_t>(*bits / static_cast<std::uint64_t>(header.bitrate_kbps));
+    if (const auto microsecond_kilobits = checked_multiply(audio_bytes, 8 * kMicrosecondsPerSecond / 1000)) {
+        result.duration_us =
+            static_cast<std::int64_t>(*microsecond_kilobits / static_cast<std::uint64_t>(header.bitrate_kbps));
     }
     result.duration_exact = false;
     return {};

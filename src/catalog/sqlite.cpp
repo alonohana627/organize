@@ -2,7 +2,7 @@
 
 #include <sqlite3.h>
 
-#include <chrono>
+#include <exception>
 #include <format>
 #include <random>
 #include <thread>
@@ -10,6 +10,41 @@
 #include "mso/domain/core.hpp"
 
 namespace mso::sqlite {
+
+namespace {
+
+/// SQL function `new_uuid()`: a fresh RFC 4122 v4 UUID from stduuid (mso::new_uuid) as canonical
+/// lowercase text, so set-based INSERT … SELECT statements can mint row identities.
+void new_uuid_sql_function(sqlite3_context* context, int /*argument_count*/, sqlite3_value** /*arguments*/) {
+    try {
+        const std::string text = uuids::to_string(new_uuid());
+        sqlite3_result_text(context, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
+    } catch (const std::exception& error) {
+        sqlite3_result_error(context, error.what(), -1);  // never let an exception cross the C boundary
+    }
+}
+
+/// Restores a connection's configured busy timeout when a scope that suspended it ends.
+class BusyTimeoutSuspension {
+public:
+    BusyTimeoutSuspension(sqlite3* handle, int configured_ms) : handle_(handle), configured_ms_(configured_ms) {
+        sqlite3_busy_timeout(handle_, 0);
+    }
+    ~BusyTimeoutSuspension() { sqlite3_busy_timeout(handle_, configured_ms_); }
+    BusyTimeoutSuspension(const BusyTimeoutSuspension&) = delete;
+    BusyTimeoutSuspension& operator=(const BusyTimeoutSuspension&) = delete;
+
+private:
+    sqlite3* handle_;
+    int configured_ms_;
+};
+
+bool is_busy(int result_code) {
+    const int primary_code = result_code & 0xFF;
+    return primary_code == SQLITE_BUSY || primary_code == SQLITE_LOCKED;
+}
+
+}  // namespace
 
 Error make_sqlite_error(sqlite3* connection, int result_code, std::string_view operation) {
     const int primary_code = result_code & 0xFF;
@@ -54,21 +89,25 @@ bool compiled_with(std::string_view option) {
 
 // ---------------------------------------------------------------- StatementCache
 sqlite3_stmt* StatementCache::take(std::string_view sql) {
-    const auto found = idle_.find(std::string(sql));
+    const auto found = idle_.find(sql);
     if (found == idle_.end()) return nullptr;
     sqlite3_stmt* statement = found->second;
     idle_.erase(found);
     return statement;
 }
 
-void StatementCache::give_back(std::string sql, sqlite3_stmt* statement) {
+void StatementCache::give_back(std::string sql, sqlite3_stmt* statement) noexcept {
     sqlite3_reset(statement);
     sqlite3_clear_bindings(statement);
     if (closed_ || idle_.size() >= kMaximumIdleStatements) {
         sqlite3_finalize(statement);
         return;
     }
-    idle_.emplace(std::move(sql), statement);
+    try {
+        idle_.emplace(std::move(sql), statement);
+    } catch (const std::bad_alloc&) {
+        sqlite3_finalize(statement);  // caching is an optimization; dropping the statement is safe
+    }
 }
 
 void StatementCache::clear() noexcept {
@@ -83,7 +122,10 @@ PreparedStatement::PreparedStatement(PreparedStatement&& other) noexcept
     : connection_(other.connection_),
       statement_(other.statement_),
       cache_(std::move(other.cache_)),
-      sql_(std::move(other.sql_)) {
+      sql_(std::move(other.sql_)),
+      bind_error_code_(other.bind_error_code_),
+      bind_error_parameter_(other.bind_error_parameter_),
+      last_step_error_code_(other.last_step_error_code_) {
     other.statement_ = nullptr;
 }
 
@@ -94,6 +136,9 @@ PreparedStatement& PreparedStatement::operator=(PreparedStatement&& other) noexc
         statement_ = other.statement_;
         cache_ = std::move(other.cache_);
         sql_ = std::move(other.sql_);
+        bind_error_code_ = other.bind_error_code_;
+        bind_error_parameter_ = other.bind_error_parameter_;
+        last_step_error_code_ = other.last_step_error_code_;
         other.statement_ = nullptr;
     }
     return *this;
@@ -112,35 +157,52 @@ void PreparedStatement::release() noexcept {
     statement_ = nullptr;
 }
 
+void PreparedStatement::remember_bind_result(int result_code, int parameter) noexcept {
+    if (result_code != SQLITE_OK && bind_error_code_ == 0) {
+        bind_error_code_ = result_code;
+        bind_error_parameter_ = parameter;
+    }
+}
+
 PreparedStatement& PreparedStatement::bind(int parameter, std::int64_t value) {
-    sqlite3_bind_int64(statement_, parameter, value);
+    remember_bind_result(sqlite3_bind_int64(statement_, parameter, value), parameter);
     return *this;
 }
 
 PreparedStatement& PreparedStatement::bind(int parameter, double value) {
-    sqlite3_bind_double(statement_, parameter, value);
+    remember_bind_result(sqlite3_bind_double(statement_, parameter, value), parameter);
     return *this;
 }
 
 PreparedStatement& PreparedStatement::bind(int parameter, std::string_view value) {
-    sqlite3_bind_text64(statement_, parameter, value.data(), value.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
+    remember_bind_result(
+        sqlite3_bind_text64(statement_, parameter, value.data(), value.size(), SQLITE_TRANSIENT, SQLITE_UTF8),
+        parameter);
     return *this;
 }
 
 PreparedStatement& PreparedStatement::bind_blob(int parameter, const void* data, std::size_t size) {
-    sqlite3_bind_blob64(statement_, parameter, data, size, SQLITE_TRANSIENT);
+    remember_bind_result(sqlite3_bind_blob64(statement_, parameter, data, size, SQLITE_TRANSIENT), parameter);
     return *this;
 }
 
 PreparedStatement& PreparedStatement::bind_null(int parameter) {
-    sqlite3_bind_null(statement_, parameter);
+    remember_bind_result(sqlite3_bind_null(statement_, parameter), parameter);
     return *this;
 }
 
 Result<bool> PreparedStatement::next_row() {
+    if (bind_error_code_ != 0) {
+        auto error =
+            make_sqlite_error(nullptr, bind_error_code_, std::format("bind parameter {}", bind_error_parameter_));
+        reset();
+        return std::unexpected(std::move(error));
+    }
+    last_step_error_code_ = 0;
     const int result_code = sqlite3_step(statement_);
     if (result_code == SQLITE_ROW) return true;
     if (result_code == SQLITE_DONE) return false;
+    last_step_error_code_ = result_code;
     auto error = make_sqlite_error(connection_, result_code, "step");
     sqlite3_reset(statement_);
     return std::unexpected(std::move(error));
@@ -156,9 +218,15 @@ Result<void> PreparedStatement::run() {
     return {};
 }
 
-void PreparedStatement::reset() {
+void PreparedStatement::reset() noexcept {
     sqlite3_reset(statement_);
     sqlite3_clear_bindings(statement_);
+    bind_error_code_ = 0;
+    bind_error_parameter_ = 0;
+}
+
+bool PreparedStatement::failed_on_unique_constraint() const noexcept {
+    return last_step_error_code_ == SQLITE_CONSTRAINT_UNIQUE || last_step_error_code_ == SQLITE_CONSTRAINT_PRIMARYKEY;
 }
 
 bool PreparedStatement::column_is_null(int column) const {
@@ -210,8 +278,8 @@ Connection& Connection::operator=(Connection&& other) noexcept {
         close();
         handle_ = other.handle_;
         cache_ = std::move(other.cache_);
+        busy_timeout_ms_ = other.busy_timeout_ms_;
         other.handle_ = nullptr;
-        other.cache_ = std::make_shared<StatementCache>();
     }
     return *this;
 }
@@ -223,13 +291,14 @@ Connection::~Connection() {
 void Connection::close() noexcept {
     if (cache_) cache_->clear();
     if (handle_) {
-        sqlite3_close_v2(handle_);
+        sqlite3_close_v2(handle_);  // deferred until outstanding statements are finalized
         handle_ = nullptr;
     }
 }
 
 Result<Connection> Connection::open(const std::filesystem::path& file, const ConnectionOptions& options) {
     Connection connection;
+    connection.busy_timeout_ms_ = options.busy_timeout_ms;
     int flags = SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_EXRESCODE;
     if (options.read_only) {
         flags |= SQLITE_OPEN_READONLY;
@@ -242,10 +311,16 @@ Result<Connection> Connection::open(const std::filesystem::path& file, const Con
     if (result_code != SQLITE_OK) {
         auto error = make_sqlite_error(connection.handle_, result_code, "open");
         connection.close();
-        if (!std::filesystem::exists(file)) error.code = ErrorCode::NotFound;
+        std::error_code exists_error;
+        if (!std::filesystem::exists(file, exists_error) && !exists_error) error.code = ErrorCode::NotFound;
         return std::unexpected(std::move(error));
     }
     sqlite3_busy_timeout(connection.handle_, options.busy_timeout_ms);
+    const int function_code =
+        sqlite3_create_function_v2(connection.handle_, "new_uuid", 0, SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr,
+                                   &new_uuid_sql_function, nullptr, nullptr, nullptr);
+    if (function_code != SQLITE_OK)
+        return std::unexpected(make_sqlite_error(connection.handle_, function_code, "register new_uuid()"));
 
     // Memory accounting stays simple: explicit page cache, no mmap, temp data on disk.
     std::string pragmas =
@@ -261,6 +336,7 @@ Result<Connection> Connection::open(const std::filesystem::path& file, const Con
 }
 
 Result<PreparedStatement> Connection::prepare(std::string_view sql) {
+    if (!handle_ || !cache_) return fail(ErrorCode::Internal, "prepare on a closed connection");
     if (sqlite3_stmt* cached = cache_->take(sql)) return PreparedStatement(handle_, cached, cache_, std::string(sql));
     sqlite3_stmt* statement = nullptr;
     const int result_code = sqlite3_prepare_v3(handle_, sql.data(), static_cast<int>(sql.size()),
@@ -272,6 +348,7 @@ Result<PreparedStatement> Connection::prepare(std::string_view sql) {
 }
 
 Result<void> Connection::execute_script(std::string_view sql) {
+    if (!handle_) return fail(ErrorCode::Internal, "execute on a closed connection");
     const std::string script(sql);
     char* message = nullptr;
     const int result_code = sqlite3_exec(handle_, script.c_str(), nullptr, nullptr, &message);
@@ -307,19 +384,28 @@ bool Connection::in_transaction() const {
     return handle_ && !sqlite3_get_autocommit(handle_);
 }
 
-Result<void> Connection::begin_immediate(int deadline_ms) {
+Result<void> Connection::begin_immediate(std::chrono::milliseconds deadline) {
+    if (!handle_) return fail(ErrorCode::Internal, "begin on a closed connection");
     using Clock = std::chrono::steady_clock;
-    const auto deadline = Clock::now() + std::chrono::milliseconds(deadline_ms);
+    const auto give_up_at = Clock::now() + deadline;
     static thread_local std::minstd_rand jitter(std::random_device{}());
+    // Our own jittered loop is the only wait: SQLite's busy handler would add its full timeout to
+    // every attempt and double the real wait.
+    const BusyTimeoutSuspension suspended(handle_, busy_timeout_ms_);
     while (true) {
         const int result_code = sqlite3_exec(handle_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
         if (result_code == SQLITE_OK) return {};
-        const int primary_code = result_code & 0xFF;
-        const bool busy = primary_code == SQLITE_BUSY || primary_code == SQLITE_LOCKED;
-        if (!busy || Clock::now() >= deadline)
+        if (!is_busy(result_code) || Clock::now() >= give_up_at)
             return std::unexpected(make_sqlite_error(handle_, result_code, "begin immediate"));
         std::this_thread::sleep_for(std::chrono::milliseconds(5 + jitter() % 20));
     }
+}
+
+Result<void> Connection::begin_deferred() {
+    if (!handle_) return fail(ErrorCode::Internal, "begin on a closed connection");
+    const int result_code = sqlite3_exec(handle_, "BEGIN", nullptr, nullptr, nullptr);
+    if (result_code != SQLITE_OK) return std::unexpected(make_sqlite_error(handle_, result_code, "begin"));
+    return {};
 }
 
 Result<void> Connection::commit() {
@@ -360,7 +446,9 @@ Result<std::vector<std::string>> Connection::foreign_key_violations() {
     return violations;
 }
 
-Result<void> Connection::backup_to(const std::filesystem::path& destination, int pages_per_step) {
+Result<void> Connection::backup_to(const std::filesystem::path& destination, int pages_per_step,
+                                   std::chrono::milliseconds busy_deadline) {
+    if (!handle_) return fail(ErrorCode::Internal, "backup from a closed connection");
     sqlite3* target = nullptr;
     const auto utf8_path = path_to_utf8(destination);
     int result_code = sqlite3_open_v2(utf8_path.c_str(), &target, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
@@ -376,22 +464,32 @@ Result<void> Connection::backup_to(const std::filesystem::path& destination, int
         result_code = sqlite3_errcode(target);
         return fail_and_close("backup init");
     }
-    do {
+    using Clock = std::chrono::steady_clock;
+    std::optional<Clock::time_point> busy_since;
+    while (true) {
         result_code = sqlite3_backup_step(backup, pages_per_step);
-        if (result_code == SQLITE_BUSY || result_code == SQLITE_LOCKED)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    } while (result_code == SQLITE_OK || result_code == SQLITE_BUSY || result_code == SQLITE_LOCKED);
+        if (result_code == SQLITE_OK) {
+            busy_since.reset();
+            continue;
+        }
+        if (!is_busy(result_code)) break;
+        const auto now = Clock::now();
+        if (!busy_since) busy_since = now;
+        if (now - *busy_since >= busy_deadline) break;  // bounded: never retry BUSY forever
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     sqlite3_backup_finish(backup);
     if (result_code != SQLITE_DONE) return fail_and_close("backup step");
 
     // A backup is a standalone file: leave WAL mode so the single file is complete on its own.
-    sqlite3_exec(target, "PRAGMA journal_mode=DELETE", nullptr, nullptr, nullptr);
+    result_code = sqlite3_exec(target, "PRAGMA journal_mode=DELETE", nullptr, nullptr, nullptr);
+    if (result_code != SQLITE_OK) return fail_and_close("backup journal mode");
     result_code = sqlite3_close_v2(target);
     if (result_code != SQLITE_OK) return std::unexpected(make_sqlite_error(nullptr, result_code, "backup close"));
     return {};
 }
 
-// ---------------------------------------------------------------- WriteTransaction
+// ---------------------------------------------------------------- transactions
 Result<void> WriteTransaction::begin() {
     auto began = connection_.begin_immediate();
     if (began) active_ = true;
@@ -402,6 +500,12 @@ Result<void> WriteTransaction::commit() {
     auto committed = connection_.commit();
     if (committed) active_ = false;
     return committed;
+}
+
+Result<void> ReadTransaction::begin() {
+    auto began = connection_.begin_deferred();
+    if (began) active_ = true;
+    return began;
 }
 
 }  // namespace mso::sqlite

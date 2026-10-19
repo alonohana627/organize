@@ -15,7 +15,10 @@ the owner has changed a requirement, `IMPLEMENTATION_STATUS.md` lists the deviat
    `deps/manifest.json` and re-applied by `deps/update_deps.py`.
 3. **Clear names, no abbreviations**, and a `///` doc comment on every meaningful class and
    non-trivial function. Aim for code a reviewer rates 10/10.
-4. **Layout:** all headers in `include/mso/<module>/`, all sources in `src/<module>/` (`.cpp` only).
+4. **Layout:** all headers in `include/mso/<module>/` (internal ones in `include/mso/<module>/detail/`),
+   all sources in `src/<module>/` (`.cpp` only). A module includes only the modules it declares in
+   `CMakeLists.txt` (`mso_module(... MODULES ...)`); the `include-graph` CTest entry enforces it.
+   Exception: test-only helpers live next to the tests (`tests/test_support.{hpp,cpp}`).
 5. **Every component has doctest tests** (`tests/<area>_tests.cpp`, `TEST_SUITE("<area>")`).
 6. **Docs move with code:** update `README.md`, `docs/BUILDING.md`, `deps/README.md`,
    `IMPLEMENTATION_STATUS.md` and the affected `SKILLS/` guide in the same change.

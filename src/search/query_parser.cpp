@@ -1,9 +1,9 @@
 // Recursive-descent parser for the search query language (see query.hpp).
-#include <charconv>
-#include <cmath>
+#include <algorithm>
 #include <format>
 #include <utility>
 
+#include "mso/domain/analysis_flags.hpp"
 #include "mso/search/query.hpp"
 
 namespace mso::search {
@@ -56,13 +56,6 @@ std::string_view to_string(Field field) noexcept {
 
 namespace {
 
-/// Bit flags stored in effective_metadata.analysis_flags (see Library::record_analysis).
-constexpr std::int64_t kAnalyzedTempo = 1;
-constexpr std::int64_t kAnalyzedKey = 2;
-constexpr std::int64_t kAnalyzedWaveform = 4;
-constexpr std::int64_t kAnalyzedHash = 8;
-constexpr std::int64_t kAnalyzedLoudness = 16;
-
 std::optional<Field> field_from_name(std::string_view name) {
     const std::string lowered = to_lower_ascii(name);
     struct Alias {
@@ -106,18 +99,49 @@ std::optional<Field> field_from_name(std::string_view name) {
 
 /// A lexical token with its byte offset in the query.
 struct Token {
+    /// Token type.
     enum class Kind { Word, Quoted, FieldValue, OpenParen, CloseParen, End };
-    Kind kind = Kind::End;
+    Kind kind = Kind::End;      ///< token type
     std::string text;           ///< word / quoted content / field value
     std::string field_name;     ///< FieldValue only
     bool value_quoted = false;  ///< FieldValue only
-    std::size_t offset = 0;
+    std::size_t offset = 0;     ///< byte offset of the token's first character
 };
 
+/// A unit suffix and how many storage units (milli-BPM, microseconds, bytes, Hz) one of it is.
+struct Unit {
+    std::string_view suffix;
+    std::int64_t storage_units;
+};
+
+/// A non-negative decimal number as typed: `mantissa` × 10^-`decimals` ("120.25" → 12025, 2).
+struct Decimal {
+    std::int64_t mantissa = 0;
+    int decimals = 0;
+};
+
+/// The largest supported number of decimals and significant digits of a typed number.
+constexpr int kMaxDecimals = 9;
+constexpr int kMaxDigits = 18;
+/// Largest accepted value in storage units (well inside SQLite's 64-bit integers).
+constexpr std::int64_t kMaxStorageValue = 9'000'000'000'000'000;
+
+/// ⌈numerator / denominator⌉ for a positive denominator.
+constexpr std::int64_t ceiling_divide(std::int64_t numerator, std::int64_t denominator) {
+    return numerator >= 0 ? (numerator + denominator - 1) / denominator : -((-numerator) / denominator);
+}
+
+/// ⌊numerator / denominator⌋ for a positive denominator.
+constexpr std::int64_t floor_divide(std::int64_t numerator, std::int64_t denominator) {
+    return numerator >= 0 ? numerator / denominator : -((-numerator + denominator - 1) / denominator);
+}
+
+/// Recursive-descent parser over a token list; one instance parses one query.
 class Parser {
 public:
     explicit Parser(std::string_view text) : text_(text) {}
 
+    /// Tokenizes and parses the whole text.
     Result<Query> parse() {
         if (count_code_points(text_) > kMaxQueryCodePoints) return error_at(0, "query is longer than 4096 characters");
         if (!is_valid_utf8(text_)) return error_at(0, "query is not valid UTF-8");
@@ -135,6 +159,7 @@ public:
 
 private:
     // ------------------------------------------------------------ errors
+    /// PARSE_ERROR positioned at the code point that starts at `byte_offset`.
     std::unexpected<Error> error_at(std::size_t byte_offset, std::string message) const {
         Error error{ErrorCode::ParseError, false, std::move(message), std::nullopt,
                     static_cast<std::uint32_t>(count_code_points(text_.substr(0, byte_offset)))};
@@ -166,6 +191,7 @@ private:
         return error_at(start, "unterminated quote");
     }
 
+    /// Splits the text into words, quoted phrases, `field:value` pairs and parentheses.
     Result<void> tokenize() {
         std::size_t position = 0;
         while (true) {
@@ -219,8 +245,14 @@ private:
 
     const Token& peek() const { return tokens_[index_]; }
     const Token& advance() { return tokens_[index_++]; }
+    /// True when the next token is the operator `keyword` (operators are upper-case only).
     bool peek_keyword(std::string_view keyword) const {
-        return peek().kind == Token::Kind::Word && peek().text == keyword;  // operators are upper-case only
+        return peek().kind == Token::Kind::Word && peek().text == keyword;
+    }
+    /// True when the next token cannot start a term.
+    bool at_term_boundary() const {
+        return peek().kind == Token::Kind::End || peek().kind == Token::Kind::CloseParen || peek_keyword("OR") ||
+               peek_keyword("AND");
     }
 
     // ------------------------------------------------------------ grammar
@@ -231,6 +263,7 @@ private:
         return node;
     }
 
+    /// or := and ("OR" and)*
     Result<QueryNodePointer> parse_or(std::size_t depth) {
         if (depth > kMaxQueryDepth) return error_at(peek().offset, "query is nested more than 16 levels");
         auto first = parse_and(depth);
@@ -241,8 +274,7 @@ private:
         (*node)->children.push_back(std::move(*first));
         while (peek_keyword("OR")) {
             const auto offset = advance().offset;
-            if (peek().kind == Token::Kind::End || peek().kind == Token::Kind::CloseParen)
-                return error_at(offset, "OR needs a term on both sides");
+            if (at_term_boundary()) return error_at(offset, "OR needs a term on both sides");
             auto next = parse_and(depth);
             if (!next) return next;
             (*node)->children.push_back(std::move(*next));
@@ -250,22 +282,25 @@ private:
         return node;
     }
 
+    /// and := unary (["AND"] unary)*
     Result<QueryNodePointer> parse_and(std::size_t depth) {
         std::vector<QueryNodePointer> terms;
         const std::size_t offset = peek().offset;
         while (peek().kind != Token::Kind::End && peek().kind != Token::Kind::CloseParen && !peek_keyword("OR")) {
             if (peek_keyword("AND")) {
                 const auto and_offset = advance().offset;
-                if (terms.empty() || peek().kind == Token::Kind::End || peek().kind == Token::Kind::CloseParen ||
-                    peek_keyword("OR"))
-                    return error_at(and_offset, "AND needs a term on both sides");
+                if (terms.empty() || at_term_boundary()) return error_at(and_offset, "AND needs a term on both sides");
                 continue;
             }
             auto term = parse_unary(depth);
             if (!term) return term;
             terms.push_back(std::move(*term));
         }
-        if (terms.empty()) return error_at(offset, "expected a search term");
+        if (terms.empty()) {
+            if (peek().kind == Token::Kind::CloseParen)
+                return error_at(peek().offset, depth == 0 ? "unmatched ')'" : "empty parentheses");
+            return error_at(offset, "expected a search term");
+        }
         if (terms.size() == 1) return std::move(terms.front());
         auto node = make_node(QueryNode::Kind::And, offset);
         if (!node) return node;
@@ -273,12 +308,12 @@ private:
         return node;
     }
 
+    /// unary := "NOT" unary | "(" or ")" | word | phrase | field:value
     Result<QueryNodePointer> parse_unary(std::size_t depth) {
         if (peek_keyword("NOT")) {
             const auto offset = advance().offset;
-            if (peek().kind == Token::Kind::End || peek().kind == Token::Kind::CloseParen || peek_keyword("OR") ||
-                peek_keyword("AND"))
-                return error_at(offset, "NOT needs a term");
+            if (depth + 1 > kMaxQueryDepth) return error_at(offset, "query is nested more than 16 levels");
+            if (at_term_boundary()) return error_at(offset, "NOT needs a term");
             auto operand = parse_unary(depth + 1);
             if (!operand) return operand;
             auto node = make_node(QueryNode::Kind::Not, offset);
@@ -302,11 +337,15 @@ private:
                 return text_node(token, true);
             case Token::Kind::FieldValue:
                 return predicate_node(token);
-            default:
-                return error_at(token.offset, "expected a search term");
+            case Token::Kind::OpenParen:
+            case Token::Kind::CloseParen:
+            case Token::Kind::End:
+                break;
         }
+        return error_at(token.offset, "expected a search term");
     }
 
+    /// A free-text term; words may end in '*' (prefix), phrases keep '*' literally.
     Result<QueryNodePointer> text_node(const Token& token, bool phrase, std::optional<Field> column = std::nullopt) {
         auto node = make_node(QueryNode::Kind::Text, token.offset);
         if (!node) return node;
@@ -317,9 +356,11 @@ private:
                 return error_at(token.offset, "a prefix search needs at least two characters before '*'");
             term.prefix = true;
         }
-        if (term.text.find('*') != std::string::npos)
+        if (!phrase && term.text.find('*') != std::string::npos)
             return error_at(token.offset, "'*' is only allowed at the end of a word");
         if (trim(term.text).empty()) return error_at(token.offset, "empty search term");
+        if (!has_letter_or_digit(term.text))
+            return error_at(token.offset, "a search term needs at least one letter or digit");
         (*node)->text = std::move(term);
         return node;
     }
@@ -328,10 +369,8 @@ private:
     Result<QueryNodePointer> predicate_node(const Token& token) {
         auto field = field_from_name(token.field_name);
         if (!field) return error_at(token.offset, std::format("unknown field '{}'", token.field_name));
-        if (*field == Field::Name || *field == Field::Path || *field == Field::Notes) {
-            Token text_token = token;
-            return text_node(text_token, token.value_quoted, *field);
-        }
+        if (*field == Field::Name || *field == Field::Path || *field == Field::Notes)
+            return text_node(token, token.value_quoted, *field);
         auto node = make_node(QueryNode::Kind::Predicate, token.offset);
         if (!node) return node;
         FieldPredicate& predicate = (*node)->predicate;
@@ -349,11 +388,13 @@ private:
             case Field::Folder:
             case Field::Collection:
                 predicate.text = trim(value);
+                if (predicate.text.empty()) return error_at(offset, "expected a name");
                 return {};
             case Field::Format:
             case Field::Codec:
                 predicate.text = to_lower_ascii(trim(value));
                 if (predicate.text.starts_with('.')) predicate.text.erase(0, 1);
+                if (predicate.text.empty()) return error_at(offset, "expected a format or codec name");
                 return {};
             case Field::Favorite:
             case Field::Available:
@@ -363,28 +404,29 @@ private:
             case Field::Analyzed:
                 return parse_analyzed(predicate, value, offset);
             case Field::Bpm:
-                return parse_numeric(predicate, value, offset, 1000, {{"", 1}, {"bpm", 1}});
+                return parse_numeric(predicate, value, offset, {{"", 1000}, {"bpm", 1000}}, true);
             case Field::Duration:
-                return parse_numeric(predicate, value, offset, 1'000'000,
-                                     {{"", 1}, {"s", 1}, {"ms", 0.001}, {"min", 60}});
+                return parse_numeric(predicate, value, offset,
+                                     {{"", 1'000'000}, {"s", 1'000'000}, {"ms", 1000}, {"min", 60'000'000}}, true);
             case Field::Size:
-                return parse_numeric(predicate, value, offset, 1,
+                return parse_numeric(predicate, value, offset,
                                      {{"", 1},
                                       {"b", 1},
-                                      {"kb", 1e3},
-                                      {"mb", 1e6},
-                                      {"gb", 1e9},
+                                      {"kb", 1'000},
+                                      {"mb", 1'000'000},
+                                      {"gb", 1'000'000'000},
                                       {"kib", 1024},
-                                      {"mib", 1048576},
-                                      {"gib", 1073741824}});
+                                      {"mib", 1'048'576},
+                                      {"gib", 1'073'741'824}},
+                                     true);
             case Field::SampleRate:
-                return parse_numeric(predicate, value, offset, 1, {{"", 1}, {"hz", 1}, {"k", 1000}, {"khz", 1000}});
+                return parse_numeric(predicate, value, offset, {{"", 1}, {"hz", 1}, {"k", 1000}, {"khz", 1000}}, true);
             case Field::Rating:
             case Field::Channels:
             case Field::BitDepth: {
-                auto parsed = parse_numeric(predicate, value, offset, 1, {{"", 1}});
+                auto parsed = parse_numeric(predicate, value, offset, {{"", 1}}, false);
                 if (!parsed) return parsed;
-                if (predicate.field == Field::Rating && (predicate.low < 0 || predicate.high > 5 || predicate.low > 5))
+                if (predicate.field == Field::Rating && !rating_in_range(predicate))
                     return error_at(offset, "rating is between 0 and 5");
                 return {};
             }
@@ -394,6 +436,24 @@ private:
                 break;
         }
         return error_at(offset, "unsupported field");
+    }
+
+    /// The typed rating values (not the widened bounds) must lie in 0..5.
+    static bool rating_in_range(const FieldPredicate& predicate) {
+        switch (predicate.comparison) {
+            case Comparison::Equal:
+            case Comparison::Between:
+                return predicate.low >= 0 && predicate.high <= 5;
+            case Comparison::Less:
+                return predicate.high >= -1 && predicate.high <= 4;
+            case Comparison::LessOrEqual:
+                return predicate.high >= 0 && predicate.high <= 5;
+            case Comparison::Greater:
+                return predicate.low >= 1 && predicate.low <= 6;
+            case Comparison::GreaterOrEqual:
+                return predicate.low >= 0 && predicate.low <= 5;
+        }
+        return false;
     }
 
     Result<void> parse_flag(FieldPredicate& predicate, std::string_view value, std::size_t offset) {
@@ -418,93 +478,175 @@ private:
         return {};
     }
 
+    /// `analyzed:<stage>` (that stage recorded), `analyzed:any|true|yes` (any stage) or
+    /// `analyzed:none|false|no` (no stage at all).
     Result<void> parse_analyzed(FieldPredicate& predicate, std::string_view value, std::size_t offset) {
         const std::string lowered = to_lower_ascii(value);
-        if (lowered == "tempo" || lowered == "bpm")
+        predicate.flag = true;
+        if (lowered == "tempo" || lowered == "bpm") {
             predicate.low = kAnalyzedTempo;
-        else if (lowered == "key")
+        } else if (lowered == "key") {
             predicate.low = kAnalyzedKey;
-        else if (lowered == "waveform")
+        } else if (lowered == "waveform") {
             predicate.low = kAnalyzedWaveform;
-        else if (lowered == "hash" || lowered == "duplicates")
+        } else if (lowered == "hash" || lowered == "duplicates") {
             predicate.low = kAnalyzedHash;
-        else if (lowered == "loudness")
+        } else if (lowered == "loudness") {
             predicate.low = kAnalyzedLoudness;
-        else if (lowered == "any" || lowered == "true")
-            predicate.low = 0xFF;
-        else
-            return error_at(offset, "analyzed: expects tempo, key, waveform, hash, loudness or any");
+        } else if (lowered == "any" || lowered == "true" || lowered == "yes") {
+            predicate.low = kAnalyzedAny;
+        } else if (lowered == "none" || lowered == "false" || lowered == "no") {
+            predicate.low = kAnalyzedAny;
+            predicate.flag = false;
+        } else {
+            return error_at(offset, "analyzed: expects tempo, key, waveform, hash, loudness, any or none");
+        }
+        predicate.high = predicate.low;
         predicate.text = lowered;
         return {};
     }
 
-    /// A unit suffix and its multiplier relative to the field's base unit.
-    struct Unit {
-        std::string_view suffix;
-        double multiplier;
-    };
-
-    /// Parses "x", "<x", "<=x", ">x", ">=x", "=x" or "a..b" with optional unit suffixes, scaled by
-    /// `scale` into integers (e.g. BPM → milli-BPM).
-    Result<void> parse_numeric(FieldPredicate& predicate, std::string_view value, std::size_t offset, double scale,
-                               std::initializer_list<Unit> units) {
+    /// Parses "x", "<x", "<=x", ">x", ">=x", "=x" or "a..b" with optional unit suffixes into the
+    /// inclusive integer bounds described at FieldPredicate. Equality and ranges are widened to
+    /// the precision typed; `allow_fraction` = false rejects fractional values (count fields).
+    Result<void> parse_numeric(FieldPredicate& predicate, std::string_view value, std::size_t offset,
+                               std::initializer_list<Unit> units, bool allow_fraction) {
         std::string_view rest = value;
+        std::size_t rest_offset = offset;
         predicate.comparison = Comparison::Equal;
-        if (rest.starts_with(">=")) {
-            predicate.comparison = Comparison::GreaterOrEqual;
-            rest.remove_prefix(2);
-        } else if (rest.starts_with("<=")) {
-            predicate.comparison = Comparison::LessOrEqual;
-            rest.remove_prefix(2);
-        } else if (rest.starts_with('>')) {
-            predicate.comparison = Comparison::Greater;
-            rest.remove_prefix(1);
-        } else if (rest.starts_with('<')) {
-            predicate.comparison = Comparison::Less;
-            rest.remove_prefix(1);
-        } else if (rest.starts_with('=')) {
-            rest.remove_prefix(1);
+        for (const auto& [prefix, comparison] :
+             {std::pair{std::string_view(">="), Comparison::GreaterOrEqual},
+              std::pair{std::string_view("<="), Comparison::LessOrEqual},
+              std::pair{std::string_view(">"), Comparison::Greater}, std::pair{std::string_view("<"), Comparison::Less},
+              std::pair{std::string_view("="), Comparison::Equal}}) {
+            if (!rest.starts_with(prefix)) continue;
+            predicate.comparison = comparison;
+            rest.remove_prefix(prefix.size());
+            rest_offset += prefix.size();
+            break;
         }
 
         const auto range = rest.find("..");
         if (range != std::string_view::npos) {
             if (predicate.comparison != Comparison::Equal)
                 return error_at(offset, "a range cannot also have a comparison");
-            auto low = parse_quantity(rest.substr(0, range), offset, scale, units);
-            auto high = parse_quantity(rest.substr(range + 2), offset, scale, units);
+            auto low = parse_quantity(rest.substr(0, range), rest_offset, units, allow_fraction);
             if (!low) return std::unexpected(low.error());
+            auto high = parse_quantity(rest.substr(range + 2), rest_offset + range + 2, units, allow_fraction);
             if (!high) return std::unexpected(high.error());
-            if (*low > *high) return error_at(offset, "range start is greater than its end");
+            auto low_bound = precision_lower_bound(*low, offset);
+            if (!low_bound) return std::unexpected(low_bound.error());
+            auto high_bound = precision_upper_bound(*high, offset);
+            if (!high_bound) return std::unexpected(high_bound.error());
+            auto low_exact = exact_floor(*low, offset);
+            if (!low_exact) return std::unexpected(low_exact.error());
+            auto high_exact = exact_floor(*high, offset);
+            if (!high_exact) return std::unexpected(high_exact.error());
+            if (*low_exact > *high_exact) return error_at(offset, "range start is greater than its end");
             predicate.comparison = Comparison::Between;
-            predicate.low = *low;
-            predicate.high = *high;
+            predicate.low = *low_bound;
+            predicate.high = *high_bound;
             return {};
         }
-        auto quantity = parse_quantity(rest, offset, scale, units);
+        auto quantity = parse_quantity(rest, rest_offset, units, allow_fraction);
         if (!quantity) return std::unexpected(quantity.error());
-        predicate.low = predicate.high = *quantity;
+        Result<std::int64_t> low = 0;
+        Result<std::int64_t> high = 0;
+        switch (predicate.comparison) {
+            case Comparison::Equal:
+            case Comparison::Between:
+                low = precision_lower_bound(*quantity, offset);
+                high = precision_upper_bound(*quantity, offset);
+                break;
+            case Comparison::Less:  // value < x  ⇔  value <= ⌈x⌉ - 1
+                high = exact_ceiling(*quantity, offset).transform([](std::int64_t bound) { return bound - 1; });
+                break;
+            case Comparison::LessOrEqual:  // value <= x  ⇔  value <= ⌊x⌋
+                high = exact_floor(*quantity, offset);
+                break;
+            case Comparison::Greater:  // value > x  ⇔  value >= ⌊x⌋ + 1
+                low = exact_floor(*quantity, offset).transform([](std::int64_t bound) { return bound + 1; });
+                break;
+            case Comparison::GreaterOrEqual:  // value >= x  ⇔  value >= ⌈x⌉
+                low = exact_ceiling(*quantity, offset);
+                break;
+        }
+        if (!low) return std::unexpected(low.error());
+        if (!high) return std::unexpected(high.error());
+        predicate.low = *low;
+        predicate.high = *high;
         return {};
     }
 
-    Result<std::int64_t> parse_quantity(std::string_view text, std::size_t offset, double scale,
-                                        std::initializer_list<Unit> units) {
-        std::size_t number_end = 0;
-        while (number_end < text.size() &&
-               ((text[number_end] >= '0' && text[number_end] <= '9') || text[number_end] == '.'))
-            ++number_end;
-        if (number_end == 0) return error_at(offset, std::format("'{}' is not a number", text));
-        double number = 0;
-        const auto parsed = std::from_chars(text.data(), text.data() + number_end, number);
-        if (parsed.ec != std::errc() || parsed.ptr != text.data() + number_end)
-            return error_at(offset, std::format("'{}' is not a number", text.substr(0, number_end)));
-        const std::string suffix = to_lower_ascii(text.substr(number_end));
-        for (const auto& unit : units) {
-            if (unit.suffix != suffix) continue;
-            const double scaled = std::round(number * unit.multiplier * scale);
-            if (!std::isfinite(scaled) || scaled > 9.0e15) return error_at(offset, "number is too large");
-            return static_cast<std::int64_t>(scaled);
+    /// A typed number with its unit: value = mantissa × 10^-decimals × storage_units.
+    struct Quantity {
+        Decimal number;
+        std::int64_t storage_units = 1;
+    };
+
+    Result<Quantity> parse_quantity(std::string_view text, std::size_t offset, std::initializer_list<Unit> units,
+                                    bool allow_fraction) {
+        Decimal number;
+        std::size_t position = 0;
+        int digits = 0;
+        bool seen_point = false;
+        for (; position < text.size(); ++position) {
+            const char character = text[position];
+            if (character == '.' && !seen_point && !(position + 1 < text.size() && text[position + 1] == '.')) {
+                seen_point = true;
+                continue;
+            }
+            if (character < '0' || character > '9') break;
+            if (++digits > kMaxDigits) return error_at(offset, "number has too many digits");
+            number.mantissa = number.mantissa * 10 + (character - '0');
+            if (seen_point) ++number.decimals;
         }
-        return error_at(offset + number_end, std::format("unknown unit '{}'", suffix));
+        if (digits == 0) return error_at(offset, std::format("'{}' is not a number", text));
+        if (number.decimals > kMaxDecimals) return error_at(offset, "number has too many decimals");
+        if (!allow_fraction && number.decimals > 0) return error_at(offset, "expected a whole number");
+        const std::string suffix = to_lower_ascii(text.substr(position));
+        for (const auto& unit : units)
+            if (unit.suffix == suffix) return Quantity{number, unit.storage_units};
+        return error_at(offset + position, std::format("unknown unit '{}'", suffix));
+    }
+
+    /// (mantissa × `mantissa_multiplier` + `addend`) × storage_units / (`divisor` × 10^decimals),
+    /// rounded to an integer with `round`; a parse error when it overflows or exceeds the limit.
+    template <class Round>
+    Result<std::int64_t> scaled(const Quantity& quantity, std::int64_t mantissa_multiplier, std::int64_t addend,
+                                std::int64_t divisor, std::size_t offset, Round round) {
+        std::int64_t power = 1;
+        for (int index = 0; index < quantity.number.decimals; ++index)
+            power *= 10;
+        std::int64_t numerator = 0;
+        std::int64_t denominator = 0;
+        if (__builtin_mul_overflow(quantity.number.mantissa, mantissa_multiplier, &numerator) ||
+            __builtin_add_overflow(numerator, addend, &numerator) ||
+            __builtin_mul_overflow(numerator, quantity.storage_units, &numerator) ||
+            __builtin_mul_overflow(divisor, power, &denominator))
+            return error_at(offset, "number is too large");
+        const std::int64_t result = round(numerator, denominator);
+        if (result > kMaxStorageValue) return error_at(offset, "number is too large");
+        return result;
+    }
+
+    /// ⌈x - h⌉ where h is half of the last typed digit: the smallest stored value that rounds to x.
+    Result<std::int64_t> precision_lower_bound(const Quantity& quantity, std::size_t offset) {
+        return scaled(quantity, 2, -1, 2, offset, ceiling_divide);
+    }
+    /// ⌈x + h⌉ - 1: the largest stored value that rounds to x (x + h itself rounds up).
+    Result<std::int64_t> precision_upper_bound(const Quantity& quantity, std::size_t offset) {
+        return scaled(quantity, 2, 1, 2, offset, ceiling_divide).transform([](std::int64_t bound) {
+            return bound - 1;
+        });
+    }
+    /// ⌊x⌋ in storage units.
+    Result<std::int64_t> exact_floor(const Quantity& quantity, std::size_t offset) {
+        return scaled(quantity, 1, 0, 1, offset, floor_divide);
+    }
+    /// ⌈x⌉ in storage units.
+    Result<std::int64_t> exact_ceiling(const Quantity& quantity, std::size_t offset) {
+        return scaled(quantity, 1, 0, 1, offset, ceiling_divide);
     }
 
     std::string_view text_;
@@ -531,6 +673,24 @@ void collect_positive_terms(const QueryNode& node, bool negated, std::vector<Tex
     }
 }
 
+/// True when every match of `node` matches one of its positive text terms.
+bool node_requires_text_match(const QueryNode& node) {
+    switch (node.kind) {
+        case QueryNode::Kind::Text:
+            return true;
+        case QueryNode::Kind::And:
+            return std::ranges::any_of(node.children,
+                                       [](const auto& child) { return node_requires_text_match(*child); });
+        case QueryNode::Kind::Or:
+            return std::ranges::all_of(node.children,
+                                       [](const auto& child) { return node_requires_text_match(*child); });
+        case QueryNode::Kind::Not:
+        case QueryNode::Kind::Predicate:
+            return false;
+    }
+    return false;
+}
+
 }  // namespace
 
 Result<Query> parse_query(std::string_view text) {
@@ -541,6 +701,10 @@ std::vector<TextTerm> positive_text_terms(const Query& query) {
     std::vector<TextTerm> terms;
     if (query.root) collect_positive_terms(*query.root, false, terms);
     return terms;
+}
+
+bool requires_text_match(const Query& query) {
+    return query.root && node_requires_text_match(*query.root);
 }
 
 }  // namespace mso::search

@@ -6,6 +6,8 @@
 #include <csv.hpp>
 #include <nlohmann/json.hpp>
 
+#include "mso/app/json_fields.hpp"
+
 namespace mso::app {
 
 namespace {
@@ -19,6 +21,7 @@ constexpr std::string_view kCsvColumns[] = {
     "bit_depth",   "byte_size",    "bpm",         "bpm_source",     "key",           "key_source",
     "category",    "tags",         "rating",      "favorite",       "availability",  "created_at"};
 
+/// A known number as text, or "" (an empty CSV cell).
 std::string optional_number(const std::optional<std::int64_t>& value) {
     return value ? std::to_string(*value) : std::string();
 }
@@ -44,16 +47,20 @@ std::vector<std::string> csv_values(const search::SampleRow& row, const std::str
             row.key ? format_key(*row.key) : "",
             row.key_source,
             row.category,
-            nlohmann::json(row.tag_paths).dump(),
+            dump_json(nlohmann::json(row.tag_paths)),
             std::to_string(row.rating),
             row.favorite ? "true" : "false",
             std::string(search::to_string(row.availability)),
             std::to_string(row.created_at)};
 }
 
+/// One sample of the JSON export.
 nlohmann::json json_row(const search::SampleRow& row, const std::string& absolute_path, bool include_absolute) {
     auto nullable = [](const std::optional<std::int64_t>& value) {
         return value ? nlohmann::json(*value) : nlohmann::json();
+    };
+    auto nullable_text = [](const std::string& value) {
+        return value.empty() ? nlohmann::json() : nlohmann::json(value);
     };
     nlohmann::json location = {
         {"root", row.root_name}, {"root_uuid", uuids::to_string(row.root_uuid)}, {"relative_path", row.relative_path}};
@@ -62,8 +69,8 @@ nlohmann::json json_row(const search::SampleRow& row, const std::string& absolut
                           {"display_name", row.display_name},
                           {"file_name", row.file_name},
                           {"location", location},
-                          {"format", row.format.empty() ? nlohmann::json() : nlohmann::json(row.format)},
-                          {"codec", row.codec.empty() ? nlohmann::json() : nlohmann::json(row.codec)},
+                          {"format", nullable_text(row.format)},
+                          {"codec", nullable_text(row.codec)},
                           {"duration_us", nullable(row.duration_us)},
                           {"duration_exact", row.duration_exact},
                           {"sample_rate", nullable(row.sample_rate)},
@@ -71,17 +78,30 @@ nlohmann::json json_row(const search::SampleRow& row, const std::string& absolut
                           {"bit_depth", nullable(row.bit_depth)},
                           {"byte_size", nullable(row.byte_size)},
                           {"bpm_milli", nullable(row.bpm_milli)},
-                          {"bpm_source", row.bpm_source.empty() ? nlohmann::json() : nlohmann::json(row.bpm_source)},
+                          {"bpm_source", nullable_text(row.bpm_source)},
                           {"key", row.key ? nlohmann::json{{"pitch_class", row.key->pitch_class},
                                                            {"mode", std::string(to_string(row.key->mode))}}
                                           : nlohmann::json()},
-                          {"key_source", row.key_source.empty() ? nlohmann::json() : nlohmann::json(row.key_source)},
-                          {"category", row.category.empty() ? nlohmann::json() : nlohmann::json(row.category)},
+                          {"key_source", nullable_text(row.key_source)},
+                          {"category", nullable_text(row.category)},
                           {"tags", row.tag_paths},
                           {"rating", row.rating},
                           {"favorite", row.favorite},
                           {"availability", std::string(search::to_string(row.availability))},
                           {"created_at", row.created_at}};
+}
+
+/// Sibling temporary name owned by this export (unique, so concurrent exports never collide).
+std::filesystem::path temporary_sibling(const std::filesystem::path& file) {
+    auto temporary = file;
+    temporary += std::format(".{}.partial", uuids::to_string(new_uuid()));
+    return temporary;
+}
+
+/// Removes one of our temporary files; a leftover is harmless.
+void remove_quietly(const std::filesystem::path& file) {
+    std::error_code ignored;  // cleanup of our own temporary file; a leftover is harmless
+    std::filesystem::remove(file, ignored);
 }
 
 }  // namespace
@@ -96,36 +116,40 @@ std::string spreadsheet_safe(std::string value) {
 Result<ExportSummary> write_metadata_export(catalog::Library& library, const std::filesystem::path& destination,
                                             const ExportOptions& options, const RootPathResolver& root_path,
                                             std::stop_token stop) {
-    auto temporary = destination;
-    temporary += std::format(".{}.partial", uuids::to_string(new_uuid()));
+    const auto temporary = temporary_sibling(destination);
     ExportSummary summary{0, destination};
-    const auto identity = library.identity();
+    auto identity = library.identity();
+    auto start_revision = library.catalog_revision();  // identity() is cached; read the database
+    if (!start_revision) return std::unexpected(start_revision.error());
+    identity.catalog_revision = *start_revision;
+    const bool csv = options.format == ExportFormat::Csv;
+    std::int64_t revision_at_end = identity.catalog_revision;
     {
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
         if (!out) return fail(ErrorCode::AccessDenied, "cannot create the export file");
         auto cleanup_on_failure = [&](Error error) {
             out.close();
-            std::error_code ignored;
-            std::filesystem::remove(temporary, ignored);
+            remove_quietly(temporary);
             return std::unexpected(std::move(error));
         };
+        auto write_failed = [&] {
+            return cleanup_on_failure(Error{ErrorCode::DiskFull, false, "writing the export failed", {}, {}});
+        };
 
-        const bool csv = options.format == ExportFormat::Csv;
         auto csv_writer = csv::make_csv_writer(out);  // RFC 4180 quoting, CRLF records (patched)
         if (csv) {
             if (options.utf8_bom) out << "\xEF\xBB\xBF";
             csv_writer << std::vector<std::string>(std::begin(kCsvColumns), std::end(kCsvColumns));
         } else {
-            const nlohmann::json manifest = {{"schema_version", kExportSchemaVersion},
-                                             {"library",
-                                              {{"uuid", uuids::to_string(identity.uuid)},
-                                               {"name", identity.name},
-                                               {"catalog_revision", identity.catalog_revision}}},
-                                             {"exported_at", now_unix_ms()},
-                                             {"absolute_paths", options.include_absolute_paths}};
-            const std::string head = manifest.dump();
-            out << head.substr(0, head.size() - 1) << ",\"samples\":[";
+            // The envelope is written field by field around the streamed sample array.
+            const nlohmann::json library_json = {{"uuid", uuids::to_string(identity.uuid)},
+                                                 {"name", identity.name},
+                                                 {"catalog_revision", identity.catalog_revision}};
+            out << "{\"schema_version\":" << kExportSchemaVersion << ",\"library\":" << dump_json(library_json)
+                << ",\"exported_at\":" << now_unix_ms()
+                << ",\"absolute_paths\":" << (options.include_absolute_paths ? "true" : "false") << ",\"samples\":[";
         }
+        if (!out) return write_failed();
 
         search::SearchService service;
         search::SearchRequest request{
@@ -140,7 +164,7 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
             for (const auto& row : page->rows) {
                 std::string absolute;
                 if (options.include_absolute_paths)
-                    if (auto base = root_path(row.root_uuid))
+                    if (auto base = root_path(row.root_uuid, row.root_mode))
                         absolute = path_to_utf8(*base / path_from_utf8(row.relative_path));
                 if (csv) {
                     auto values = csv_values(row, absolute);
@@ -149,39 +173,69 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
                             value = spreadsheet_safe(std::move(value));
                     csv_writer << values;
                 } else {
-                    out << (first ? "" : ",") << json_row(row, absolute, options.include_absolute_paths).dump();
+                    out << (first ? "" : ",") << dump_json(json_row(row, absolute, options.include_absolute_paths));
                     first = false;
                 }
                 ++summary.rows;
             }
+            if (!out) return write_failed();  // checked per page, not only at the end
             if (!page->next) break;
             request.cursor = page->next;
         }
-        if (csv)
+        auto end_revision = library.catalog_revision();
+        if (!end_revision) return cleanup_on_failure(end_revision.error());
+        revision_at_end = *end_revision;
+        if (csv) {
             csv_writer.flush();
-        else
-            out << "]}";
+        } else {
+            out << "],\"catalog_revision_at_end\":" << revision_at_end
+                << ",\"consistent\":" << (revision_at_end == identity.catalog_revision ? "true" : "false") << "}";
+        }
         out.flush();
-        if (!out) return cleanup_on_failure(Error{ErrorCode::DiskFull, false, "writing the export failed", {}, {}});
+        if (!out) return write_failed();
     }
+
+    // The CSV manifest is complete on disk before the CSV itself is published.
+    std::filesystem::path manifest_temporary;
+    auto manifest_path = destination;
+    manifest_path += ".manifest.json";
+    if (csv) {
+        manifest_temporary = temporary_sibling(manifest_path);
+        std::ofstream manifest(manifest_temporary, std::ios::binary | std::ios::trunc);
+        manifest << dump_json({{"schema_version", kExportSchemaVersion},
+                               {"library", uuids::to_string(identity.uuid)},
+                               {"catalog_revision", identity.catalog_revision},
+                               {"catalog_revision_at_end", revision_at_end},
+                               {"consistent", revision_at_end == identity.catalog_revision},
+                               {"rows", summary.rows},
+                               {"spreadsheet_safe", options.spreadsheet_safe},
+                               {"absolute_paths", options.include_absolute_paths},
+                               {"tags_encoding", "JSON array per cell"}},
+                              2);
+        manifest.flush();
+        if (!manifest) {
+            manifest.close();
+            remove_quietly(manifest_temporary);
+            remove_quietly(temporary);
+            return fail(ErrorCode::DiskFull, "writing the export manifest failed");
+        }
+    }
+
     std::error_code error;
     std::filesystem::rename(temporary, destination, error);
     if (error) {
-        std::filesystem::remove(temporary, error);
-        return fail(ErrorCode::AccessDenied, "cannot replace the export destination");
+        const auto message = std::format("cannot replace the export destination: {}", error.message());
+        remove_quietly(temporary);
+        if (csv) remove_quietly(manifest_temporary);
+        return fail(ErrorCode::AccessDenied, message);
     }
-    if (options.format == ExportFormat::Csv) {
-        // The CSV manifest records what a spreadsheet reader needs to interpret the file.
-        auto manifest_path = destination;
-        manifest_path += ".manifest.json";
-        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
-        manifest << nlohmann::json{{"schema_version", kExportSchemaVersion},
-                                   {"library", uuids::to_string(identity.uuid)},
-                                   {"catalog_revision", identity.catalog_revision},
-                                   {"rows", summary.rows},
-                                   {"spreadsheet_safe", options.spreadsheet_safe},
-                                   {"tags_encoding", "JSON array per cell"}}
-                        .dump(2);
+    if (csv) {
+        std::filesystem::rename(manifest_temporary, manifest_path, error);
+        if (error) {
+            remove_quietly(manifest_temporary);
+            return fail(ErrorCode::AccessDenied,
+                        std::format("the export was written but its manifest could not be: {}", error.message()));
+        }
     }
     return summary;
 }

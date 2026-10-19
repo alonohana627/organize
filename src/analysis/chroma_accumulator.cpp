@@ -26,6 +26,7 @@ constexpr std::size_t kProminenceOuterOffset = 6;
 constexpr double kReferenceFrequencyHz = 440.0;
 constexpr double kReferenceMidiNote = 69.0;  ///< A4; MIDI note 60 = C4 so note % 12 == 0 is C
 
+/// Chroma frame length at `sample_rate`: the power of two closest to kFrameSeconds.
 std::size_t chroma_frame_size(int sample_rate) {
     return nearest_power_of_two(kFrameSeconds * static_cast<double>(sample_rate), 1024, 65536);
 }
@@ -50,6 +51,7 @@ struct BandPower {
     double flatness = 1.0;  ///< geometric / arithmetic mean of power: ~0 for tones, ~0.56 for white noise
 };
 
+/// Mean power and spectral flatness of bins [first, last).
 BandPower measure_band(std::span<const float> magnitudes, std::size_t first, std::size_t last) {
     constexpr double kPowerEpsilon = 1e-20;
     double log_sum = 0.0;

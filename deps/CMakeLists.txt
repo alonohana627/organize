@@ -1,16 +1,22 @@
 # Vendored third-party dependencies, pinned in deps/manifest.json and fetched by deps/update_deps.py.
 # They are built here with their own (quiet) flags so project warnings stay meaningful.
 
-# ---- SQLite amalgamation: pinned build with the compile features the catalog asserts at startup.
+# ---- SQLite amalgamation. The options only affect how sqlite3.c is compiled (none changes sqlite3.h),
+# so they are PRIVATE. The catalog checks FTS5 at startup (sqlite3_compileoption_used); the rest are
+# SQLite's recommended options (https://sqlite.org/compile.html#recommended_compile_time_options)
+# plus the safety settings the catalog relies on.
 add_library(mso_sqlite3 STATIC sqlite/sqlite3.c)
 target_include_directories(mso_sqlite3 SYSTEM PUBLIC sqlite)
-target_compile_definitions(mso_sqlite3 PUBLIC
+target_compile_definitions(mso_sqlite3 PRIVATE
   SQLITE_ENABLE_FTS5=1
   SQLITE_THREADSAFE=2              # multi-thread: connections are thread-confined
   SQLITE_DEFAULT_FOREIGN_KEYS=1
   SQLITE_DQS=0                     # no double-quoted string literals
   SQLITE_DEFAULT_MEMSTATUS=0
   SQLITE_OMIT_LOAD_EXTENSION=1     # catalogs never load code
+  SQLITE_OMIT_DEPRECATED=1         # no legacy APIs (sqlite3_trace, sqlite3_profile, ...)
+  SQLITE_OMIT_SHARED_CACHE=1       # every connection has its own cache; shared cache is never used
+  SQLITE_LIKE_DOESNT_MATCH_BLOBS=1 # LIKE (codec filters) only ever compares text
   SQLITE_DEFAULT_WAL_SYNCHRONOUS=2
   SQLITE_MAX_EXPR_DEPTH=1000)
 target_compile_options(mso_sqlite3 PRIVATE -w)
@@ -78,6 +84,8 @@ target_include_directories(mso_picosha2 SYSTEM INTERFACE picosha2)
 add_library(mso::picosha2 ALIAS mso_picosha2)
 
 # ---- miniaudio: WASAPI output plus built-in WAV/FLAC/MP3 decoders; Vorbis through stb_vorbis.
+# deps/miniaudio_impl.c is the project's one glue translation unit (not vendored): it compiles the
+# miniaudio and stb_vorbis implementations in the order stb_vorbis requires.
 add_library(mso_miniaudio STATIC miniaudio_impl.c)
 target_include_directories(mso_miniaudio SYSTEM PUBLIC miniaudio miniaudio/extras)
 target_compile_definitions(mso_miniaudio PUBLIC

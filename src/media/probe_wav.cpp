@@ -3,10 +3,10 @@
 #include <bit>
 #include <format>
 
-#include "mso/media/id3.hpp"
-#include "mso/media/probe_formats.hpp"
-#include "mso/media/tag_mapping.hpp"
-#include "mso/media/text_decoding.hpp"
+#include "mso/media/detail/id3.hpp"
+#include "mso/media/detail/probe_formats.hpp"
+#include "mso/media/detail/tag_mapping.hpp"
+#include "mso/media/detail/text_decoding.hpp"
 
 namespace mso::media::detail {
 
@@ -33,6 +33,9 @@ constexpr std::size_t kWave64HeaderSize = 40;
 
 /// Trailing 12 bytes shared by the Wave64 GUIDs of standard chunks ("fmt ", "data", "fact", ...).
 constexpr std::uint8_t kWave64GuidSuffix[12] = {0xF3, 0xAC, 0xD3, 0x11, 0x8C, 0xD1, 0x00, 0xC0, 0x4F, 0x8E, 0xDB, 0x8A};
+/// Wave64 GUID of the "list" chunk (RIFF LIST equivalent; it shares the "riff" GUID's suffix).
+constexpr std::uint8_t kWave64ListGuid[16] = {0x6C, 0x69, 0x73, 0x74, 0x2F, 0x91, 0xCF, 0x11,
+                                              0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00};
 
 /// Fields of a "fmt " chunk (WAVEFORMATEX, with WAVEFORMATEXTENSIBLE resolved to its sub-format).
 struct WaveFormat {
@@ -44,6 +47,7 @@ struct WaveFormat {
     std::uint16_t valid_bits = 0;  // extensible only; 0 when absent
 };
 
+/// Decodes a "fmt " chunk payload.
 Result<WaveFormat> parse_wave_format(Bytes payload) {
     ByteCursor cursor(payload);
     WaveFormat format;
@@ -175,6 +179,7 @@ public:
     WaveParser(BoundedFileReader& reader, ProbeResult& result, ChunkLayout layout)
         : reader_(reader), result_(result), layout_(layout) {}
 
+    /// Walks every chunk, then checks that the essential fmt and data chunks were present.
     Result<void> run() {
         const Result<void> walk = walk_chunks();
         derive_frame_count();
@@ -185,8 +190,11 @@ public:
     }
 
 private:
+    /// Bytes of one chunk header in this layout.
     std::size_t header_size() const noexcept { return layout_ == ChunkLayout::Riff ? 8 : 24; }
 
+    /// Visits chunks in file order with header-sized reads (at most kMaxChunkCount), stopping at
+    /// the end of the file or at a header that does not move forward.
     Result<void> walk_chunks() {
         std::uint64_t offset = layout_ == ChunkLayout::Riff ? kRiffHeaderSize : kWave64HeaderSize;
         for (int count = 0; count < kMaxChunkCount; ++count) {
@@ -203,6 +211,7 @@ private:
         return {};
     }
 
+    /// Decodes one chunk header read at `offset`; nullopt for an impossible Wave64 size.
     std::optional<WaveChunk> decode_chunk_header(Bytes header, std::uint64_t offset) const {
         ByteCursor cursor(header);
         WaveChunk chunk;
@@ -219,10 +228,12 @@ private:
         const std::uint64_t size_with_header = cursor.u64_le();
         if (size_with_header < header_size()) return std::nullopt;
         if (std::ranges::equal(guid.subspan(4), kWave64GuidSuffix)) chunk.id = std::string(as_text(guid.first(4)));
+        if (std::ranges::equal(guid, kWave64ListGuid)) chunk.id = "LIST";
         chunk.payload_size = size_with_header - header_size();
         return chunk;
     }
 
+    /// Offset of the chunk after `chunk` (payload plus alignment padding); nullopt on overflow.
     std::optional<std::uint64_t> next_chunk_offset(const WaveChunk& chunk) const {
         const std::uint64_t alignment = layout_ == ChunkLayout::Riff ? 2 : 8;
         const std::uint64_t padding = (alignment - chunk.payload_size % alignment) % alignment;
@@ -236,11 +247,22 @@ private:
                                       static_cast<std::size_t>(std::min(chunk.payload_size, limit)));
     }
 
+    /// Records the data chunk's position, or loads and parses a metadata chunk this probe reads.
     Result<void> visit(const WaveChunk& chunk) {
         if (chunk.id == "data") {
             data_offset_ = chunk.payload_offset;
             data_size_ = chunk.payload_size;
             return {};
+        }
+        if (chunk.id == "id3 " || chunk.id == "ID3 ") {
+            // Walked frame by frame in the file: embedded pictures are skipped unread.
+            return read_id3v2(reader_, chunk.payload_offset, chunk.payload_size, result_.tags);
+        }
+        if (chunk.id == "LIST") {
+            // Only INFO lists carry text tags; other list types (adtl cue labels) are not read.
+            auto list_type = load(chunk, 4);
+            if (!list_type) return std::unexpected(list_type.error());
+            if (!has_magic(*list_type, 0, "INFO")) return {};
         }
         const auto handler = payload_handler(chunk.id);
         if (!handler) return {};
@@ -255,19 +277,20 @@ private:
         Result<void> (WaveParser::*parse)(Bytes payload);
     };
 
+    /// The handler for a metadata chunk id; nullopt for chunks the probe does not read.
     std::optional<PayloadHandler> payload_handler(std::string_view id) const {
         if (id == "fmt ") return PayloadHandler{kMaxFormatChunkBytes, &WaveParser::on_format};
         if (id == "fact") return PayloadHandler{4, &WaveParser::on_fact};
         if (id == "ds64") return PayloadHandler{24, &WaveParser::on_ds64};
-        if (id == "LIST") return PayloadHandler{kMaxTagBytes, &WaveParser::on_list};
+        if (id == "LIST") return PayloadHandler{kMaxTextItemBytes, &WaveParser::on_list};
         if (id == "acid") return PayloadHandler{24, &WaveParser::on_acid};
         if (id == "smpl") {
             return PayloadHandler{kSamplerHeaderBytes + kMaxSamplerLoops * kSamplerLoopBytes, &WaveParser::on_sampler};
         }
-        if (id == "id3 " || id == "ID3 ") return PayloadHandler{kMaxTagBytes, &WaveParser::on_id3};
         return std::nullopt;
     }
 
+    /// "fmt ": codec, layout and bit depth (only the first one counts).
     Result<void> on_format(Bytes payload) {
         if (format_) return {};  // only the first fmt chunk describes the data
         auto format = parse_wave_format(payload);
@@ -277,6 +300,7 @@ private:
         return {};
     }
 
+    /// "fact": frame count of compressed formats.
     Result<void> on_fact(Bytes payload) {
         ByteCursor cursor(payload);
         const std::uint32_t frames = cursor.u32_le();
@@ -284,6 +308,7 @@ private:
         return {};
     }
 
+    /// "ds64": the 64-bit data size of RF64/BW64 files.
     Result<void> on_ds64(Bytes payload) {
         ByteCursor cursor(payload);
         cursor.skip(8);  // RIFF size
@@ -293,23 +318,21 @@ private:
         return {};
     }
 
+    /// "LIST" of type INFO: text tags.
     Result<void> on_list(Bytes payload) {
         parse_info_list(payload, result_.tags);
         return {};
     }
 
+    /// "acid": loop tempo.
     Result<void> on_acid(Bytes payload) {
         parse_acid(payload, result_.tags);
         return {};
     }
 
+    /// "smpl": sampler loops.
     Result<void> on_sampler(Bytes payload) {
         parse_sampler_loops(payload, result_.loops);
-        return {};
-    }
-
-    Result<void> on_id3(Bytes payload) {
-        parse_id3v2(payload, result_.tags);
         return {};
     }
 

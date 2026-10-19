@@ -26,7 +26,8 @@ struct KeyOverrideEdit {
 /// Edits applied to every sample in `sample_ids`. Fields left empty are not touched, so a
 /// multi-selection never overwrites values the user did not explicitly set.
 /// Large selections are committed in chunks of at most kSamplesPerChunk; a crash or cancel keeps
-/// the committed chunks as one partially-applied, undoable action.
+/// the committed chunks as one partially-applied, undoable action; so does a failed chunk, and
+/// retrying the same operation id resumes after the last committed chunk (Library::apply_edit).
 struct EditCommand {
     static constexpr std::size_t kSamplesPerChunk = 500;
 

@@ -17,19 +17,26 @@ and how to verify. Read `AGENTS.md` and the project rules below first.
 ## Project rules every task must follow
 
 - **Use libraries, don't hand-roll.** UUIDs are `uuids::uuid` (stduuid, `mso::new_uuid()`), JSON is
-  `nlohmann::json` (never aliased), SHA-256 is `mso::Sha256` over picosha2, Unicode is utf8proc, FFT is
+  `nlohmann::json` (never aliased), SHA-256 is picosha2, Unicode is utf8proc, FFT is
   pocketfft, CLI parsing is CLI11, tests use doctest. A missing capability means a new vendored dependency
   (see add-dependency), not new utility code. The project is GPL-3.0, so any GPL-compatible library is fine.
 - **Clear names, no abbreviations** (`PreparedStatement`, not `Stmt`), and a `///` doc comment on every
   meaningful class and non-trivial function.
-- **Layout:** every header lives in `include/mso/<module>/`, every `.cpp` in `src/<module>/`. Modules:
-  domain, catalog, search, media, files, audio, analysis, app, cli, ui, worker.
+- **Layout:** every header lives in `include/mso/<module>/` (internal ones in
+  `include/mso/<module>/detail/`), every `.cpp` in `src/<module>/`. Modules: domain, catalog, search,
+  media, files, audio, analysis, worker, app, cli, ui. A module includes only the modules it declares
+  in `CMakeLists.txt` (`mso_module(<name> MODULES ...)`); the `include-graph` CTest entry checks it.
+  Test helpers are the one exception: `tests/test_support.{hpp,cpp}`.
 - **Errors** are `mso::Result<T>` (`std::expected<T, mso::Error>`) with the stable `ErrorCode` taxonomy;
   no exceptions cross module boundaries.
 - **Portability:** Windows (MSYS2 CLANG64) is verified; Linux must stay buildable. Platform code goes
-  behind `#ifdef _WIN32` with a POSIX branch, never in public headers.
+  behind `#ifdef _WIN32` with a POSIX branch, in `.cpp` files or `detail/` headers. A public header may
+  only select a platform type or constant (both branches present, e.g. a native handle type or the
+  worker executable name), never contain platform logic.
 - **Tests:** every component has doctest cases in `tests/<area>_tests.cpp` inside
-  `TEST_SUITE("<area>")`. Generate fixtures at runtime; never commit audio.
+  `TEST_SUITE("<area>")` (CTest registers each suite automatically). Generate fixtures at runtime with
+  the shared helpers in `tests/test_support.hpp`; never commit audio; poll with deadlines
+  (`test::wait_until`), never sleep a fixed time.
 - **Docs move with code:** update `README.md`, `docs/BUILDING.md`, `deps/README.md`,
   `IMPLEMENTATION_STATUS.md` and the relevant skill in the same change.
 - **Git:** never commit or push without the owner's explicit OK.

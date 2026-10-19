@@ -1,4 +1,4 @@
-#include "mso/media/mpeg_audio_header.hpp"
+#include "mso/media/detail/mpeg_audio_header.hpp"
 
 namespace mso::media::detail {
 

@@ -1,4 +1,4 @@
-#include "mso/media/probe_formats.hpp"
+#include "mso/media/detail/probe_formats.hpp"
 
 #include <cstdint>
 #include <limits>

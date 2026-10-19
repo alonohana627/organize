@@ -1,18 +1,21 @@
 // User edits, structural taxonomy edits, and durable undo/redo.
 #include <algorithm>
-
-#include <picosha2.h>
 #include <format>
 
-#include "mso/catalog/catalog_internal.hpp"
+#include <picosha2.h>
+
+#include "mso/catalog/detail/catalog_internal.hpp"
+#include "mso/catalog/detail/patch_operations.hpp"
 #include "mso/catalog/library.hpp"
-#include "mso/catalog/patch_operations.hpp"
 
 namespace mso::catalog {
 using detail::PatchDirection;
+using detail::PatchEffects;
 namespace patch = detail::patch;
 
 namespace {
+
+constexpr std::size_t kMaximumCollectionNameCodePoints = 128;
 
 /// Canonical digest of a command's content (everything except its operation id), used to detect
 /// the same operation id being reused for a different request.
@@ -37,69 +40,109 @@ std::string command_digest(const EditCommand& command) {
     if (command.add_to_collection) document["add_to_collection"] = *command.add_to_collection;
     if (command.remove_from_collection) document["remove_from_collection"] = *command.remove_from_collection;
     if (command.removed) document["removed"] = *command.removed;
-    return picosha2::hash256_hex_string(document.dump());
+    return picosha2::hash256_hex_string(detail::to_json_text(document));
 }
 
 std::string command_digest(const TaxonomyCommand& command) {
-    nlohmann::json document = {
+    const nlohmann::json document = {
         {"kind", static_cast<int>(command.kind)},
         {"target", command.target_id},
         {"other", command.other_id ? nlohmann::json(*command.other_id) : nlohmann::json()},
         {"parent", command.new_parent_id ? nlohmann::json(*command.new_parent_id) : nlohmann::json()},
         {"name", command.new_name},
         {"query", command.smart_query ? nlohmann::json(*command.smart_query) : nlohmann::json()}};
-    return picosha2::hash256_hex_string(document.dump());
+    return picosha2::hash256_hex_string(detail::to_json_text(document));
 }
 
-nlohmann::json receipt_json(const MutationReceipt& receipt) {
+/// Digest of an undo or redo request (they carry no content beyond their direction).
+std::string history_step_digest(bool undoing) {
+    return picosha2::hash256_hex_string(std::string(undoing ? "{\"kind\":\"undo\"}" : "{\"kind\":\"redo\"}"));
+}
+
+nlohmann::json receipt_json(const MutationReceipt& receipt, std::size_t next_offset) {
     return nlohmann::json{{"operation", uuids::to_string(receipt.operation)},
                           {"revision", receipt.committed_revision},
                           {"action", receipt.history_action ? nlohmann::json(uuids::to_string(*receipt.history_action))
                                                             : nlohmann::json()},
                           {"applied", receipt.applied},
                           {"skipped", receipt.skipped},
-                          {"conflicted", receipt.conflicted}};
+                          {"conflicted", receipt.conflicted},
+                          {"next_offset", next_offset}};
 }
 
-MutationReceipt receipt_from_json(const nlohmann::json& document) {
+/// A receipt read back from command_receipts.
+struct StoredReceipt {
     MutationReceipt receipt;
-    receipt.operation = uuids::uuid::from_string(document.value("operation", std::string())).value_or(uuids::uuid());
-    receipt.committed_revision = document.value("revision", std::int64_t{0});
-    if (document.contains("action") && document["action"].is_string())
-        receipt.history_action = uuids::uuid::from_string(document["action"].get<std::string>());
-    receipt.applied = document.value("applied", std::int64_t{0});
-    receipt.skipped = document.value("skipped", std::int64_t{0});
-    receipt.conflicted = document.value("conflicted", std::int64_t{0});
-    receipt.replayed = true;
-    return receipt;
+    std::string state;  ///< running, completed, partial, failed
+    std::optional<std::int64_t> action_id;
+    std::size_t next_offset = 0;  ///< samples of the command already processed (chunked edits)
+};
+
+Result<StoredReceipt> stored_receipt_from(const std::string& text, std::string state,
+                                          std::optional<std::int64_t> action_id) {
+    const auto document = detail::parse_json(text);
+    const auto operation = detail::json_string_member(document, "operation");
+    const auto parsed_operation = operation ? uuids::uuid::from_string(*operation) : std::nullopt;
+    if (document.is_discarded() || !parsed_operation) return fail(ErrorCode::DbCorrupt, "stored receipt is malformed");
+    StoredReceipt stored;
+    stored.state = std::move(state);
+    stored.action_id = action_id;
+    stored.receipt.operation = *parsed_operation;
+    stored.receipt.committed_revision = detail::json_integer_member(document, "revision").value_or(0);
+    if (const auto action = detail::json_string_member(document, "action")) {
+        const auto action_uuid = uuids::uuid::from_string(*action);
+        if (!action_uuid) return fail(ErrorCode::DbCorrupt, "stored receipt names a malformed action");
+        stored.receipt.history_action = *action_uuid;
+    }
+    stored.receipt.applied = detail::json_integer_member(document, "applied").value_or(0);
+    stored.receipt.skipped = detail::json_integer_member(document, "skipped").value_or(0);
+    stored.receipt.conflicted = detail::json_integer_member(document, "conflicted").value_or(0);
+    stored.next_offset = static_cast<std::size_t>(
+        std::max<std::int64_t>(0, detail::json_integer_member(document, "next_offset").value_or(0)));
+    stored.receipt.replayed = true;
+    stored.receipt.partial = stored.state != "completed";
+    return stored;
 }
 
 /// Looks up a stored receipt. Same digest → the stored receipt; different digest → mismatch.
-Result<std::optional<MutationReceipt>> find_receipt(sqlite::Connection& connection, const uuids::uuid& operation,
-                                                    const std::string& digest) {
-    auto statement =
-        connection.prepare("SELECT command_digest, receipt_json FROM command_receipts WHERE operation_uuid=?1");
+Result<std::optional<StoredReceipt>> find_receipt(sqlite::Connection& connection, const uuids::uuid& operation,
+                                                  const std::string& digest) {
+    auto statement = connection.prepare(
+        "SELECT command_digest, receipt_json, state, action_id FROM command_receipts WHERE operation_uuid=?1");
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, uuids::to_string(operation));
     auto has_row = statement->next_row();
     if (!has_row) return std::unexpected(has_row.error());
-    if (!*has_row) return std::optional<MutationReceipt>{};
-    if (statement->column_text(0) != digest)
-        return fail(ErrorCode::IdempotencyMismatch, "this operation id was already used for a different request");
-    auto document = nlohmann::json::parse(statement->column_text(1), nullptr, false);
+    if (!*has_row) return std::optional<StoredReceipt>{};
+    const bool same_request = statement->column_text(0) == digest;
+    const std::string text = statement->column_text(1);
+    std::string state = statement->column_text(2);
+    const auto action_id = statement->column_optional_int64(3);
     statement->reset();
-    return std::optional<MutationReceipt>(receipt_from_json(document));
+    if (!same_request)
+        return fail(ErrorCode::IdempotencyMismatch, "this operation id was already used for a different request");
+    auto stored = stored_receipt_from(text, std::move(state), action_id);
+    if (!stored) return std::unexpected(stored.error());
+    return std::optional<StoredReceipt>(std::move(*stored));
 }
 
 Result<void> store_receipt(sqlite::Connection& connection, const MutationReceipt& receipt, const std::string& digest,
-                           std::string_view state, std::int64_t action_id) {
+                           std::string_view state, std::optional<std::int64_t> action_id, std::size_t next_offset = 0) {
     auto statement = connection.prepare(
         "INSERT INTO command_receipts(operation_uuid,command_digest,state,action_id,receipt_json,updated_at) "
         "VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(operation_uuid) DO UPDATE SET state=excluded.state, "
         "receipt_json=excluded.receipt_json, updated_at=excluded.updated_at");
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, uuids::to_string(receipt.operation)).bind(2, digest).bind(3, state).bind(4, action_id);
-    statement->bind(5, receipt_json(receipt).dump()).bind(6, now_unix_ms());
+    statement->bind(5, detail::to_json_text(receipt_json(receipt, next_offset))).bind(6, now_unix_ms());
+    return statement->run();
+}
+
+/// Runs one parameterized statement binding ?1 = id.
+Result<void> run_with_id(sqlite::Connection& connection, std::string_view sql, std::int64_t id) {
+    auto statement = connection.prepare(sql);
+    if (!statement) return std::unexpected(statement.error());
+    statement->bind(1, id);
     return statement->run();
 }
 
@@ -109,10 +152,15 @@ class ActionRecorder {
 public:
     explicit ActionRecorder(sqlite::Connection& connection) : connection_(connection) {}
 
+    /// The action row id (0 until started or attached).
     std::int64_t action_id() const { return action_id_; }
+    /// The action's UUID.
     const uuids::uuid& action_uuid() const { return action_uuid_; }
+    /// True once the action exists in the database.
+    bool exists() const { return action_id_ != 0; }
 
     /// Creates the action row (state 'applying'), supersedes the redo tail and moves the cursor.
+    /// History is kept without automatic pruning (docs/03_DATA_AND_SEARCH.md §9).
     Result<void> start(std::string_view label) {
         if (auto superseded =
                 connection_.execute_script("UPDATE history_actions SET state='superseded' WHERE state='undone'");
@@ -128,29 +176,45 @@ public:
             .bind(4, now_unix_ms());
         if (auto inserted = insert->run(); !inserted) return inserted;
         action_id_ = connection_.last_insert_rowid();
-        auto cursor = connection_.prepare("UPDATE history_state SET cursor_action_id=?1, active_action_id=?1");
-        if (!cursor) return std::unexpected(cursor.error());
-        cursor->bind(1, action_id_);
-        return cursor->run();
+        return run_with_id(connection_, "UPDATE history_state SET cursor_action_id=?1, active_action_id=?1",
+                           action_id_);
     }
 
-    /// Stores one chunk of operations (forward + inverse) at the given revision.
+    /// Adopts an existing partial action (a retried chunked edit) without touching the database.
+    void adopt(std::int64_t action_id, const uuids::uuid& uuid) {
+        action_id_ = action_id;
+        action_uuid_ = uuid;
+    }
+
+    /// Continues the adopted action: it becomes 'applying' again and new chunks continue its numbering.
+    Result<void> resume() {
+        auto next = connection_.prepare("SELECT COALESCE(max(chunk_index)+1,0) FROM history_chunks WHERE action_id=?1");
+        if (!next) return std::unexpected(next.error());
+        next->bind(1, action_id_);
+        auto has_row = next->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        next_chunk_index_ = *has_row ? next->column_int64(0) : 0;
+        next->reset();
+        if (auto applying =
+                run_with_id(connection_, "UPDATE history_actions SET state='applying' WHERE id=?1", action_id_);
+            !applying)
+            return applying;
+        return run_with_id(connection_, "UPDATE history_state SET active_action_id=?1", action_id_);
+    }
+
+    /// Stores one chunk of operations at the given revision. The inverse column of the released
+    /// schema is unused (undo reverses the forward operations), so it stores an empty array.
     Result<void> add_chunk(const nlohmann::json& operations, std::int64_t revision) {
-        nlohmann::json inverse = nlohmann::json::array();
-        for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
-            nlohmann::json reversed = *it;
-            std::swap(reversed["before"], reversed["after"]);
-            inverse.push_back(std::move(reversed));
-        }
         auto insert = connection_.prepare(
             "INSERT INTO history_chunks(action_id,chunk_index,forward_json,inverse_json,state,catalog_revision) "
-            "VALUES(?1,?2,?3,?4,'applied',?5)");
+            "VALUES(?1,?2,?3,'[]','applied',?4)");
         if (!insert) return std::unexpected(insert.error());
-        insert->bind(1, action_id_).bind(2, chunk_count_++).bind(3, operations.dump()).bind(4, inverse.dump());
-        insert->bind(5, revision);
+        insert->bind(1, action_id_).bind(2, next_chunk_index_++).bind(3, detail::to_json_text(operations));
+        insert->bind(4, revision);
         return insert->run();
     }
 
+    /// Marks the action completely applied and clears the in-progress marker.
     Result<void> finish() {
         auto update = connection_.prepare("UPDATE history_actions SET state='applied', completed_at=?2 WHERE id=?1");
         if (!update) return std::unexpected(update.error());
@@ -159,17 +223,20 @@ public:
         return connection_.execute_script("UPDATE history_state SET active_action_id=NULL");
     }
 
-    void attach(std::int64_t action_id, const uuids::uuid& uuid, int chunk_count) {
-        action_id_ = action_id;
-        action_uuid_ = uuid;
-        chunk_count_ = chunk_count;
+    /// Marks the action partially applied (its committed chunks stay undoable).
+    Result<void> mark_partial() {
+        if (auto partial =
+                run_with_id(connection_, "UPDATE history_actions SET state='partial' WHERE id=?1", action_id_);
+            !partial)
+            return partial;
+        return connection_.execute_script("UPDATE history_state SET active_action_id=NULL");
     }
 
 private:
     sqlite::Connection& connection_;
     std::int64_t action_id_ = 0;
     uuids::uuid action_uuid_;
-    int chunk_count_ = 0;
+    std::int64_t next_chunk_index_ = 0;
 };
 
 /// Translates an EditCommand for one chunk of samples into recorded patch operations,
@@ -179,10 +246,20 @@ public:
     EditPlanner(sqlite::Connection& connection, const EditCommand& command)
         : connection_(connection), command_(command) {}
 
-    /// Resolves tag/category paths and validates collections once per command.
+    /// Starts the counters from an earlier, partially applied run of the same command.
+    void continue_counts(std::int64_t applied, std::int64_t skipped) {
+        applied_ = applied;
+        skipped_ = skipped;
+    }
+
+    /// Resolves tag/category paths and validates collections once per command. Tags and categories
+    /// created here are recorded as undoable operations of the action.
     Result<void> prepare() {
+        std::vector<std::int64_t> created_tags;
+        std::vector<std::int64_t> created_categories;
         for (const auto& path : command_.tags_add) {
-            auto id = detail::resolve_taxonomy_path(connection_, detail::Taxonomy::Tags, path, /*create=*/true);
+            auto id = detail::resolve_taxonomy_path(connection_, detail::Taxonomy::Tags, path, /*create=*/true,
+                                                    &created_tags);
             if (!id) return std::unexpected(id.error());
             tags_to_add_.push_back(*id);
         }
@@ -194,11 +271,18 @@ public:
                 return std::unexpected(id.error());
         }
         if (command_.category && command_.category->has_value()) {
-            auto id =
-                detail::resolve_taxonomy_path(connection_, detail::Taxonomy::Categories, **command_.category, true);
+            auto id = detail::resolve_taxonomy_path(connection_, detail::Taxonomy::Categories, **command_.category,
+                                                    /*create=*/true, &created_categories);
             if (!id) return std::unexpected(id.error());
             category_id_ = *id;
         }
+        // Creation already happened: record it as applied so undo removes the new nodes again.
+        for (const auto id : created_tags)
+            operations_.push_back(patch::tag_row(id, "deleted", true, false));
+        for (const auto id : created_categories)
+            operations_.push_back(patch::category_row(id, "deleted", true, false));
+        if (!created_tags.empty() || !created_categories.empty()) effects_.structure_changed = true;
+
         for (const auto collection : {command_.add_to_collection, command_.remove_from_collection}) {
             if (!collection) continue;
             auto kind = connection_.prepare("SELECT kind FROM collections WHERE id=?1 AND deleted=0");
@@ -207,17 +291,18 @@ public:
             auto has_row = kind->next_row();
             if (!has_row) return std::unexpected(has_row.error());
             if (!*has_row) return fail(ErrorCode::NotFound, "collection not found");
-            if (kind->column_text(0) != "manual")
-                return fail(ErrorCode::InvalidArgument, "smart collections are defined by their query");
+            const bool manual = kind->column_text(0) == "manual";
+            kind->reset();
+            if (!manual) return fail(ErrorCode::InvalidArgument, "smart collections are defined by their query");
         }
         return {};
     }
 
     /// Applies the command to each sample of the chunk, recording operations.
     Result<void> apply(std::span<const std::int64_t> sample_ids) {
+        auto deleted = connection_.prepare("SELECT deleted FROM samples WHERE id=?1");
+        if (!deleted) return std::unexpected(deleted.error());
         for (const auto sample_id : sample_ids) {
-            auto deleted = connection_.prepare("SELECT deleted FROM samples WHERE id=?1");
-            if (!deleted) return std::unexpected(deleted.error());
             deleted->bind(1, sample_id);
             auto has_row = deleted->next_row();
             if (!has_row) return std::unexpected(has_row.error());
@@ -235,9 +320,13 @@ public:
         return {};
     }
 
+    /// Operations recorded since the last call.
     nlohmann::json take_operations() { return std::exchange(operations_, nlohmann::json::array()); }
-    std::set<std::int64_t>& affected() { return affected_; }
+    /// Structural effects of everything applied so far.
+    const PatchEffects& effects() const { return effects_; }
+    /// Samples the command was applied to so far.
     std::int64_t applied_count() const { return applied_; }
+    /// Samples skipped so far (missing or removed).
     std::int64_t skipped_count() const { return skipped_; }
 
 private:
@@ -252,52 +341,53 @@ private:
     }
 
     Result<void> record(nlohmann::json operation) {
-        if (auto applied = detail::apply_operation(connection_, operation, PatchDirection::Forward, affected_);
-            !applied)
+        if (auto applied = detail::apply_operation(connection_, operation, PatchDirection::Forward, effects_); !applied)
             return applied;
         operations_.push_back(std::move(operation));
         return {};
     }
 
-    Result<void> apply_to_sample(std::int64_t id) {
-        const auto& c = command_;
-        if (c.removed && !*c.removed)
-            if (auto done = set_field(id, "deleted", false); !done) return done;
-        if (c.rating)
-            if (auto done = set_field(id, "rating", *c.rating); !done) return done;
-        if (c.favorite)
-            if (auto done = set_field(id, "favorite", *c.favorite); !done) return done;
-        if (c.notes)
-            if (auto done = set_field(id, "notes", *c.notes); !done) return done;
-        if (c.display_name)
-            if (auto done = set_field(id, "display_name", trim(*c.display_name)); !done) return done;
-        if (c.category)
-            if (auto done =
-                    set_field(id, "category_id", category_id_ ? nlohmann::json(*category_id_) : nlohmann::json());
+    Result<void> apply_to_sample(std::int64_t sample_id) {
+        const auto& command = command_;
+        if (command.removed && !*command.removed)
+            if (auto done = set_field(sample_id, "deleted", false); !done) return done;
+        if (command.rating)
+            if (auto done = set_field(sample_id, "rating", *command.rating); !done) return done;
+        if (command.favorite)
+            if (auto done = set_field(sample_id, "favorite", *command.favorite); !done) return done;
+        if (command.notes)
+            if (auto done = set_field(sample_id, "notes", *command.notes); !done) return done;
+        if (command.display_name)
+            if (auto done = set_field(sample_id, "display_name", trim(*command.display_name)); !done) return done;
+        if (command.category)
+            if (auto done = set_field(sample_id, "category_id",
+                                      category_id_ ? nlohmann::json(*category_id_) : nlohmann::json());
                 !done)
                 return done;
-        if (c.bpm) {
-            nlohmann::json value = {{"state", to_string(c.bpm->state)},
-                                    {"milli", c.bpm->milli_bpm ? nlohmann::json(*c.bpm->milli_bpm) : nlohmann::json()}};
-            if (auto done = set_field(id, "bpm_override", value); !done) return done;
+        if (command.bpm) {
+            const nlohmann::json value = {
+                {"state", to_string(command.bpm->state)},
+                {"milli", command.bpm->milli_bpm ? nlohmann::json(*command.bpm->milli_bpm) : nlohmann::json()}};
+            if (auto done = set_field(sample_id, "bpm_override", value); !done) return done;
         }
-        if (c.key) {
-            nlohmann::json value = {
-                {"state", to_string(c.key->state)},
-                {"pitch_class", c.key->key ? nlohmann::json(c.key->key->pitch_class) : nlohmann::json()},
-                {"mode", c.key->key ? nlohmann::json(std::string(to_string(c.key->key->mode))) : nlohmann::json()}};
-            if (auto done = set_field(id, "key_override", value); !done) return done;
+        if (command.key) {
+            const auto& key = command.key->key;
+            const nlohmann::json value = {
+                {"state", to_string(command.key->state)},
+                {"pitch_class", key ? nlohmann::json(key->pitch_class) : nlohmann::json()},
+                {"mode", key ? nlohmann::json(std::string(to_string(key->mode))) : nlohmann::json()}};
+            if (auto done = set_field(sample_id, "key_override", value); !done) return done;
         }
         for (const auto tag : tags_to_add_)
-            if (auto done = link_tag(id, tag, true); !done) return done;
+            if (auto done = link_tag(sample_id, tag, true); !done) return done;
         for (const auto tag : tags_to_remove_)
-            if (auto done = link_tag(id, tag, false); !done) return done;
-        if (c.add_to_collection)
-            if (auto done = link_collection(id, *c.add_to_collection, true); !done) return done;
-        if (c.remove_from_collection)
-            if (auto done = link_collection(id, *c.remove_from_collection, false); !done) return done;
-        if (c.removed && *c.removed)
-            if (auto done = set_field(id, "deleted", true); !done) return done;
+            if (auto done = link_tag(sample_id, tag, false); !done) return done;
+        if (command.add_to_collection)
+            if (auto done = link_collection(sample_id, *command.add_to_collection, true); !done) return done;
+        if (command.remove_from_collection)
+            if (auto done = link_collection(sample_id, *command.remove_from_collection, false); !done) return done;
+        if (command.removed && *command.removed)
+            if (auto done = set_field(sample_id, "deleted", true); !done) return done;
         return {};
     }
 
@@ -306,7 +396,7 @@ private:
         nlohmann::json operation = patch::tag_link(sample_id, tag_id, !linked, linked);
         auto current = detail::read_current_value(connection_, operation);
         if (!current) return std::unexpected(current.error());
-        if (current->get<bool>() == linked) return {};
+        if (*current == nlohmann::json(linked)) return {};
         return record(std::move(operation));
     }
 
@@ -322,7 +412,7 @@ private:
             next->bind(1, collection_id);
             auto has_row = next->next_row();
             if (!has_row) return std::unexpected(has_row.error());
-            operation["after"] = next->column_int64(0);
+            operation["after"] = *has_row ? next->column_int64(0) : 1;
             next->reset();
         } else {
             operation["before"] = *current;
@@ -336,7 +426,7 @@ private:
     std::vector<std::int64_t> tags_to_remove_;
     std::optional<std::int64_t> category_id_;
     nlohmann::json operations_ = nlohmann::json::array();
-    std::set<std::int64_t> affected_;
+    PatchEffects effects_;
     std::int64_t applied_ = 0;
     std::int64_t skipped_ = 0;
 };
@@ -346,8 +436,8 @@ Result<bool> is_in_subtree(sqlite::Connection& connection, std::string_view tabl
                            std::int64_t candidate) {
     auto statement = connection.prepare(std::format(
         "WITH RECURSIVE chain(id,parent_id,depth) AS (SELECT id,parent_id,0 FROM {0} WHERE id=?1 "
-        "UNION ALL SELECT t.id,t.parent_id,c.depth+1 FROM {0} t JOIN chain c ON t.id=c.parent_id WHERE c.depth<32) "
-        "SELECT 1 FROM chain WHERE id=?2",
+        "UNION ALL SELECT node.id,node.parent_id,chain.depth+1 FROM {0} node JOIN chain ON node.id=chain.parent_id "
+        "WHERE chain.depth<32) SELECT 1 FROM chain WHERE id=?2",
         table));
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, candidate).bind(2, ancestor);
@@ -355,6 +445,36 @@ Result<bool> is_in_subtree(sqlite::Connection& connection, std::string_view tabl
     if (!has_row) return std::unexpected(has_row.error());
     statement->reset();
     return *has_row;
+}
+
+/// Levels below a node in its live subtree (0 for a leaf).
+Result<std::int64_t> subtree_height(sqlite::Connection& connection, std::string_view table, std::int64_t node) {
+    auto statement = connection.prepare(std::format(
+        "WITH RECURSIVE subtree(id,depth) AS (SELECT ?1,0 UNION ALL SELECT child.id,subtree.depth+1 FROM {0} child "
+        "JOIN subtree ON child.parent_id=subtree.id WHERE child.deleted=0 AND subtree.depth<32) "
+        "SELECT max(depth) FROM subtree",
+        table));
+    if (!statement) return std::unexpected(statement.error());
+    statement->bind(1, node);
+    auto has_row = statement->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    const auto height = *has_row ? statement->column_int64(0) : 0;
+    statement->reset();
+    return height;
+}
+
+/// NOT_FOUND unless the row exists and is not deleted.
+Result<void> ensure_live(sqlite::Connection& connection, std::string_view table, std::int64_t id,
+                         std::string_view what) {
+    auto statement = connection.prepare(std::format("SELECT deleted FROM {} WHERE id=?1", table));
+    if (!statement) return std::unexpected(statement.error());
+    statement->bind(1, id);
+    auto has_row = statement->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    const bool live = *has_row && statement->column_int64(0) == 0;
+    statement->reset();
+    if (!live) return fail(ErrorCode::NotFound, std::format("{} {} does not exist", what, id));
+    return {};
 }
 
 /// Rejects a name that a live sibling already uses (normalized comparison).
@@ -371,19 +491,38 @@ Result<void> ensure_unique_sibling(sqlite::Connection& connection, std::string_v
     return {};
 }
 
+/// Samples (sorted) linked to `tag`; with `lacking_tag`, only those not linked to that tag too.
+Result<std::vector<std::int64_t>> tag_members(sqlite::Connection& connection, std::int64_t tag,
+                                              std::optional<std::int64_t> lacking_tag) {
+    auto statement = connection.prepare(
+        "SELECT link.sample_id FROM sample_tags link WHERE link.tag_id=?1 AND (?2 IS NULL OR NOT EXISTS("
+        "SELECT 1 FROM sample_tags other WHERE other.sample_id=link.sample_id AND other.tag_id=?2)) "
+        "ORDER BY link.sample_id");
+    if (!statement) return std::unexpected(statement.error());
+    statement->bind(1, tag).bind(2, lacking_tag);
+    std::vector<std::int64_t> samples;
+    auto walked = detail::for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
+        samples.push_back(row.column_int64(0));
+        return {};
+    });
+    if (!walked) return std::unexpected(walked.error());
+    return samples;
+}
+
 /// Plans a structural edit into recorded operations (applied immediately).
 class TaxonomyPlanner {
 public:
     TaxonomyPlanner(sqlite::Connection& connection, const TaxonomyCommand& command)
         : connection_(connection), command_(command) {}
 
+    /// Validates and applies the command; returns the history label.
     Result<std::string> plan() {
         using Kind = TaxonomyCommand::Kind;
         switch (command_.kind) {
             case Kind::RenameTag:
-                return rename("tags", "Rename tag");
+                return rename(detail::Taxonomy::Tags, "Rename tag");
             case Kind::RenameCategory:
-                return rename("categories", "Rename category");
+                return rename(detail::Taxonomy::Categories, "Rename category");
             case Kind::MoveTag:
                 return move_tag();
             case Kind::MergeTag:
@@ -398,13 +537,14 @@ public:
         return fail(ErrorCode::InvalidArgument, "unknown taxonomy command");
     }
 
+    /// Operations recorded by plan().
     nlohmann::json take_operations() { return std::exchange(operations_, nlohmann::json::array()); }
-    std::set<std::int64_t>& affected() { return affected_; }
+    /// Effects of the applied operations.
+    const PatchEffects& effects() const { return effects_; }
 
 private:
     Result<void> record(nlohmann::json operation) {
-        if (auto applied = detail::apply_operation(connection_, operation, PatchDirection::Forward, affected_);
-            !applied)
+        if (auto applied = detail::apply_operation(connection_, operation, PatchDirection::Forward, effects_); !applied)
             return applied;
         operations_.push_back(std::move(operation));
         return {};
@@ -414,17 +554,25 @@ private:
         return detail::read_current_value(connection_, operation);
     }
 
-    Result<std::string> rename(std::string_view table, std::string_view verb) {
+    /// Text of a stored string value (rows written by this module always hold strings).
+    static std::string text_of(const nlohmann::json& value) {
+        return value.is_string() ? value.get<std::string>() : std::string();
+    }
+
+    Result<std::string> rename(detail::Taxonomy taxonomy, std::string_view verb) {
+        const bool is_tag = taxonomy == detail::Taxonomy::Tags;
+        const auto table = detail::taxonomy_table(taxonomy);
+        if (auto live = ensure_live(connection_, table, command_.target_id, is_tag ? "tag" : "category"); !live)
+            return std::unexpected(live.error());
         const std::string name = trim(command_.new_name);
-        if (auto segments = detail::split_taxonomy_path(name); !segments || segments->size() != 1)
+        if (auto segments = split_taxonomy_path(name); !segments || segments->size() != 1)
             return fail(ErrorCode::InvalidArgument, "a name must be one non-empty segment without '/'");
-        const bool is_tag = table == "tags";
-        nlohmann::json probe =
+        const nlohmann::json probe =
             is_tag ? patch::tag_row(command_.target_id, "parent_id", nlohmann::json(), nlohmann::json())
                    : patch::category_row(command_.target_id, "parent_id", nlohmann::json(), nlohmann::json());
         auto parent = current(probe);
         if (!parent) return std::unexpected(parent.error());
-        const auto parent_id = parent->is_null() ? std::optional<std::int64_t>() : parent->get<std::int64_t>();
+        const auto parent_id = detail::json_integer(*parent);
         if (auto unique = ensure_unique_sibling(connection_, table, command_.target_id, parent_id, name); !unique)
             return std::unexpected(unique.error());
         nlohmann::json operation = is_tag ? patch::tag_row(command_.target_id, "name", nlohmann::json(), name)
@@ -433,24 +581,34 @@ private:
         if (!before) return std::unexpected(before.error());
         operation["before"] = *before;
         if (auto done = record(std::move(operation)); !done) return std::unexpected(done.error());
-        return std::format("{} '{}' to '{}'", verb, before->get<std::string>(), name);
+        return std::format("{} '{}' to '{}'", verb, text_of(*before), name);
     }
 
     Result<std::string> move_tag() {
+        if (auto live = ensure_live(connection_, "tags", command_.target_id, "tag"); !live)
+            return std::unexpected(live.error());
+        auto height = subtree_height(connection_, "tags", command_.target_id);
+        if (!height) return std::unexpected(height.error());
+        std::int64_t parent_levels = 0;
         if (command_.new_parent_id) {
+            if (auto live = ensure_live(connection_, "tags", *command_.new_parent_id, "parent tag"); !live)
+                return std::unexpected(live.error());
             auto cyclic = is_in_subtree(connection_, "tags", command_.target_id, *command_.new_parent_id);
             if (!cyclic) return std::unexpected(cyclic.error());
             if (*cyclic) return fail(ErrorCode::InvalidArgument, "a tag cannot move under itself or its descendants");
-            auto depth = detail::taxonomy_path(connection_, detail::Taxonomy::Tags, *command_.new_parent_id);
-            if (!depth) return std::unexpected(depth.error());
-            if (std::ranges::count(*depth, '/') + 2 > 16)
-                return fail(ErrorCode::InvalidArgument, "hierarchy deeper than 16 levels");
+            auto parent_path = detail::taxonomy_path(connection_, detail::Taxonomy::Tags, *command_.new_parent_id);
+            if (!parent_path) return std::unexpected(parent_path.error());
+            parent_levels = std::ranges::count(*parent_path, '/') + 1;
         }
-        nlohmann::json name_probe = patch::tag_row(command_.target_id, "name", nlohmann::json(), nlohmann::json());
+        // The moved tag sits at parent_levels + 1; its deepest descendant `height` levels below.
+        if (parent_levels + 1 + *height > static_cast<std::int64_t>(kMaxTaxonomyDepth))
+            return fail(ErrorCode::InvalidArgument, "hierarchy deeper than 16 levels");
+        const nlohmann::json name_probe =
+            patch::tag_row(command_.target_id, "name", nlohmann::json(), nlohmann::json());
         auto name = current(name_probe);
         if (!name) return std::unexpected(name.error());
-        if (auto unique = ensure_unique_sibling(connection_, "tags", command_.target_id, command_.new_parent_id,
-                                                name->get<std::string>());
+        if (auto unique =
+                ensure_unique_sibling(connection_, "tags", command_.target_id, command_.new_parent_id, text_of(*name));
             !unique)
             return std::unexpected(unique.error());
         nlohmann::json operation =
@@ -460,16 +618,19 @@ private:
         if (!before) return std::unexpected(before.error());
         operation["before"] = *before;
         if (auto done = record(std::move(operation)); !done) return std::unexpected(done.error());
-        return std::format("Move tag '{}'", name->get<std::string>());
+        return std::format("Move tag '{}'", text_of(*name));
     }
 
-    /// Merge source into canonical: redirect alias, move memberships (remembering pre-existing
-    /// target links so undo restores exactly), tombstone the source.
+    /// Merge source into canonical: redirect alias, move memberships with two set-based operations
+    /// (remembering pre-existing target links so undo restores exactly), tombstone the source.
     Result<std::string> merge_tag() {
         if (!command_.other_id) return fail(ErrorCode::InvalidArgument, "merge needs a target tag");
         const auto source = command_.target_id;
+        if (auto live = ensure_live(connection_, "tags", source, "tag"); !live) return std::unexpected(live.error());
         auto target = detail::canonical_tag(connection_, *command_.other_id);
         if (!target) return std::unexpected(target.error());
+        if (auto live = ensure_live(connection_, "tags", *target, "target tag"); !live)
+            return std::unexpected(live.error());
         if (source == *target) return fail(ErrorCode::InvalidArgument, "a tag cannot be merged into itself");
         auto target_under_source = is_in_subtree(connection_, "tags", source, *target);
         auto source_under_target = is_in_subtree(connection_, "tags", *target, source);
@@ -485,75 +646,81 @@ private:
         children->reset();
         if (*has_children) return fail(ErrorCode::InvalidArgument, "move or merge the tag's children first");
 
-        if (auto done = record(patch::tag_row(source, "alias_of", nlohmann::json(), *target)); !done)
-            return std::unexpected(done.error());
-        auto members = connection_.prepare("SELECT sample_id FROM sample_tags WHERE tag_id=?1 ORDER BY sample_id");
-        if (!members) return std::unexpected(members.error());
-        members->bind(1, source);
-        std::vector<std::int64_t> samples;
-        auto walked = detail::for_each_row(*members, [&](sqlite::PreparedStatement& row) -> Result<void> {
-            samples.push_back(row.column_int64(0));
-            return {};
-        });
-        if (!walked) return std::unexpected(walked.error());
-        for (const auto sample : samples) {
-            if (auto done = record(patch::tag_link(sample, source, true, false)); !done)
-                return std::unexpected(done.error());
-            nlohmann::json link = patch::tag_link(sample, *target, false, true);
-            auto linked = current(link);
-            if (!linked) return std::unexpected(linked.error());
-            if (!linked->get<bool>())
-                if (auto done = record(std::move(link)); !done) return std::unexpected(done.error());
-        }
-        if (auto done = record(patch::tag_row(source, "deleted", false, true)); !done)
-            return std::unexpected(done.error());
         auto source_path = detail::taxonomy_path(connection_, detail::Taxonomy::Tags, source);
         auto target_path = detail::taxonomy_path(connection_, detail::Taxonomy::Tags, *target);
-        return std::format("Merge tag '{}' into '{}'", source_path.value_or("?"), target_path.value_or("?"));
+        if (!source_path) return std::unexpected(source_path.error());
+        if (!target_path) return std::unexpected(target_path.error());
+        auto members = tag_members(connection_, source, std::nullopt);
+        auto newly_linked = tag_members(connection_, source, *target);
+        if (!members) return std::unexpected(members.error());
+        if (!newly_linked) return std::unexpected(newly_linked.error());
+
+        nlohmann::json alias = patch::tag_row(source, "alias_of", nlohmann::json(), *target);
+        auto alias_before = current(alias);
+        if (!alias_before) return std::unexpected(alias_before.error());
+        alias["before"] = *alias_before;
+        if (auto done = record(std::move(alias)); !done) return std::unexpected(done.error());
+        if (!members->empty())
+            if (auto done = record(patch::tag_links(source, *members, true, false)); !done)
+                return std::unexpected(done.error());
+        if (!newly_linked->empty())
+            if (auto done = record(patch::tag_links(*target, *newly_linked, false, true)); !done)
+                return std::unexpected(done.error());
+        if (auto done = record(patch::tag_row(source, "deleted", false, true)); !done)
+            return std::unexpected(done.error());
+        return std::format("Merge tag '{}' into '{}'", *source_path, *target_path);
     }
 
     Result<std::string> create_collection() {
         const std::string name = trim(command_.new_name);
-        if (name.empty() || count_code_points(name) > 128)
+        if (name.empty() || !is_valid_utf8(name) || count_code_points(name) > kMaximumCollectionNameCodePoints)
             return fail(ErrorCode::InvalidArgument, "collection name must be 1–128 characters");
         auto insert = connection_.prepare(
-            "INSERT INTO collections(uuid,name,kind,query_json,query_version,deleted) VALUES(?1,?2,?3,?4,?5,1)");
+            "INSERT INTO collections(uuid,name,kind,query_json,query_version,deleted) "
+            "VALUES(new_uuid(),?1,?2,?3,?4,1)");
         if (!insert) return std::unexpected(insert.error());
-        insert->bind(1, uuids::to_string(new_uuid())).bind(2, name).bind(3, command_.smart_query ? "smart" : "manual");
+        insert->bind(1, name).bind(2, command_.smart_query ? "smart" : "manual");
         if (command_.smart_query)
-            insert->bind(4, nlohmann::json{{"text", *command_.smart_query}}.dump()).bind(5, 1);
+            insert->bind(3, detail::to_json_text(nlohmann::json{{"text", *command_.smart_query}})).bind(4, 1);
         else
-            insert->bind_null(4).bind_null(5);
+            insert->bind_null(3).bind_null(4);
         if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
-        created_id_ = connection_.last_insert_rowid();
-        if (auto done = record(patch::collection_row(created_id_, "deleted", true, false)); !done)
+        const auto created_id = connection_.last_insert_rowid();
+        if (auto done = record(patch::collection_row(created_id, "deleted", true, false)); !done)
             return std::unexpected(done.error());
         return std::format("Create collection '{}'", name);
     }
 
     Result<std::string> rename_collection() {
+        if (auto live = ensure_live(connection_, "collections", command_.target_id, "collection"); !live)
+            return std::unexpected(live.error());
         const std::string name = trim(command_.new_name);
-        if (name.empty() || count_code_points(name) > 128)
+        if (name.empty() || !is_valid_utf8(name) || count_code_points(name) > kMaximumCollectionNameCodePoints)
             return fail(ErrorCode::InvalidArgument, "collection name must be 1–128 characters");
         nlohmann::json operation = patch::collection_row(command_.target_id, "name", nlohmann::json(), name);
         auto before = current(operation);
         if (!before) return std::unexpected(before.error());
         operation["before"] = *before;
         if (auto done = record(std::move(operation)); !done) return std::unexpected(done.error());
-        return std::format("Rename collection '{}' to '{}'", before->get<std::string>(), name);
+        return std::format("Rename collection '{}' to '{}'", text_of(*before), name);
     }
 
     Result<std::string> delete_collection() {
+        if (auto live = ensure_live(connection_, "collections", command_.target_id, "collection"); !live)
+            return std::unexpected(live.error());
+        const nlohmann::json name_probe =
+            patch::collection_row(command_.target_id, "name", nlohmann::json(), nlohmann::json());
+        auto name = current(name_probe);
+        if (!name) return std::unexpected(name.error());
         if (auto done = record(patch::collection_row(command_.target_id, "deleted", false, true)); !done)
             return std::unexpected(done.error());
-        return std::string("Delete collection");
+        return std::format("Delete collection '{}'", text_of(*name));
     }
 
     sqlite::Connection& connection_;
     const TaxonomyCommand& command_;
     nlohmann::json operations_ = nlohmann::json::array();
-    std::set<std::int64_t> affected_;
-    std::int64_t created_id_ = 0;
+    PatchEffects effects_;
 };
 
 /// Identifier of the action the cursor points at, if any.
@@ -567,6 +734,20 @@ Result<std::optional<std::int64_t>> cursor_action(sqlite::Connection& connection
     return id;
 }
 
+/// Whether a partially applied edit can continue: it is still the newest action at the cursor.
+Result<bool> is_resumable(sqlite::Connection& connection, std::int64_t action_id) {
+    auto statement = connection.prepare(
+        "SELECT action.state IN ('applying','partial') AND history.cursor_action_id=action.id "
+        "FROM history_actions action, history_state history WHERE action.id=?1");
+    if (!statement) return std::unexpected(statement.error());
+    statement->bind(1, action_id);
+    auto has_row = statement->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    const bool resumable = *has_row && statement->column_int64(0) != 0;
+    statement->reset();
+    return resumable;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- apply_edit
@@ -575,60 +756,100 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
     if (auto writable = ensure_writable(); !writable) return std::unexpected(writable.error());
     if (auto valid = validate(command); !valid) return std::unexpected(valid.error());
     const std::string digest = command_digest(command);
-    std::lock_guard lock(writer_mutex_);
+    const std::lock_guard lock(writer_mutex_);
 
-    if (auto stored = find_receipt(writer_, command.operation, digest); !stored)
-        return std::unexpected(stored.error());
-    else if (*stored)
-        return **stored;
+    auto stored = find_receipt(writer_, command.operation, digest);
+    if (!stored) return std::unexpected(stored.error());
 
     MutationReceipt receipt{.operation = command.operation};
     ActionRecorder action(writer_);
     EditPlanner planner(writer_, command);
+    std::size_t offset = 0;
+    bool resuming = false;
+    if (*stored) {
+        if ((*stored)->state == "completed") return (*stored)->receipt;
+        // An earlier attempt committed some chunks. Continue it only while it is still the newest
+        // history entry; otherwise report what was applied as partial.
+        const bool has_action = (*stored)->action_id.has_value() && (*stored)->receipt.history_action.has_value();
+        auto resumable = has_action ? is_resumable(writer_, *(*stored)->action_id) : Result<bool>(false);
+        if (!resumable) return std::unexpected(resumable.error());
+        if (!*resumable) return (*stored)->receipt;  // replayed = true, partial = true
+        receipt = (*stored)->receipt;
+        receipt.replayed = false;
+        receipt.partial = false;
+        offset = (*stored)->next_offset;
+        planner.continue_counts(receipt.applied, receipt.skipped);
+        action.adopt(*(*stored)->action_id, *receipt.history_action);
+        resuming = true;
+    }
+
     const std::string label = describe(command);
     const std::span<const std::int64_t> all_samples(command.sample_ids);
     bool prepared = false;
+    bool committed_any = false;
 
-    // Each chunk is its own short transaction; the first one creates the action and receipt.
-    for (std::size_t offset = 0; offset < all_samples.size(); offset += EditCommand::kSamplesPerChunk) {
+    // Each chunk is its own short transaction; the first one creates (or resumes) the action.
+    auto commit_chunk = [&](std::span<const std::int64_t> chunk, bool last_chunk) -> Result<void> {
+        sqlite::WriteTransaction transaction(writer_);
+        if (auto began = transaction.begin(); !began) return began;
+        if (!prepared) {
+            if (auto ready = planner.prepare(); !ready) return ready;
+            if (resuming) {
+                if (auto resumed = action.resume(); !resumed) return resumed;
+            } else {
+                if (auto started = action.start(label); !started) return started;
+                receipt.history_action = action.action_uuid();
+            }
+        }
+        if (auto applied = planner.apply(chunk); !applied) return applied;
+        const nlohmann::json operations = planner.take_operations();
+        auto revision =
+            detail::advance_revision(writer_, {.kind = "edit",
+                                               .structure_changed = planner.effects().structure_changed,
+                                               .details = {{"action", uuids::to_string(action.action_uuid())}}});
+        if (!revision) return std::unexpected(revision.error());
+        if (!operations.empty())
+            if (auto chunked = action.add_chunk(operations, *revision); !chunked) return chunked;
+        if (last_chunk)
+            if (auto finished = action.finish(); !finished) return finished;
+        MutationReceipt next = receipt;
+        next.committed_revision = *revision;
+        next.applied = planner.applied_count();
+        next.skipped = planner.skipped_count();
+        const std::size_t next_offset = static_cast<std::size_t>(chunk.data() - all_samples.data()) + chunk.size();
+        if (auto saved = store_receipt(writer_, next, digest, last_chunk ? "completed" : "running", action.action_id(),
+                                       next_offset);
+            !saved)
+            return saved;
+        if (auto committed = commit_revision(transaction, *revision); !committed) return committed;
+        prepared = true;
+        committed_any = true;
+        receipt = next;
+        return {};
+    };
+
+    for (; offset < all_samples.size(); offset += EditCommand::kSamplesPerChunk) {
         const auto chunk =
             all_samples.subspan(offset, std::min(EditCommand::kSamplesPerChunk, all_samples.size() - offset));
         const bool last_chunk = offset + chunk.size() >= all_samples.size();
-        sqlite::WriteTransaction transaction(writer_);
-        if (auto began = transaction.begin(); !began) return std::unexpected(began.error());
-        if (!prepared) {
-            if (auto ready = planner.prepare(); !ready) return std::unexpected(ready.error());
-            if (auto started = action.start(label); !started) return std::unexpected(started.error());
-            receipt.history_action = action.action_uuid();
-            prepared = true;
+        if (auto committed = commit_chunk(chunk, last_chunk); !committed) {
+            if (committed_any || resuming) {
+                // Earlier chunks stay committed: the action and its receipt become partial (a retry
+                // with the same operation id resumes here) instead of looking applied or running.
+                sqlite::WriteTransaction transaction(writer_);
+                auto marked = transaction.begin();
+                if (marked) marked = action.mark_partial();
+                if (marked) marked = store_receipt(writer_, receipt, digest, "partial", action.action_id(), offset);
+                if (marked) marked = transaction.commit();
+                if (!marked) {
+                    Error error = committed.error();
+                    error.safe_detail +=
+                        std::format(" (and recording the partial edit failed: {})", marked.error().safe_detail);
+                    return std::unexpected(std::move(error));
+                }
+            }
+            return std::unexpected(committed.error());
         }
-        if (auto applied = planner.apply(chunk); !applied) return std::unexpected(applied.error());
-        const nlohmann::json operations = planner.take_operations();
-        if (auto projected = detail::refresh_search_projection(writer_, planner.affected()); !projected)
-            return std::unexpected(projected.error());
-        planner.affected().clear();
-
-        nlohmann::json samples = nlohmann::json::array();
-        for (const auto id : chunk)
-            samples.push_back(id);
-        auto revision = detail::advance_revision(
-            writer_,
-            nlohmann::json{{"kind", "edit"}, {"action", uuids::to_string(action.action_uuid())}, {"samples", samples}});
-        if (!revision) return std::unexpected(revision.error());
-        if (!operations.empty())
-            if (auto chunked = action.add_chunk(operations, *revision); !chunked)
-                return std::unexpected(chunked.error());
-
-        receipt.committed_revision = *revision;
-        receipt.applied = planner.applied_count();
-        receipt.skipped = planner.skipped_count();
-        if (last_chunk)
-            if (auto finished = action.finish(); !finished) return std::unexpected(finished.error());
-        if (auto stored =
-                store_receipt(writer_, receipt, digest, last_chunk ? "completed" : "running", action.action_id());
-            !stored)
-            return std::unexpected(stored.error());
-        if (auto committed = transaction.commit(); !committed) return std::unexpected(committed.error());
     }
     return receipt;
 }
@@ -636,11 +857,10 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
 Result<MutationReceipt> Library::apply_taxonomy(const TaxonomyCommand& command) {
     if (auto writable = ensure_writable(); !writable) return std::unexpected(writable.error());
     const std::string digest = command_digest(command);
-    std::lock_guard lock(writer_mutex_);
-    if (auto stored = find_receipt(writer_, command.operation, digest); !stored)
-        return std::unexpected(stored.error());
-    else if (*stored)
-        return **stored;
+    const std::lock_guard lock(writer_mutex_);
+    auto stored = find_receipt(writer_, command.operation, digest);
+    if (!stored) return std::unexpected(stored.error());
+    if (*stored) return (*stored)->receipt;
 
     sqlite::WriteTransaction transaction(writer_);
     if (auto began = transaction.begin(); !began) return std::unexpected(began.error());
@@ -654,21 +874,21 @@ Result<MutationReceipt> Library::apply_taxonomy(const TaxonomyCommand& command) 
     relabel->bind(1, action.action_id()).bind(2, *label);
     if (auto relabeled = relabel->run(); !relabeled) return std::unexpected(relabeled.error());
 
-    if (auto projected = detail::refresh_search_projection(writer_, planner.affected()); !projected)
-        return std::unexpected(projected.error());
-    auto revision = detail::advance_revision(
-        writer_, nlohmann::json{{"kind", "taxonomy"}, {"action", uuids::to_string(action.action_uuid())}});
+    auto revision =
+        detail::advance_revision(writer_, {.kind = "taxonomy",
+                                           .structure_changed = true,
+                                           .details = {{"action", uuids::to_string(action.action_uuid())}}});
     if (!revision) return std::unexpected(revision.error());
     if (auto chunked = action.add_chunk(planner.take_operations(), *revision); !chunked)
         return std::unexpected(chunked.error());
     if (auto finished = action.finish(); !finished) return std::unexpected(finished.error());
-    MutationReceipt receipt{.operation = command.operation,
-                            .committed_revision = *revision,
-                            .history_action = action.action_uuid(),
-                            .applied = 1};
-    if (auto stored = store_receipt(writer_, receipt, digest, "completed", action.action_id()); !stored)
-        return std::unexpected(stored.error());
-    if (auto committed = transaction.commit(); !committed) return std::unexpected(committed.error());
+    const MutationReceipt receipt{.operation = command.operation,
+                                  .committed_revision = *revision,
+                                  .history_action = action.action_uuid(),
+                                  .applied = 1};
+    if (auto saved = store_receipt(writer_, receipt, digest, "completed", action.action_id()); !saved)
+        return std::unexpected(saved.error());
+    if (auto committed = commit_revision(transaction, *revision); !committed) return std::unexpected(committed.error());
     return receipt;
 }
 
@@ -676,165 +896,201 @@ Result<MutationReceipt> Library::apply_taxonomy(const TaxonomyCommand& command) 
 
 namespace {
 
+/// The action an undo or redo would step over.
+struct HistoryTarget {
+    std::int64_t id = 0;
+    uuids::uuid uuid;
+    bool completed = false;  ///< all chunks were applied (completed_at set), as opposed to partial
+};
+
 /// Applies all chunks of an action in one direction, inside the caller's transaction.
 Result<std::int64_t> replay_action(sqlite::Connection& connection, std::int64_t action_id, PatchDirection direction,
-                                   std::set<std::int64_t>& affected) {
+                                   PatchEffects& effects) {
     const bool undoing = direction == PatchDirection::Inverse;
-    auto chunks = connection.prepare(std::format(
-        "SELECT chunk_index, forward_json FROM history_chunks WHERE action_id=?1 AND state=?2 ORDER BY chunk_index {}",
-        undoing ? "DESC" : "ASC"));
+    auto chunks = connection.prepare(
+        undoing ? "SELECT chunk_index, forward_json FROM history_chunks WHERE action_id=?1 AND state='applied' "
+                  "ORDER BY chunk_index DESC"
+                : "SELECT chunk_index, forward_json FROM history_chunks WHERE action_id=?1 AND state='undone' "
+                  "ORDER BY chunk_index ASC");
     if (!chunks) return std::unexpected(chunks.error());
-    chunks->bind(1, action_id).bind(2, undoing ? "applied" : "undone");
+    chunks->bind(1, action_id);
     std::vector<std::pair<std::int64_t, nlohmann::json>> loaded;
     auto walked = detail::for_each_row(*chunks, [&](sqlite::PreparedStatement& row) -> Result<void> {
-        loaded.emplace_back(row.column_int64(0), nlohmann::json::parse(row.column_text(1)));
+        auto operations = detail::parse_json(row.column_text(1));
+        if (!operations.is_array())
+            return fail(ErrorCode::DbCorrupt,
+                        std::format("history chunk {} of action {} is malformed", row.column_int64(0), action_id));
+        loaded.emplace_back(row.column_int64(0), std::move(operations));
         return {};
     });
     if (!walked) return std::unexpected(walked.error());
 
+    auto mark = connection.prepare("UPDATE history_chunks SET state=?3 WHERE action_id=?1 AND chunk_index=?2");
+    if (!mark) return std::unexpected(mark.error());
     std::int64_t operations_applied = 0;
     for (const auto& [index, operations] : loaded) {
         if (undoing) {
-            for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
-                if (auto applied = detail::apply_operation(connection, *it, direction, affected); !applied)
+            for (auto operation = operations.rbegin(); operation != operations.rend(); ++operation) {
+                if (auto applied = detail::apply_operation(connection, *operation, direction, effects); !applied)
                     return std::unexpected(applied.error());
                 ++operations_applied;
             }
         } else {
             for (const auto& operation : operations) {
-                if (auto applied = detail::apply_operation(connection, operation, direction, affected); !applied)
+                if (auto applied = detail::apply_operation(connection, operation, direction, effects); !applied)
                     return std::unexpected(applied.error());
                 ++operations_applied;
             }
         }
-        auto mark = connection.prepare("UPDATE history_chunks SET state=?3 WHERE action_id=?1 AND chunk_index=?2");
-        if (!mark) return std::unexpected(mark.error());
         mark->bind(1, action_id).bind(2, index).bind(3, undoing ? "undone" : "applied");
         if (auto marked = mark->run(); !marked) return std::unexpected(marked.error());
     }
     return operations_applied;
 }
 
-/// Records a conflict in its own transaction after the failed attempt was rolled back.
-void record_history_conflict(sqlite::Connection& connection, std::int64_t action_id, const Error& error) {
-    sqlite::WriteTransaction transaction(connection);
-    if (!transaction.begin()) return;
-    if (!detail::add_review_item(connection, "history_conflict", std::nullopt,
-                                 nlohmann::json{{"action_id", action_id}, {"detail", error.safe_detail}}))
-        return;
-    (void)transaction.commit();
+/// Finds the action at the cursor (undo) or the oldest undone action (redo) and checks that this
+/// build can replay its payload version.
+Result<HistoryTarget> find_history_target(sqlite::Connection& connection, bool undoing) {
+    std::optional<std::int64_t> id;
+    if (undoing) {
+        auto cursor = cursor_action(connection);
+        if (!cursor) return std::unexpected(cursor.error());
+        id = *cursor;
+    } else {
+        auto next = connection.prepare("SELECT id FROM history_actions WHERE state='undone' ORDER BY id LIMIT 1");
+        if (!next) return std::unexpected(next.error());
+        auto has_row = next->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        if (*has_row) id = next->column_int64(0);
+        next->reset();
+    }
+    if (!id) return fail(ErrorCode::NotFound, undoing ? "nothing to undo" : "nothing to redo");
+
+    auto info = connection.prepare(
+        "SELECT uuid, state, command_version, completed_at IS NOT NULL FROM history_actions WHERE id=?1");
+    if (!info) return std::unexpected(info.error());
+    info->bind(1, *id);
+    auto has_row = info->next_row();
+    if (!has_row) return std::unexpected(has_row.error());
+    if (!*has_row) return fail(ErrorCode::DbCorrupt, "the history cursor points at a missing action");
+    const std::string uuid_text = info->column_text(0);
+    const std::string state = info->column_text(1);
+    const auto version = info->column_int64(2);
+    const bool completed = info->column_int64(3) != 0;
+    info->reset();
+    if (undoing && state != "applied" && state != "partial") return fail(ErrorCode::NotFound, "nothing to undo");
+    if (version > detail::kHistoryCommandVersion)
+        return fail(ErrorCode::SchemaTooNew, "this history entry was written by a newer version of the application");
+    if (version < detail::kOldestReadableHistoryCommandVersion)
+        return fail(ErrorCode::DbCorrupt, std::format("history entry version {} is not supported", version));
+    auto uuid = detail::parse_stored_uuid(uuid_text, "history action");
+    if (!uuid) return std::unexpected(uuid.error());
+    return HistoryTarget{*id, *uuid, completed};
 }
 
 }  // namespace
 
-Result<MutationReceipt> Library::undo() {
+Result<MutationReceipt> Library::undo(const uuids::uuid& operation) {
+    return step_history(operation, /*undoing=*/true);
+}
+
+Result<MutationReceipt> Library::redo(const uuids::uuid& operation) {
+    return step_history(operation, /*undoing=*/false);
+}
+
+Result<MutationReceipt> Library::step_history(const uuids::uuid& operation, bool undoing) {
     if (auto writable = ensure_writable(); !writable) return std::unexpected(writable.error());
-    std::lock_guard lock(writer_mutex_);
-    std::int64_t action_id = 0;
-    MutationReceipt receipt{.operation = new_uuid()};
+    const std::string digest = history_step_digest(undoing);
+    const std::lock_guard lock(writer_mutex_);
+    auto stored = find_receipt(writer_, operation, digest);
+    if (!stored) return std::unexpected(stored.error());
+    if (*stored) return (*stored)->receipt;  // a retried undo never reverts a second action
+
+    HistoryTarget target;
+    Error conflict;
     {
         sqlite::WriteTransaction transaction(writer_);
         if (auto began = transaction.begin(); !began) return std::unexpected(began.error());
-        auto cursor = cursor_action(writer_);
-        if (!cursor) return std::unexpected(cursor.error());
-        if (!*cursor) return fail(ErrorCode::NotFound, "nothing to undo");
-        action_id = **cursor;
-        auto info = writer_.prepare("SELECT uuid, state FROM history_actions WHERE id=?1");
-        if (!info) return std::unexpected(info.error());
-        info->bind(1, action_id);
-        if (auto has_row = info->next_row(); !has_row || !*has_row)
-            return fail(ErrorCode::NotFound, "history cursor is dangling");
-        receipt.history_action = uuids::uuid::from_string(info->column_text(0));
-        const std::string state = info->column_text(1);
-        info->reset();
-        if (state != "applied" && state != "partial") return fail(ErrorCode::NotFound, "nothing to undo");
+        auto found = find_history_target(writer_, undoing);
+        if (!found) return std::unexpected(found.error());
+        target = *found;
 
-        std::set<std::int64_t> affected;
-        auto applied = replay_action(writer_, action_id, PatchDirection::Inverse, affected);
-        if (!applied) {
-            const Error error = applied.error();
-            if (error.code == ErrorCode::HistoryConflict) {
-                writer_.rollback();
-                record_history_conflict(writer_, action_id, error);
-            }
-            return std::unexpected(error);
+        PatchEffects effects;
+        auto applied =
+            replay_action(writer_, target.id, undoing ? PatchDirection::Inverse : PatchDirection::Forward, effects);
+        if (applied) {
+            const std::string_view new_state = undoing ? "undone" : (target.completed ? "applied" : "partial");
+            auto mark = writer_.prepare("UPDATE history_actions SET state=?2 WHERE id=?1");
+            if (!mark) return std::unexpected(mark.error());
+            mark->bind(1, target.id).bind(2, new_state);
+            if (auto marked = mark->run(); !marked) return std::unexpected(marked.error());
+            auto move = writer_.prepare(
+                undoing ? "UPDATE history_state SET cursor_action_id=(SELECT max(id) FROM history_actions "
+                          "WHERE id<?1 AND state IN ('applied','partial'))"
+                        : "UPDATE history_state SET cursor_action_id=?1");
+            if (!move) return std::unexpected(move.error());
+            move->bind(1, target.id);
+            if (auto moved = move->run(); !moved) return std::unexpected(moved.error());
+            auto revision = detail::advance_revision(writer_, {.kind = undoing ? "undo" : "redo",
+                                                               .structure_changed = effects.structure_changed,
+                                                               .details = {{"action", uuids::to_string(target.uuid)}}});
+            if (!revision) return std::unexpected(revision.error());
+            const MutationReceipt receipt{.operation = operation,
+                                          .committed_revision = *revision,
+                                          .history_action = target.uuid,
+                                          .applied = *applied};
+            if (auto saved = store_receipt(writer_, receipt, digest, "completed", target.id); !saved)
+                return std::unexpected(saved.error());
+            if (auto committed = commit_revision(transaction, *revision); !committed)
+                return std::unexpected(committed.error());
+            return receipt;
         }
-        if (auto projected = detail::refresh_search_projection(writer_, affected); !projected)
-            return std::unexpected(projected.error());
-        auto mark = writer_.prepare("UPDATE history_actions SET state='undone' WHERE id=?1");
-        if (!mark) return std::unexpected(mark.error());
-        mark->bind(1, action_id);
-        if (auto marked = mark->run(); !marked) return std::unexpected(marked.error());
-        auto move = writer_.prepare(
-            "UPDATE history_state SET cursor_action_id=(SELECT max(id) FROM history_actions "
-            "WHERE id<?1 AND state IN ('applied','partial'))");
-        if (!move) return std::unexpected(move.error());
-        move->bind(1, action_id);
-        if (auto moved = move->run(); !moved) return std::unexpected(moved.error());
-        auto revision = detail::advance_revision(writer_, nlohmann::json{{"kind", "undo"}, {"action_id", action_id}});
-        if (!revision) return std::unexpected(revision.error());
-        receipt.committed_revision = *revision;
-        receipt.applied = *applied;
-        if (auto committed = transaction.commit(); !committed) return std::unexpected(committed.error());
-    }
-    return receipt;
-}
+        if (applied.error().code != ErrorCode::HistoryConflict) return std::unexpected(applied.error());
+        conflict = applied.error();
+    }  // the failed attempt rolls back here
 
-Result<MutationReceipt> Library::redo() {
-    if (auto writable = ensure_writable(); !writable) return std::unexpected(writable.error());
-    std::lock_guard lock(writer_mutex_);
+    // Record the conflict once: the action leaves the undo/redo path (state 'conflict'), so retrying
+    // neither repeats the review item nor blocks older actions.
     sqlite::WriteTransaction transaction(writer_);
-    if (auto began = transaction.begin(); !began) return std::unexpected(began.error());
-    auto next = writer_.prepare("SELECT id, uuid FROM history_actions WHERE state='undone' ORDER BY id LIMIT 1");
-    if (!next) return std::unexpected(next.error());
-    auto has_row = next->next_row();
-    if (!has_row) return std::unexpected(has_row.error());
-    if (!*has_row) return fail(ErrorCode::NotFound, "nothing to redo");
-    const std::int64_t action_id = next->column_int64(0);
-    MutationReceipt receipt{.operation = new_uuid(), .history_action = uuids::uuid::from_string(next->column_text(1))};
-    next->reset();
-
-    std::set<std::int64_t> affected;
-    auto applied = replay_action(writer_, action_id, PatchDirection::Forward, affected);
-    if (!applied) {
-        const Error error = applied.error();
-        if (error.code == ErrorCode::HistoryConflict) {
-            writer_.rollback();
-            record_history_conflict(writer_, action_id, error);
-        }
-        return std::unexpected(error);
+    auto recorded = transaction.begin();
+    if (recorded) recorded = run_with_id(writer_, "UPDATE history_actions SET state='conflict' WHERE id=?1", target.id);
+    if (recorded)
+        recorded = run_with_id(writer_,
+                               undoing ? "UPDATE history_state SET cursor_action_id=(SELECT max(id) FROM "
+                                         "history_actions WHERE id<?1 AND state IN ('applied','partial'))"
+                                       : "UPDATE history_actions SET state='superseded' WHERE state='undone' AND id>?1",
+                               target.id);
+    if (recorded)
+        recorded = detail::add_review_item(writer_, "history_conflict", std::nullopt,
+                                           nlohmann::json{{"action_id", target.id},
+                                                          {"action", uuids::to_string(target.uuid)},
+                                                          {"direction", undoing ? "undo" : "redo"},
+                                                          {"detail", conflict.safe_detail}});
+    if (recorded) {
+        auto revision = detail::advance_revision(
+            writer_, {.kind = "history_conflict", .details = {{"action", uuids::to_string(target.uuid)}}});
+        recorded = revision ? commit_revision(transaction, *revision) : Result<void>(std::unexpected(revision.error()));
     }
-    if (auto projected = detail::refresh_search_projection(writer_, affected); !projected)
-        return std::unexpected(projected.error());
-    auto mark = writer_.prepare("UPDATE history_actions SET state='applied' WHERE id=?1");
-    if (!mark) return std::unexpected(mark.error());
-    mark->bind(1, action_id);
-    if (auto marked = mark->run(); !marked) return std::unexpected(marked.error());
-    auto move = writer_.prepare("UPDATE history_state SET cursor_action_id=?1");
-    if (!move) return std::unexpected(move.error());
-    move->bind(1, action_id);
-    if (auto moved = move->run(); !moved) return std::unexpected(moved.error());
-    auto revision = detail::advance_revision(writer_, nlohmann::json{{"kind", "redo"}, {"action_id", action_id}});
-    if (!revision) return std::unexpected(revision.error());
-    receipt.committed_revision = *revision;
-    receipt.applied = *applied;
-    if (auto committed = transaction.commit(); !committed) return std::unexpected(committed.error());
-    return receipt;
+    if (!recorded)
+        conflict.safe_detail += std::format(" (and recording the conflict failed: {})", recorded.error().safe_detail);
+    return std::unexpected(std::move(conflict));
 }
 
 Result<std::vector<HistoryEntry>> Library::history(std::size_t limit) {
     auto reader = acquire_reader();
     if (!reader) return std::unexpected(reader.error());
     auto statement = reader->connection().prepare(
-        "SELECT a.id, a.uuid, a.label, a.state, a.created_at, (a.id = h.cursor_action_id) "
-        "FROM history_actions a, history_state h WHERE a.state<>'superseded' ORDER BY a.id DESC LIMIT ?1");
+        "SELECT action.id, action.uuid, action.label, action.state, action.created_at, "
+        "(action.id IS history.cursor_action_id) FROM history_actions action, history_state history "
+        "WHERE action.state<>'superseded' ORDER BY action.id DESC LIMIT ?1");
     if (!statement) return std::unexpected(statement.error());
-    statement->bind(1, static_cast<std::int64_t>(limit));
+    statement->bind(1, static_cast<std::int64_t>(std::min<std::size_t>(limit, 100'000)));
     std::vector<HistoryEntry> entries;
     auto walked = detail::for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
-        entries.push_back(
-            HistoryEntry{row.column_int64(0), uuids::uuid::from_string(row.column_text(1)).value_or(uuids::uuid()),
-                         row.column_text(2), row.column_text(3), row.column_int64(4), row.column_int64(5) != 0});
+        auto uuid = detail::parse_stored_uuid(row.column_text(1), "history action");
+        if (!uuid) return std::unexpected(uuid.error());
+        entries.push_back(HistoryEntry{row.column_int64(0), *uuid, row.column_text(2), row.column_text(3),
+                                       row.column_int64(4), row.column_int64(5) != 0});
         return {};
     });
     if (!walked) return std::unexpected(walked.error());

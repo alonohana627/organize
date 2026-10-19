@@ -1,5 +1,7 @@
 #include "mso/ui/star_rating_widget.hpp"
 
+#include <QAccessible>
+#include <QAccessibleWidget>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
@@ -23,9 +25,42 @@ int rating_for_key(int key) {
     return -1;
 }
 
+/// Exposes the stars to assistive technology as a slider from 0 to 5; setting the value rates.
+class AccessibleStarRating final : public QAccessibleWidget, public QAccessibleValueInterface {
+public:
+    explicit AccessibleStarRating(StarRatingWidget* stars) : QAccessibleWidget(stars, QAccessible::Slider) {}
+
+    void* interface_cast(QAccessible::InterfaceType type) override {
+        if (type == QAccessible::ValueInterface) return static_cast<QAccessibleValueInterface*>(this);
+        return QAccessibleWidget::interface_cast(type);
+    }
+    QVariant currentValue() const override { return stars()->rating(); }
+    void setCurrentValue(const QVariant& value) override {
+        emit stars() -> ratingChosen(std::clamp(value.toInt(), 0, StarRating::kMaximumRating));
+    }
+    QVariant maximumValue() const override { return StarRating::kMaximumRating; }
+    QVariant minimumValue() const override { return 0; }
+    QVariant minimumStepSize() const override { return 1; }
+
+private:
+    StarRatingWidget* stars() const { return static_cast<StarRatingWidget*>(widget()); }
+};
+
+/// QAccessible factory for StarRatingWidget (installed once, on first construction).
+QAccessibleInterface* accessible_star_rating_factory(const QString& class_name, QObject* object) {
+    if (class_name == QLatin1String("mso::ui::StarRatingWidget") && object && object->isWidgetType())
+        return new AccessibleStarRating(static_cast<StarRatingWidget*>(object));
+    return nullptr;
+}
+
 }  // namespace
 
 StarRatingWidget::StarRatingWidget(QWidget* parent) : QWidget(parent) {
+    static const bool accessibility_installed = [] {
+        QAccessible::installFactory(&accessible_star_rating_factory);
+        return true;
+    }();
+    Q_UNUSED(accessibility_installed);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
     setCursor(Qt::PointingHandCursor);
@@ -36,13 +71,18 @@ StarRatingWidget::StarRatingWidget(QWidget* parent) : QWidget(parent) {
 }
 
 void StarRatingWidget::set_rating(int rating) {
-    rating_ = std::clamp(rating, 0, StarRating::kMaximumRating);
+    rating = std::clamp(rating, 0, StarRating::kMaximumRating);
+    if (rating == rating_ && !mixed_) return;
+    rating_ = rating;
     mixed_ = false;
     update_accessible_text();
+    QAccessibleValueChangeEvent changed(this, rating_);
+    QAccessible::updateAccessibility(&changed);
     update();
 }
 
 void StarRatingWidget::set_mixed(bool mixed) {
+    if (mixed == mixed_ && (!mixed || rating_ == 0)) return;
     mixed_ = mixed;
     if (mixed) rating_ = 0;
     update_accessible_text();

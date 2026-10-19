@@ -40,13 +40,18 @@ protected:
 private:
     /// Pixel size of one star, derived from the font so it follows the DPI and the user's font.
     int star_size() const;
+    /// Where the stars are drawn (inside the focus margin).
     QRect strip_area() const;
     /// Emits ratingChosen for a click on `star`; clicking the current rating clears it to 0.
     void choose(int star);
+    /// Describes the rating for screen readers.
     void update_accessible_text();
 
+    /// Shown rating 0..5.
     int rating_ = 0;
+    /// Star under the pointer (hover preview), or 0.
     int hovered_star_ = 0;
+    /// A multi-selection with differing ratings.
     bool mixed_ = false;
 };
 

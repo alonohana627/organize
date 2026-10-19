@@ -19,6 +19,6 @@ Validated 2026-10-19 in the preparation environment with Python's SQLite 3.53.1.
 
 The source schema intentionally relies on application validation for recursive hierarchy cycles, cross-root folder references, field provenance, content revisions, command-digest comparisons, history semantics and publication protocols. The checks do not claim those future services are implemented.
 
-Not executed: C++/Qt build, Windows/WASAPI/DAW integration, real-media decoding, million-row performance, model export/inference, ANN recall, audio-quality evaluation, application crash recovery, or production migration execution. Their acceptance procedures and gates are specified in chapter 06.
+Not executed in this specification-phase validation (before any implementation existed): C++/Qt build, Windows/WASAPI/DAW integration, real-media decoding, million-row performance, model export/inference, ANN recall, audio-quality evaluation, application crash recovery, or production migration execution. Their acceptance procedures and gates are specified in chapter 06. What the implementation has since built and verified, and what is still unverified, is recorded in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 To repeat document/schema checks, run `python3 tools/validate_spec.py`. To regenerate the combined handoff after source edits, run `python3 tools/build_handoff.py`. The build script does not require network access or third-party Python packages.

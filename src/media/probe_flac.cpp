@@ -1,8 +1,7 @@
 // Native FLAC metadata probe.
-#include <algorithm>
 
-#include "mso/media/probe_formats.hpp"
-#include "mso/media/vorbis_comment.hpp"
+#include "mso/media/detail/probe_formats.hpp"
+#include "mso/media/detail/vorbis_comment.hpp"
 
 namespace mso::media::detail {
 
@@ -37,9 +36,9 @@ Result<void> probe_flac(BoundedFileReader& reader, std::uint64_t stream_offset, 
             if (auto parsed = parse_flac_streaminfo(*streaminfo, result); !parsed) return parsed;
             has_stream_info = true;
         } else if (type == kBlockVorbisComment) {
-            auto block = reader.read_available(payload_offset, std::min<std::size_t>(length, kMaxTagBytes));
-            if (!block) return std::unexpected(block.error());
-            parse_vorbis_comment(*block, result.tags);
+            // Streamed entry by entry: oversized entries (embedded pictures) are skipped unread.
+            FileRangeCommentSource comments(reader, payload_offset, length);
+            if (auto read = read_vorbis_comment(comments, result.tags); !read) return read;
         }
         if (flags & kLastBlockFlag) break;
         offset = payload_offset + length;  // 24-bit lengths cannot overflow

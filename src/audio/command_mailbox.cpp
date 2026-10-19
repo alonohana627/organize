@@ -1,10 +1,14 @@
-#include "mso/audio/command_mailbox.hpp"
+#include "mso/audio/detail/command_mailbox.hpp"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 
-namespace mso::audio {
+#include <readerwriterqueue/readerwriterqueue.h>
+
+#include "mso/audio/detail/overloaded.hpp"
+
+namespace mso::audio::detail {
 namespace {
 
 /// Seek payloads: a plain non-negative frame, or a fraction in parts per billion tagged by the top bit.
@@ -24,14 +28,17 @@ std::uint64_t encode_gain(float gain) noexcept {
     return std::bit_cast<std::uint32_t>(gain);
 }
 
-template <class... Handlers>
-struct Overloaded : Handlers... {
-    using Handlers::operator()...;
-};
-
 }  // namespace
 
-CommandMailbox::CommandMailbox() : queue_(kGeneralCapacity), payload_cells_(queue_.max_capacity() + 1) {}
+/// The moodycamel queue, kept out of the header.
+struct CommandMailbox::EntryQueue {
+    moodycamel::ReaderWriterQueue<Entry> entries{kGeneralCapacity};  ///< preallocated entry FIFO
+};
+
+CommandMailbox::CommandMailbox()
+    : queue_(std::make_unique<EntryQueue>()), payload_cells_(queue_->entries.max_capacity() + 1) {}
+
+CommandMailbox::~CommandMailbox() = default;
 
 bool CommandMailbox::post(const TransportCommand& command) noexcept {
     return std::visit(Overloaded{
@@ -66,6 +73,9 @@ bool CommandMailbox::post(const TransportCommand& command) noexcept {
                           [this](const transport::SetPlaybackMode& mode) {
                               return push(EntryKind::PlaybackMode, static_cast<std::uint64_t>(mode.mode));
                           },
+                          [this](const transport::SetSeamFades& fades) {
+                              return push(EntryKind::SeamFades, fades.enabled ? 1u : 0u);
+                          },
                       },
                       command);
 }
@@ -76,9 +86,9 @@ bool CommandMailbox::push(EntryKind kind, std::uint64_t payload, std::optional<L
     }
     // The cell's previous entry has been popped (see payload_cells_), so overwriting it is safe
     // even if the queue turns out to be full.
-    const std::size_t cell = static_cast<std::size_t>(enqueued_count_ % payload_cells_.size());
+    const auto cell = static_cast<std::size_t>(enqueued_count_ % payload_cells_.size());
     payload_cells_[cell].store(payload, std::memory_order_relaxed);
-    if (!queue_.try_enqueue(Entry{kind, next_sequence_, cell, loop})) {
+    if (!queue_->entries.try_enqueue(Entry{kind, next_sequence_, cell, loop})) {
         return reject();
     }
     ++next_sequence_;
@@ -114,8 +124,11 @@ bool CommandMailbox::is_coalescing(EntryKind kind) noexcept {
 }
 
 std::optional<TransportCommand> CommandMailbox::take() noexcept {
+    // Peek first, then read the Stop sequence. The producer stores a Stop before it enqueues anything
+    // posted later, so once the peek (an acquire) shows an entry, every Stop posted before that entry
+    // is visible to the load below; the reverse order could hand out "Stop, Play" as "Play, Stop".
+    const Entry* front = queue_->entries.peek();
     const std::uint64_t stop = stop_sequence_.load(std::memory_order_acquire);
-    const Entry* front = queue_.peek();
     // A Stop goes out once everything posted before it has been delivered. Of several Stops not
     // yet delivered only the newest remains; the result is the same, a stopped transport at 0.
     if (stop > delivered_stop_sequence_ && (front == nullptr || front->sequence > stop)) {
@@ -127,7 +140,7 @@ std::optional<TransportCommand> CommandMailbox::take() noexcept {
     }
     const Entry entry = *front;
     const std::uint64_t payload = payload_cells_[entry.cell].exchange(kTakenPayload, std::memory_order_acq_rel);
-    queue_.pop();
+    queue_->entries.pop();
     return decode(entry, payload);
 }
 
@@ -154,10 +167,12 @@ TransportCommand CommandMailbox::decode(const Entry& entry, std::uint64_t payloa
             return transport::SetPitch{std::bit_cast<double>(payload)};
         case EntryKind::PlaybackMode:
             return transport::SetPlaybackMode{static_cast<PlaybackMode>(payload)};
+        case EntryKind::SeamFades:
+            return transport::SetSeamFades{payload != 0};
         case EntryKind::Loop:
             return transport::SetLoop{entry.loop};
     }
     return transport::Stop{};
 }
 
-}  // namespace mso::audio
+}  // namespace mso::audio::detail

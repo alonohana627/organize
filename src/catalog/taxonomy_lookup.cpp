@@ -1,6 +1,6 @@
 #include "mso/catalog/taxonomy_lookup.hpp"
 
-#include "mso/catalog/catalog_internal.hpp"
+#include "mso/catalog/detail/catalog_internal.hpp"
 
 namespace mso::catalog {
 

@@ -2,23 +2,15 @@
 
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QLocale>
 #include <QStringList>
 
 #include <cmath>
 
+#include "mso/domain/analysis_flags.hpp"
+
 namespace mso::ui {
-
-namespace {
-
-/// Bits of SampleRow::analysis_flags (see catalog/library_analysis.cpp).
-constexpr std::int64_t kAnalyzedTempo = 1;
-constexpr std::int64_t kAnalyzedKey = 2;
-constexpr std::int64_t kAnalyzedWaveform = 4;
-constexpr std::int64_t kAnalyzedHash = 8;
-constexpr std::int64_t kAnalyzedLoudness = 16;
-
-}  // namespace
 
 QString DisplayFormat::from_utf8(std::string_view text) {
     return QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
@@ -30,11 +22,25 @@ std::string DisplayFormat::to_utf8(const QString& text) {
 }
 
 QString DisplayFormat::from_path(const std::filesystem::path& path) {
-    return QDir::toNativeSeparators(QString::fromStdU16String(path.generic_u16string()));
+#ifdef _WIN32
+    // Native paths are UTF-16 here: no conversion can fail or lose characters.
+    return QDir::toNativeSeparators(QString::fromStdWString(path.native()));
+#else
+    // POSIX file names are bytes; Qt's file-name codec round-trips even non-UTF-8 names.
+    return QFile::decodeName(QByteArray::fromStdString(path.native()));
+#endif
 }
 
 std::filesystem::path DisplayFormat::to_path(const QString& text) {
-    return std::filesystem::path(QDir::fromNativeSeparators(text).toStdU16String());
+#ifdef _WIN32
+    return std::filesystem::path(QDir::toNativeSeparators(text).toStdWString());
+#else
+    return std::filesystem::path(QFile::encodeName(text).toStdString());
+#endif
+}
+
+QUrl DisplayFormat::to_file_url(const std::filesystem::path& path) {
+    return QUrl::fromLocalFile(QDir::fromNativeSeparators(from_path(path)));
 }
 
 QString DisplayFormat::from_uuid(const uuids::uuid& id) {
@@ -79,7 +85,7 @@ QString DisplayFormat::bit_depth(std::optional<std::int64_t> bits) {
 
 QString DisplayFormat::byte_size(std::optional<std::int64_t> bytes) {
     if (!bytes) return {};
-    return from_utf8(format_byte_size(*bytes));
+    return QLocale().formattedDataSize(*bytes, 1, QLocale::DataSizeIecFormat);
 }
 
 QString DisplayFormat::bpm(std::optional<std::int64_t> milli_bpm) {

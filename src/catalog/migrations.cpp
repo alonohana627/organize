@@ -2,9 +2,7 @@
 
 #include <picosha2.h>
 
-#include <format>
-
-#include "mso/domain/core.hpp"
+#include <string>
 
 namespace mso::catalog {
 
@@ -257,17 +255,33 @@ static constexpr std::string_view kMigration4 = R"SQL(
 CREATE INDEX locations_missing_by_size ON locations(byte_size) WHERE state='missing';
 )SQL";
 
+// History and analysis-queue indexes (review round 2026-10-19): new actions supersede the redo tail
+// by state; root availability changes block/unblock jobs by sample; receipts are looked up by state.
+static constexpr std::string_view kMigration5 = R"SQL(
+CREATE INDEX history_actions_state ON history_actions(state,id);
+CREATE INDEX jobs_sample ON jobs(sample_id,state);
+CREATE INDEX command_receipts_state ON command_receipts(state,updated_at);
+)SQL";
+
 const std::vector<Migration>& migrations() {
     static const std::vector<Migration> list = [] {
-        std::vector<Migration> v{
+        std::vector<Migration> shipped{
             {1, "core catalog, history, search projection", kMigration1, {}},
             {2, "analysis runs, jobs, artifacts", kMigration2, {}},
             {3, "file operations, duplicate edges", kMigration3, {}},
             {4, "index for missing-location lookups", kMigration4, {}},
+            {5, "history state, job sample and receipt indexes", kMigration5, {}},
         };
-        for (auto& m : v)
-            m.checksum = picosha2::hash256_hex_string(m.sql.begin(), m.sql.end());
-        return v;
+        for (auto& migration : shipped) {
+            // Hash with LF line ends whatever the checkout did, so a CRLF working copy can never
+            // change a released checksum.
+            std::string normalized;
+            normalized.reserve(migration.sql.size());
+            for (const char character : migration.sql)
+                if (character != '\r') normalized.push_back(character);
+            migration.checksum = picosha2::hash256_hex_string(normalized);
+        }
+        return shipped;
     }();
     return list;
 }

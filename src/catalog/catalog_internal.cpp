@@ -1,4 +1,4 @@
-#include "mso/catalog/catalog_internal.hpp"
+#include "mso/catalog/detail/catalog_internal.hpp"
 
 #include <format>
 
@@ -8,87 +8,123 @@ namespace mso::catalog::detail {
 
 namespace {
 
-constexpr std::size_t kMaxTaxonomyDepth = 16;
-constexpr std::size_t kMaxTaxonomyNameCodePoints = 128;
+constexpr std::int64_t kMinimumMilliBpm = 20'000;
+constexpr std::int64_t kMaximumMilliBpm = 400'000;
 
-std::string_view table_name(Taxonomy taxonomy) {
-    return taxonomy == Taxonomy::Tags ? "tags" : "categories";
+/// Per-connection TEMP tables (disk-backed: temp_store=FILE). Their contents take part in the open
+/// transaction, so a rollback also forgets what a failed mutation marked.
+constexpr std::string_view kChangeTrackingTables = R"SQL(
+CREATE TEMP TABLE IF NOT EXISTS changed_samples (
+ sample_id INTEGER PRIMARY KEY, search_text INTEGER NOT NULL DEFAULT 0
+);
+CREATE TEMP TABLE IF NOT EXISTS projection_tag_paths (tag_id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+CREATE TEMP TABLE IF NOT EXISTS projection_category_paths (category_id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+)SQL";
+
+/// Display paths of every tag linked to a queued sample (one recursive walk for the whole set).
+constexpr std::string_view kFillTagPathsSql =
+    "INSERT INTO temp.projection_tag_paths(tag_id, path) "
+    "WITH RECURSIVE tag_chain(tag_id, ancestor_id, path, depth) AS ("
+    " SELECT tag.id, tag.parent_id, tag.name, 0 FROM tags tag WHERE tag.id IN ("
+    "  SELECT link.tag_id FROM sample_tags link JOIN temp.changed_samples queued "
+    "  ON queued.sample_id=link.sample_id WHERE queued.search_text=1)"
+    " UNION ALL SELECT chain.tag_id, parent.parent_id, parent.name || '/' || chain.path, chain.depth+1 "
+    " FROM tag_chain chain JOIN tags parent ON parent.id=chain.ancestor_id WHERE chain.depth<16)"
+    " SELECT tag_id, path FROM tag_chain WHERE ancestor_id IS NULL";
+
+/// Display paths of every category assigned to a queued sample.
+constexpr std::string_view kFillCategoryPathsSql =
+    "INSERT INTO temp.projection_category_paths(category_id, path) "
+    "WITH RECURSIVE category_chain(category_id, ancestor_id, path, depth) AS ("
+    " SELECT category.id, category.parent_id, category.name, 0 FROM categories category WHERE category.id IN ("
+    "  SELECT sample.category_id FROM samples sample JOIN temp.changed_samples queued "
+    "  ON queued.sample_id=sample.id WHERE queued.search_text=1)"
+    " UNION ALL SELECT chain.category_id, parent.parent_id, parent.name || '/' || chain.path, chain.depth+1 "
+    " FROM category_chain chain JOIN categories parent ON parent.id=chain.ancestor_id WHERE chain.depth<16)"
+    " SELECT category_id, path FROM category_chain WHERE ancestor_id IS NULL";
+
+/// Upserts the projection row of every queued live sample in one statement.
+constexpr std::string_view kUpsertProjectionSql =
+    "INSERT INTO sample_search(sample_id, name, path, tags, category, notes, embedded) "
+    "SELECT sample.id, sample.display_name, "
+    " COALESCE((SELECT group_concat(root.name || '/' || location.relative_path, ' | ' ORDER BY location.id) "
+    "  FROM locations location JOIN roots root ON root.id=location.root_id "
+    "  WHERE location.sample_id=sample.id AND location.state<>'retired'), ''), "
+    " COALESCE((SELECT group_concat(tag_path.path, ' | ' ORDER BY link.tag_id) "
+    "  FROM sample_tags link JOIN temp.projection_tag_paths tag_path ON tag_path.tag_id=link.tag_id "
+    "  WHERE link.sample_id=sample.id), ''), "
+    " COALESCE((SELECT category_path.path FROM temp.projection_category_paths category_path "
+    "  WHERE category_path.category_id=sample.category_id), ''), "
+    " sample.notes, "
+    " COALESCE((SELECT CASE WHEN json_type(observation.value_json)='text' "
+    "   THEN json_extract(observation.value_json, '$') END "
+    "  FROM metadata_observations observation WHERE observation.sample_id=sample.id "
+    "  AND observation.field='embedded_text' AND observation.valid=1 "
+    "  AND observation.content_revision=sample.content_revision ORDER BY observation.id DESC LIMIT 1), '') "
+    "FROM samples sample JOIN temp.changed_samples queued ON queued.sample_id=sample.id "
+    "WHERE queued.search_text=1 AND sample.deleted=0 "
+    "ON CONFLICT(sample_id) DO UPDATE SET name=excluded.name, path=excluded.path, tags=excluded.tags, "
+    "category=excluded.category, notes=excluded.notes, embedded=excluded.embedded";
+
+/// Removes projection rows of queued samples that are tombstoned or gone.
+constexpr std::string_view kRemoveProjectionSql =
+    "DELETE FROM sample_search WHERE sample_id IN (SELECT sample_id FROM temp.changed_samples WHERE search_text=1) "
+    "AND NOT EXISTS(SELECT 1 FROM samples sample WHERE sample.id=sample_search.sample_id AND sample.deleted=0)";
+
+Result<void> run_statement(sqlite::Connection& connection, std::string_view sql) {
+    auto statement = connection.prepare(sql);
+    if (!statement) return std::unexpected(statement.error());
+    return statement->run();
 }
 
-/// Joins the display paths of a sample's (canonical) tags with " | ".
-Result<std::string> joined_tag_paths(sqlite::Connection& connection, std::int64_t sample_id) {
-    auto statement = connection.prepare("SELECT tag_id FROM sample_tags WHERE sample_id=?1 ORDER BY tag_id");
-    if (!statement) return std::unexpected(statement.error());
-    statement->bind(1, sample_id);
-    std::string joined;
-    auto walked = for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
-        auto path = taxonomy_path(connection, Taxonomy::Tags, row.column_int64(0));
-        if (!path) return std::unexpected(path.error());
-        if (!joined.empty()) joined += " | ";
-        joined += *path;
-        return {};
-    });
-    if (!walked) return std::unexpected(walked.error());
-    return joined;
-}
-
-/// Joins a sample's live location paths ("Root/sub/file.wav") with " | ".
-Result<std::string> joined_location_paths(sqlite::Connection& connection, std::int64_t sample_id) {
-    auto statement = connection.prepare(
-        "SELECT r.name, l.relative_path FROM locations l JOIN roots r ON r.id=l.root_id "
-        "WHERE l.sample_id=?1 AND l.state<>'retired' ORDER BY l.id");
-    if (!statement) return std::unexpected(statement.error());
-    statement->bind(1, sample_id);
-    std::string joined;
-    auto walked = for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
-        if (!joined.empty()) joined += " | ";
-        joined += row.column_text(0) + "/" + row.column_text(1);
-        return {};
-    });
-    if (!walked) return std::unexpected(walked.error());
-    return joined;
-}
-
-/// Latest valid observation value of `field` for the sample's current content revision.
-Result<std::optional<std::string>> current_observation_text(sqlite::Connection& connection, std::int64_t sample_id,
-                                                            std::string_view field) {
-    auto statement = connection.prepare(
-        "SELECT o.value_json FROM metadata_observations o JOIN samples s ON s.id=o.sample_id "
-        "WHERE o.sample_id=?1 AND o.field=?2 AND o.valid=1 AND o.content_revision=s.content_revision "
-        "ORDER BY o.id DESC LIMIT 1");
-    if (!statement) return std::unexpected(statement.error());
-    statement->bind(1, sample_id).bind(2, field);
-    auto has_row = statement->next_row();
+/// Prunes the outbox to the backlog cap and flags consumers that lost envelopes as baseline-required.
+Result<void> enforce_outbox_cap(sqlite::Connection& connection) {
+    auto cutoff = connection.prepare(
+        "SELECT revision FROM (SELECT revision, sum(length(payload_json)) OVER (ORDER BY revision DESC) AS newer_bytes "
+        "FROM catalog_outbox) WHERE newer_bytes>?1 ORDER BY revision DESC LIMIT 1");
+    if (!cutoff) return std::unexpected(cutoff.error());
+    cutoff->bind(1, kMaximumOutboxBytes);
+    auto has_row = cutoff->next_row();
     if (!has_row) return std::unexpected(has_row.error());
-    if (!*has_row) return std::optional<std::string>{};
-    auto value = nlohmann::json::parse(statement->column_text(0), nullptr, false);
-    if (value.is_string()) return std::optional<std::string>(value.get<std::string>());
-    return std::optional<std::string>{};
+    if (!*has_row) return {};
+    const std::int64_t oldest_dropped_through = cutoff->column_int64(0);
+    cutoff->reset();
+    auto prune = connection.prepare("DELETE FROM catalog_outbox WHERE revision<=?1");
+    if (!prune) return std::unexpected(prune.error());
+    prune->bind(1, oldest_dropped_through);
+    if (auto pruned = prune->run(); !pruned) return pruned;
+    auto flag = connection.prepare("UPDATE consumer_cursors SET baseline_required=1 WHERE revision<?1");
+    if (!flag) return std::unexpected(flag.error());
+    flag->bind(1, oldest_dropped_through);
+    return flag->run();
 }
 
-/// One provenanced candidate for an effective musical fact.
+/// Latest valid observation of `field` for the sample's current content revision, preferring the
+/// highest-precedence source (accepted suggestion > container > analysis > filename).
 struct Candidate {
     nlohmann::json value;
     std::string source;
     std::optional<double> confidence;
 };
 
-/// Highest-precedence valid observation of `field` (container > analysis > filename).
 Result<std::optional<Candidate>> best_observation(sqlite::Connection& connection, std::int64_t sample_id,
                                                   std::string_view field) {
     auto statement = connection.prepare(
-        "SELECT o.value_json, o.source, o.confidence FROM metadata_observations o JOIN samples s ON s.id=o.sample_id "
-        "WHERE o.sample_id=?1 AND o.field=?2 AND o.valid=1 AND o.content_revision=s.content_revision "
-        "ORDER BY CASE o.source WHEN 'accepted_suggestion' THEN 0 WHEN 'container' THEN 1 WHEN 'analysis' THEN 2 "
-        "ELSE 3 END, o.id DESC LIMIT 1");
+        "SELECT observation.value_json, observation.source, observation.confidence FROM metadata_observations "
+        "observation JOIN samples sample ON sample.id=observation.sample_id WHERE observation.sample_id=?1 "
+        "AND observation.field=?2 AND observation.valid=1 AND observation.content_revision=sample.content_revision "
+        "ORDER BY CASE observation.source WHEN 'accepted_suggestion' THEN 0 WHEN 'container' THEN 1 "
+        "WHEN 'analysis' THEN 2 ELSE 3 END, observation.id DESC LIMIT 1");
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, sample_id).bind(2, field);
     auto has_row = statement->next_row();
     if (!has_row) return std::unexpected(has_row.error());
     if (!*has_row) return std::optional<Candidate>{};
-    auto value = nlohmann::json::parse(statement->column_text(0), nullptr, false);
-    if (value.is_discarded() || value.is_null()) return std::optional<Candidate>{};
-    return std::optional<Candidate>(Candidate{value, statement->column_text(1), statement->column_optional_double(2)});
+    auto value = parse_json(statement->column_text(0));
+    auto candidate = Candidate{std::move(value), statement->column_text(1), statement->column_optional_double(2)};
+    statement->reset();
+    if (candidate.value.is_discarded() || candidate.value.is_null()) return std::optional<Candidate>{};
+    return std::optional<Candidate>(std::move(candidate));
 }
 
 }  // namespace
@@ -98,7 +134,10 @@ Result<void> for_each_row(sqlite::PreparedStatement& statement,
     while (true) {
         auto has_row = statement.next_row();
         if (!has_row) return std::unexpected(has_row.error());
-        if (!*has_row) return {};
+        if (!*has_row) {
+            statement.reset();
+            return {};
+        }
         if (auto handled = row(statement); !handled) {
             statement.reset();
             return handled;
@@ -106,99 +145,128 @@ Result<void> for_each_row(sqlite::PreparedStatement& statement,
     }
 }
 
-Result<std::int64_t> advance_revision(sqlite::Connection& connection, const nlohmann::json& envelope) {
-    if (auto bumped =
-            connection.execute_script("UPDATE library_state SET catalog_revision=catalog_revision+1 WHERE singleton=1");
-        !bumped)
-        return std::unexpected(bumped.error());
-    auto revision = connection.query_int64("SELECT catalog_revision FROM library_state WHERE singleton=1");
-    if (!revision) return std::unexpected(revision.error());
-    auto insert = connection.prepare(
-        "INSERT INTO catalog_outbox(revision,envelope_version,payload_json,created_at) VALUES(?1,?2,?3,?4)");
-    if (!insert) return std::unexpected(insert.error());
-    insert->bind(1, *revision).bind(2, kOutboxEnvelopeVersion).bind(3, envelope.dump()).bind(4, now_unix_ms());
-    if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
-    return *revision;
+Result<uuids::uuid> parse_stored_uuid(std::string_view text, std::string_view what) {
+    auto uuid = uuids::uuid::from_string(text);
+    if (!uuid) return fail(ErrorCode::DbCorrupt, std::format("stored {} UUID '{}' is malformed", what, text));
+    return *uuid;
 }
 
-Result<void> refresh_search_projection(sqlite::Connection& connection, const std::set<std::int64_t>& sample_ids) {
-    auto select_sample =
-        connection.prepare("SELECT display_name, notes, category_id, deleted FROM samples WHERE id=?1");
-    auto remove = connection.prepare("DELETE FROM sample_search WHERE sample_id=?1");
-    auto upsert = connection.prepare(
-        "INSERT INTO sample_search(sample_id,name,path,tags,category,notes,embedded) VALUES(?1,?2,?3,?4,?5,?6,?7) "
-        "ON CONFLICT(sample_id) DO UPDATE SET name=excluded.name, path=excluded.path, tags=excluded.tags, "
-        "category=excluded.category, notes=excluded.notes, embedded=excluded.embedded");
-    if (!select_sample) return std::unexpected(select_sample.error());
-    if (!remove) return std::unexpected(remove.error());
-    if (!upsert) return std::unexpected(upsert.error());
+// ---------------------------------------------------------------- change tracking and outbox
 
-    for (const std::int64_t sample_id : sample_ids) {
-        select_sample->bind(1, sample_id);
-        auto has_row = select_sample->next_row();
-        if (!has_row) return std::unexpected(has_row.error());
-        if (!*has_row || select_sample->column_int64(3) != 0) {
-            select_sample->reset();
-            remove->bind(1, sample_id);
-            if (auto removed = remove->run(); !removed) return removed;
-            continue;
-        }
-        const std::string display_name = select_sample->column_text(0);
-        const std::string notes = select_sample->column_text(1);
-        const auto category_id = select_sample->column_optional_int64(2);
-        select_sample->reset();
+Result<void> prepare_change_tracking(sqlite::Connection& connection) {
+    return connection.execute_script(kChangeTrackingTables);
+}
 
-        auto tags = joined_tag_paths(connection, sample_id);
-        if (!tags) return std::unexpected(tags.error());
-        auto paths = joined_location_paths(connection, sample_id);
-        if (!paths) return std::unexpected(paths.error());
-        std::string category;
-        if (category_id) {
-            auto path = taxonomy_path(connection, Taxonomy::Categories, *category_id);
-            if (!path) return std::unexpected(path.error());
-            category = *path;
-        }
-        auto embedded = current_observation_text(connection, sample_id, "embedded_text");
-        if (!embedded) return std::unexpected(embedded.error());
+Result<void> mark_sample_changed(sqlite::Connection& connection, std::int64_t sample_id, bool search_text_changed) {
+    auto mark = connection.prepare(
+        "INSERT INTO temp.changed_samples(sample_id, search_text) VALUES(?1, ?2) "
+        "ON CONFLICT(sample_id) DO UPDATE SET search_text=max(search_text, excluded.search_text)");
+    if (!mark) return std::unexpected(mark.error());
+    mark->bind(1, sample_id).bind(2, search_text_changed ? 1 : 0);
+    return mark->run();
+}
 
-        upsert->bind(1, sample_id).bind(2, display_name).bind(3, *paths).bind(4, *tags).bind(5, category);
-        upsert->bind(6, notes).bind(7, embedded->value_or(""));
-        if (auto written = upsert->run(); !written) return written;
+Result<void> mark_sample_list_changed(sqlite::Connection& connection, std::span<const std::int64_t> sample_ids,
+                                      bool search_text_changed) {
+    if (sample_ids.empty()) return {};
+    auto mark = connection.prepare(
+        "INSERT INTO temp.changed_samples(sample_id, search_text) SELECT DISTINCT value, ?2 FROM json_each(?1) "
+        "WHERE type='integer' ON CONFLICT(sample_id) DO UPDATE SET search_text=max(search_text, excluded.search_text)");
+    if (!mark) return std::unexpected(mark.error());
+    mark->bind(1, to_json_text(nlohmann::json(std::vector<std::int64_t>(sample_ids.begin(), sample_ids.end()))));
+    mark->bind(2, search_text_changed ? 1 : 0);
+    return mark->run();
+}
+
+Result<void> mark_samples_changed(sqlite::Connection& connection, std::string_view select_sample_ids_sql,
+                                  std::span<const std::int64_t> parameters, bool search_text_changed) {
+    auto mark = connection.prepare(
+        std::format("INSERT INTO temp.changed_samples(sample_id, search_text) SELECT DISTINCT candidate.sample_id, {} "
+                    "FROM ({}) AS candidate WHERE candidate.sample_id IS NOT NULL "
+                    "ON CONFLICT(sample_id) DO UPDATE SET search_text=max(search_text, excluded.search_text)",
+                    search_text_changed ? 1 : 0, select_sample_ids_sql));
+    if (!mark) return std::unexpected(mark.error());
+    int index = 1;
+    for (const auto parameter : parameters)
+        mark->bind(index++, parameter);
+    return mark->run();
+}
+
+Result<void> refresh_search_projection(sqlite::Connection& connection) {
+    auto pending = connection.query_int64("SELECT EXISTS(SELECT 1 FROM temp.changed_samples WHERE search_text=1)");
+    if (!pending) return std::unexpected(pending.error());
+    if (*pending == 0) return {};
+    for (const auto sql : {std::string_view("DELETE FROM temp.projection_tag_paths"),
+                           std::string_view("DELETE FROM temp.projection_category_paths"), kFillTagPathsSql,
+                           kFillCategoryPathsSql, kUpsertProjectionSql, kRemoveProjectionSql,
+                           std::string_view("UPDATE temp.changed_samples SET search_text=0 WHERE search_text=1")}) {
+        if (auto ran = run_statement(connection, sql); !ran) return ran;
     }
     return {};
 }
 
-Result<std::vector<std::string>> split_taxonomy_path(std::string_view path) {
-    std::vector<std::string> segments;
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        auto end = path.find('/', start);
-        if (end == std::string_view::npos) end = path.size();
-        std::string segment = trim(path.substr(start, end - start));
-        if (segment.empty()) return fail(ErrorCode::InvalidArgument, "empty tag or category name in path");
-        if (count_code_points(segment) > kMaxTaxonomyNameCodePoints)
-            return fail(ErrorCode::InvalidArgument, "tag or category name longer than 128 characters");
-        if (!is_valid_utf8(segment)) return fail(ErrorCode::InvalidArgument, "tag or category name is not valid UTF-8");
-        segments.push_back(std::move(segment));
-        start = end + 1;
+Result<std::int64_t> advance_revision(sqlite::Connection& connection, const ChangeEnvelope& envelope) {
+    if (auto projected = refresh_search_projection(connection); !projected) return std::unexpected(projected.error());
+
+    auto bump = connection.prepare(
+        "UPDATE library_state SET catalog_revision=catalog_revision+1 WHERE singleton=1 RETURNING catalog_revision");
+    if (!bump) return std::unexpected(bump.error());
+    auto bumped = bump->next_row();
+    if (!bumped) return std::unexpected(bumped.error());
+    if (!*bumped) return fail(ErrorCode::DbCorrupt, "library_state row is missing");
+    const std::int64_t revision = bump->column_int64(0);
+    bump->reset();
+
+    auto changed_count = connection.query_int64("SELECT count(*) FROM temp.changed_samples");
+    if (!changed_count) return std::unexpected(changed_count.error());
+    nlohmann::json payload = envelope.details.is_object() ? envelope.details : nlohmann::json::object();
+    payload["kind"] = envelope.kind;
+    payload["structure"] = envelope.structure_changed;
+    nlohmann::json samples = nlohmann::json::array();
+    if (*changed_count > kMaximumEnvelopeSamples) {
+        payload["all_samples"] = true;
+    } else if (*changed_count > 0) {
+        auto changed = connection.prepare("SELECT sample_id FROM temp.changed_samples ORDER BY sample_id");
+        if (!changed) return std::unexpected(changed.error());
+        auto walked = for_each_row(*changed, [&](sqlite::PreparedStatement& row) -> Result<void> {
+            samples.push_back(row.column_int64(0));
+            return {};
+        });
+        if (!walked) return std::unexpected(walked.error());
     }
-    if (segments.size() > kMaxTaxonomyDepth) return fail(ErrorCode::InvalidArgument, "hierarchy deeper than 16 levels");
-    return segments;
+    payload["samples"] = std::move(samples);
+
+    auto insert = connection.prepare(
+        "INSERT INTO catalog_outbox(revision,envelope_version,payload_json,created_at) VALUES(?1,?2,?3,?4)");
+    if (!insert) return std::unexpected(insert.error());
+    insert->bind(1, revision).bind(2, kOutboxEnvelopeVersion).bind(3, to_json_text(payload)).bind(4, now_unix_ms());
+    if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
+    if (auto cleared = run_statement(connection, "DELETE FROM temp.changed_samples"); !cleared)
+        return std::unexpected(cleared.error());
+    if (revision % kOutboxSizeCheckInterval == 0)
+        if (auto capped = enforce_outbox_cap(connection); !capped) return std::unexpected(capped.error());
+    return revision;
+}
+
+// ---------------------------------------------------------------- taxonomy
+
+std::string_view taxonomy_table(Taxonomy taxonomy) noexcept {
+    return taxonomy == Taxonomy::Tags ? "tags" : "categories";
 }
 
 Result<std::int64_t> resolve_taxonomy_path(sqlite::Connection& connection, Taxonomy taxonomy, std::string_view path,
-                                           bool create) {
+                                           bool create, std::vector<std::int64_t>* created) {
     auto segments = split_taxonomy_path(path);
     if (!segments) return std::unexpected(segments.error());
-    const auto table = table_name(taxonomy);
+    const auto table = taxonomy_table(taxonomy);
     // A merged (tombstoned) tag still resolves by its old name, through its alias to the canonical tag.
     auto find = connection.prepare(
         taxonomy == Taxonomy::Tags
             ? "SELECT id FROM tags WHERE COALESCE(parent_id,0)=COALESCE(?1,0) AND name_key=?2 AND "
               "(deleted=0 OR id IN (SELECT source_tag_id FROM tag_aliases)) ORDER BY deleted LIMIT 1"
             : "SELECT id FROM categories WHERE COALESCE(parent_id,0)=COALESCE(?1,0) AND name_key=?2 AND deleted=0");
-    auto insert =
-        connection.prepare(std::format("INSERT INTO {}(uuid,parent_id,name,name_key) VALUES(?1,?2,?3,?4)", table));
+    auto insert = connection.prepare(
+        std::format("INSERT INTO {}(uuid,parent_id,name,name_key) VALUES(new_uuid(),?1,?2,?3)", table));
     if (!find) return std::unexpected(find.error());
     if (!insert) return std::unexpected(insert.error());
 
@@ -221,21 +289,22 @@ Result<std::int64_t> resolve_taxonomy_path(sqlite::Connection& connection, Taxon
         }
         find->reset();
         if (!create) return fail(ErrorCode::NotFound, std::format("no {} named '{}'", table, path));
-        insert->bind(1, uuids::to_string(new_uuid())).bind(2, parent).bind(3, segment).bind(4, key);
+        insert->bind(1, parent).bind(2, segment).bind(3, key);
         if (auto inserted = insert->run(); !inserted) return std::unexpected(inserted.error());
         parent = connection.last_insert_rowid();
+        if (created) created->push_back(*parent);
     }
     return *parent;
 }
 
 Result<std::string> taxonomy_path(sqlite::Connection& connection, Taxonomy taxonomy, std::int64_t id) {
-    auto statement =
-        connection.prepare(std::format("WITH RECURSIVE chain(id,parent_id,name,depth) AS ("
-                                       " SELECT id,parent_id,name,0 FROM {0} WHERE id=?1"
-                                       " UNION ALL SELECT t.id,t.parent_id,t.name,c.depth+1 FROM {0} t JOIN chain c ON "
-                                       "t.id=c.parent_id WHERE c.depth<16)"
-                                       " SELECT name FROM chain ORDER BY depth DESC",
-                                       table_name(taxonomy)));
+    auto statement = connection.prepare(
+        std::format("WITH RECURSIVE chain(id,parent_id,name,depth) AS ("
+                    " SELECT id,parent_id,name,0 FROM {0} WHERE id=?1"
+                    " UNION ALL SELECT node.id,node.parent_id,node.name,chain.depth+1 FROM {0} node JOIN chain "
+                    " ON node.id=chain.parent_id WHERE chain.depth<16)"
+                    " SELECT name FROM chain ORDER BY depth DESC",
+                    taxonomy_table(taxonomy)));
     if (!statement) return std::unexpected(statement.error());
     statement->bind(1, id);
     std::string path;
@@ -256,20 +325,23 @@ Result<std::int64_t> canonical_tag(sqlite::Connection& connection, std::int64_t 
         statement->bind(1, current);
         auto has_row = statement->next_row();
         if (!has_row) return std::unexpected(has_row.error());
-        if (!*has_row) return current;
+        if (!*has_row) {
+            statement->reset();
+            return current;
+        }
         current = statement->column_int64(0);
         statement->reset();
     }
-    return fail(ErrorCode::Internal, "tag alias chain too long or cyclic");
+    return fail(ErrorCode::DbCorrupt, "tag alias chain too long or cyclic");
 }
 
 Result<void> add_review_item(sqlite::Connection& connection, std::string_view kind,
                              std::optional<std::int64_t> sample_id, const nlohmann::json& evidence) {
     auto insert = connection.prepare(
-        "INSERT INTO review_items(uuid,kind,sample_id,evidence_json,state,created_at) VALUES(?1,?2,?3,?4,'open',?5)");
+        "INSERT INTO review_items(uuid,kind,sample_id,evidence_json,state,created_at) "
+        "VALUES(new_uuid(),?1,?2,?3,'open',?4)");
     if (!insert) return std::unexpected(insert.error());
-    insert->bind(1, uuids::to_string(new_uuid())).bind(2, kind).bind(3, sample_id).bind(4, evidence.dump());
-    insert->bind(5, now_unix_ms());
+    insert->bind(1, kind).bind(2, sample_id).bind(3, to_json_text(evidence)).bind(4, now_unix_ms());
     return insert->run();
 }
 
@@ -307,23 +379,34 @@ Result<void> recompute_effective_musical_facts(sqlite::Connection& connection, s
     }
     overrides->reset();
 
+    // Observations come from probes, filenames and workers: anything out of range is ignored rather
+    // than allowed to violate the effective_metadata CHECK constraints.
+    auto valid_confidence = [](const std::optional<double>& confidence) {
+        return !confidence || (*confidence >= 0.0 && *confidence <= 1.0);
+    };
     if (bpm_state == "auto") {
         auto candidate = best_observation(connection, sample_id, "bpm_milli");
         if (!candidate) return std::unexpected(candidate.error());
-        if (*candidate && (*candidate)->value.is_number_integer()) {
-            bpm = (*candidate)->value.get<std::int64_t>();
-            bpm_source = (*candidate)->source;
-            bpm_confidence = (*candidate)->confidence;
+        if (*candidate) {
+            const auto value = json_integer((*candidate)->value);
+            if (value && *value >= kMinimumMilliBpm && *value <= kMaximumMilliBpm &&
+                valid_confidence((*candidate)->confidence)) {
+                bpm = *value;
+                bpm_source = (*candidate)->source;
+                bpm_confidence = (*candidate)->confidence;
+            }
         }
     }
     if (key_state == "auto") {
         auto candidate = best_observation(connection, sample_id, "key");
         if (!candidate) return std::unexpected(candidate.error());
-        if (*candidate && (*candidate)->value.is_object()) {
-            const auto& value = (*candidate)->value;
-            if (value.contains("pitch_class") && value.contains("mode")) {
-                key_class = value["pitch_class"].get<std::int64_t>();
-                key_mode = value["mode"].get<std::string>();
+        if (*candidate) {
+            const auto pitch_class = json_integer_member((*candidate)->value, "pitch_class");
+            const auto mode = json_string_member((*candidate)->value, "mode");
+            if (pitch_class && *pitch_class >= 0 && *pitch_class <= 11 && mode && parse_key_mode(*mode) &&
+                valid_confidence((*candidate)->confidence)) {
+                key_class = *pitch_class;
+                key_mode = *mode;
                 key_source = (*candidate)->source;
                 key_confidence = (*candidate)->confidence;
             }
@@ -337,6 +420,28 @@ Result<void> recompute_effective_musical_facts(sqlite::Connection& connection, s
     update->bind(1, sample_id).bind(2, bpm).bind(3, bpm_source).bind(4, bpm_confidence);
     update->bind(5, key_class).bind(6, key_mode).bind(7, key_source).bind(8, key_confidence);
     return update->run();
+}
+
+// ---------------------------------------------------------------- analysis queue reachability
+
+Result<void> block_unreachable_jobs(sqlite::Connection& connection, std::int64_t root_id) {
+    auto block = connection.prepare(std::format(
+        "UPDATE jobs SET state='blocked', error_code='SOURCE_OFFLINE', lease_expires_at=NULL "
+        "WHERE state='queued' AND sample_id IN (SELECT sample_id FROM locations WHERE root_id=?1) AND NOT {}",
+        kJobSampleReachableSql));
+    if (!block) return std::unexpected(block.error());
+    block->bind(1, root_id);
+    return block->run();
+}
+
+Result<void> unblock_reachable_jobs(sqlite::Connection& connection, std::int64_t root_id) {
+    auto unblock = connection.prepare(
+        std::format("UPDATE jobs SET state='queued', error_code=NULL, lease_expires_at=NULL WHERE state='blocked' "
+                    "AND sample_id IN (SELECT sample_id FROM locations WHERE root_id=?1 AND state='present') AND {}",
+                    kJobSampleReachableSql));
+    if (!unblock) return std::unexpected(unblock.error());
+    unblock->bind(1, root_id);
+    return unblock->run();
 }
 
 }  // namespace mso::catalog::detail

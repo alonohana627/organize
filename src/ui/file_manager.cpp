@@ -1,16 +1,14 @@
 #include "mso/ui/file_manager.hpp"
 
 #include <QDesktopServices>
-#include <QDir>
 #include <QProcess>
-#include <QUrl>
 
 #include "mso/ui/display_format.hpp"
 
 namespace mso::ui {
 
 bool FileManager::reveal_file(const std::filesystem::path& file) {
-#ifdef Q_OS_WIN
+#ifdef _WIN32
     // explorer.exe parses "/select,<path>" itself; the path is quoted verbatim (native
     // arguments) because QProcess's own quoting would split it at the comma.
     QProcess explorer;
@@ -23,7 +21,15 @@ bool FileManager::reveal_file(const std::filesystem::path& file) {
 }
 
 bool FileManager::open_folder(const std::filesystem::path& folder) {
-    return QDesktopServices::openUrl(QUrl::fromLocalFile(QDir::fromNativeSeparators(DisplayFormat::from_path(folder))));
+    return QDesktopServices::openUrl(DisplayFormat::to_file_url(folder));
+}
+
+QString FileManager::reveal_action_text() {
+#ifdef _WIN32
+    return tr("Show in Explorer");
+#else
+    return tr("Show in Folder");
+#endif
 }
 
 }  // namespace mso::ui

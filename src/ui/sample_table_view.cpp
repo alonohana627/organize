@@ -1,5 +1,6 @@
 #include "mso/ui/sample_table_view.hpp"
 
+#include <QContextMenuEvent>
 #include <QDrag>
 #include <QFocusEvent>
 #include <QHeaderView>
@@ -9,14 +10,21 @@
 #include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QStyleOptionViewItem>
 #include <QUrl>
 
 #include <algorithm>
+#include <filesystem>
+#include <map>
+#include <optional>
 #include <utility>
 
+#include "mso/ui/display_format.hpp"
 #include "mso/ui/drag_path_resolver.hpp"
+#include "mso/ui/root_locations.hpp"
 #include "mso/ui/sample_row_delegate.hpp"
 #include "mso/ui/sample_table_model.hpp"
+#include "mso/ui/star_rating.hpp"
 
 namespace mso::ui {
 
@@ -41,16 +49,7 @@ SampleTableView::SampleTableView(QWidget* parent) : QTableView(parent) {
         if (const auto* sample = sample_model_->loaded_row(index.row()))
             emit ratingClicked(SampleKey{sample->library, sample->sample_id}, rating);
     });
-    setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(this, &QWidget::customContextMenuRequested, this, [this](const QPoint& position) {
-        const int row = rowAt(position.y());
-        if (row >= 0 && selectionModel() && !selectionModel()->isRowSelected(row, {})) {
-            // Like Explorer: right-clicking an unselected row makes it the selection.
-            setCurrentIndex(model()->index(row, std::max(0, columnAt(position.x()))));
-            selectRow(row);
-        }
-        emit sampleMenuRequested(viewport()->mapToGlobal(position), row);
-    });
+    setContextMenuPolicy(Qt::DefaultContextMenu);  // contextMenuEvent() tells mouse from keyboard
     // Uniform row heights keep scrolling cost independent of the result size.
     verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
     verticalHeader()->hide();
@@ -137,19 +136,23 @@ std::size_t SampleTableView::select_keys(const std::vector<SampleKey>& keys, con
     if (!sample_model_ || !selectionModel()) return 0;
     QItemSelection selection;
     std::size_t found = 0;
+    // One pass over the loaded rows for all keys (row_of per key would be keys x rows).
+    std::vector<SampleKey> wanted = keys;
+    if (current) wanted.push_back(*current);
+    const std::map<SampleKey, int> rows = sample_model_->rows_of(wanted);
     for (const SampleKey& key : keys) {
-        if (auto row = sample_model_->row_of(key)) {
-            selection.select(sample_model_->index(*row, 0),
-                             sample_model_->index(*row, SampleTableModel::kColumnCount - 1));
+        if (const auto row = rows.find(key); row != rows.end()) {
+            selection.select(sample_model_->index(row->second, 0),
+                             sample_model_->index(row->second, SampleTableModel::kColumnCount - 1));
             ++found;
         }
     }
     const auto flags = QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows;
     selectionModel()->select(selection, flags);
     if (current) {
-        if (auto row = sample_model_->row_of(*current))
+        if (const auto row = rows.find(*current); row != rows.end())
             selectionModel()->setCurrentIndex(
-                sample_model_->index(*row, currentIndex().isValid() ? currentIndex().column() : 0),
+                sample_model_->index(row->second, currentIndex().isValid() ? currentIndex().column() : 0),
                 QItemSelectionModel::NoUpdate);
     }
     return found;
@@ -211,30 +214,73 @@ void SampleTableView::focusOutEvent(QFocusEvent* event) {
     update_row(currentIndex().row());
 }
 
+void SampleTableView::contextMenuEvent(QContextMenuEvent* event) {
+    // From the keyboard (Menu key, Shift+F10) the menu belongs at the current row, not wherever
+    // the mouse pointer happens to be.
+    const bool from_keyboard = event->reason() == QContextMenuEvent::Keyboard && currentIndex().isValid();
+    const QPoint position = from_keyboard ? visualRect(currentIndex()).center() : event->pos();
+    const int row = rowAt(position.y());
+    if (row >= 0 && selectionModel() && !selectionModel()->isRowSelected(row, {})) {
+        // Like Explorer: right-clicking an unselected row makes it the selection.
+        setCurrentIndex(model()->index(row, std::max(0, columnAt(position.x()))));
+        selectRow(row);
+    }
+    emit sampleMenuRequested(viewport()->mapToGlobal(position), row);
+    event->accept();
+}
+
+void SampleTableView::mouseDoubleClickEvent(QMouseEvent* event) {
+    // QAbstractItemView emits doubleClicked() (= play) before the delegate sees the event, so a
+    // quick second click on a star is filtered here.
+    const QModelIndex index = indexAt(event->position().toPoint());
+    if (index.column() == static_cast<int>(SampleTableModel::Column::Rating)) {
+        QStyleOptionViewItem option;
+        initViewItemOption(&option);
+        option.rect = visualRect(index);
+        if (StarRating::star_at(SampleRowDelegate::rating_area(option), SampleRowDelegate::rating_star_size(option),
+                                event->position().toPoint()) > 0) {
+            event->accept();
+            return;
+        }
+    }
+    QTableView::mouseDoubleClickEvent(event);
+}
+
 void SampleTableView::startDrag(Qt::DropActions supported_actions) {
     if (!(supported_actions & Qt::CopyAction)) return;
-    const std::vector<SampleKey> keys = selected_keys();
-    if (keys.empty()) return;
-    if (keys.size() < selected_row_count()) {
+    const std::vector<search::SampleRow> samples = selected_samples();
+    if (samples.empty()) return;
+    if (samples.size() < selected_row_count()) {
         emit dragRefused(tr("Some selected rows are not loaded; scroll them into view or select fewer samples."));
         return;
     }
-    if (keys.size() > DragPathResolver::kMaxDragSamples) {
-        emit dragRefused(tr("Drag at most %1 samples at a time.").arg(DragPathResolver::kMaxDragSamples));
+    if (samples.size() > DragPathResolver::kMaxDragSamples) {
+        emit dragRefused(
+            tr("Drag at most %n sample(s) at a time.", nullptr, static_cast<int>(DragPathResolver::kMaxDragSamples)));
         return;
     }
-    if (!resolver_ || !resolver_->is_ready_for(keys)) {
-        emit dragRefused(tr("Checking file locations… try dragging again in a moment."));
-        return;
-    }
-    const std::vector<SampleKey> unavailable = resolver_->unavailable_keys();
-    if (!unavailable.empty()) {
-        emit mixedDragRefused(keys.size() - unavailable.size(), unavailable.size());
-        return;
-    }
+    // URLs come from catalog data right now (no disk access on the UI thread). When the background
+    // check has finished for this selection, it additionally catches files that vanished.
+    std::vector<SampleKey> keys;
+    for (const auto& sample : samples)
+        keys.push_back(SampleKey{sample.library, sample.sample_id});
+    const bool checked = resolver_ && resolver_->is_ready_for(keys);
+    std::vector<SampleKey> available;
     QList<QUrl> urls;
-    for (const auto& path : resolver_->available_paths())
-        urls << QUrl::fromLocalFile(QString::fromStdU16String(path.generic_u16string()));
+    for (const auto& sample : samples) {
+        const SampleKey key{sample.library, sample.sample_id};
+        std::optional<std::filesystem::path> path;
+        if (sample.availability == search::RowAvailability::Available && root_locations_)
+            path = root_locations_->path_of(sample);
+        if (path && checked && !resolver_->path_of(key)) path.reset();  // the disk check found it missing
+        if (!path) continue;
+        available.push_back(key);
+        urls << DisplayFormat::to_file_url(*path);
+    }
+    if (available.size() < samples.size()) {
+        emit mixedDragRefused(available, samples.size() - available.size());
+        return;
+    }
     auto* mime = new QMimeData;
     mime->setUrls(urls);
     auto* drag = new QDrag(this);

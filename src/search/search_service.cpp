@@ -8,7 +8,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "mso/catalog/taxonomy_lookup.hpp"
+#include "mso/domain/taxonomy.hpp"
+#include "mso/search/detail/predicate_support.hpp"
 #include "mso/search/query_compiler.hpp"
 
 namespace mso::search {
@@ -47,28 +48,16 @@ std::optional<SortField> parse_sort_field(std::string_view text) noexcept {
     return std::nullopt;
 }
 
-std::string_view to_string(RowAvailability availability) noexcept {
-    switch (availability) {
-        case RowAvailability::Available:
-            return "available";
-        case RowAvailability::SourceOffline:
-            return "source offline";
-        case RowAvailability::Missing:
-            return "missing";
-        case RowAvailability::Unknown:
-            return "unknown";
-    }
-    return "unknown";
-}
-
 namespace {
 
-constexpr int kCursorVersion = 1;
+/// Version of the cursor token layout; version 2 added the library set to the fingerprint.
+constexpr int kCursorVersion = 2;
 
 /// SQL expression for each sort field; text sorts compare normalized keys.
 std::string_view sort_expression(SortField field) {
     switch (field) {
         case SortField::Name:
+        case SortField::Relevance:
             return "s.name_key";
         case SortField::Added:
             return "s.created_at";
@@ -86,22 +75,34 @@ std::string_view sort_expression(SortField field) {
             return "s.rating";
         case SortField::Format:
             return "e.format";
-        case SortField::Relevance:
-            return "s.name_key";
     }
     return "s.name_key";
 }
 
-constexpr std::string_view kRowColumns =
-    "s.id, s.uuid, s.display_name, s.rating, s.favorite, s.created_at, s.category_id, e.format, e.codec, "
-    "e.duration_us, e.duration_exact, e.sample_rate, e.channels, e.bit_depth, e.byte_size, e.bpm_milli, "
-    "e.bpm_source, e.bpm_confidence, e.key_class, e.key_mode, e.key_source, e.key_confidence, "
-    "COALESCE(e.analysis_flags,0)";
-constexpr int kSortValueColumn = 23;  // appended after kRowColumns
+/// True for sorts whose key is text (compared as normalized strings); others are integers.
+bool is_text_sort(SortField field) {
+    return field == SortField::Name || field == SortField::Format;
+}
 
-/// A row together with the values that order it globally across libraries.
-struct OrderedRow {
-    SampleRow row;
+/// True for errors caused by the request itself, which fail the whole call; anything else is a
+/// failure of one library, reported in its coverage.
+bool is_request_error(const Error& error) {
+    return error.code == ErrorCode::ParseError || error.code == ErrorCode::InvalidArgument ||
+           error.code == ErrorCode::StaleCursor;
+}
+
+/// Records a library failure in its coverage, or returns the error when it is a request error.
+std::optional<Error> record_library_error(LibraryCoverage& coverage, Error error) {
+    if (is_request_error(error)) return error;
+    coverage.complete = false;
+    coverage.error = std::move(error);
+    return std::nullopt;
+}
+
+/// A matching sample of one library with the values that order it globally (metadata sorts).
+struct OrderedKey {
+    uuids::uuid library;
+    std::int64_t sample_id = 0;
     int partition = 0;  ///< 0 = sort value present, 1 = null
     nlohmann::json sort_value;
 };
@@ -109,80 +110,122 @@ struct OrderedRow {
 /// Keyset position of one library inside a federated cursor.
 struct LibraryPosition {
     int partition = 0;
-    nlohmann::json value;
+    nlohmann::json value;  ///< last sort value (null, integer or string)
     std::int64_t last_id = 0;
     bool started = false;
     bool exhausted = false;
 };
 
-std::string query_fingerprint(const SearchRequest& request) {
-    nlohmann::json scope = {
-        {"root", request.scope.root_id ? nlohmann::json(*request.scope.root_id) : nlohmann::json()},
-        {"folder", request.scope.folder ? nlohmann::json(*request.scope.folder) : nlohmann::json()},
-        {"collection", request.scope.collection_id ? nlohmann::json(*request.scope.collection_id) : nlohmann::json()},
-        {"tag", request.scope.tag_id ? nlohmann::json(*request.scope.tag_id) : nlohmann::json()},
-        {"category", request.scope.category_id ? nlohmann::json(*request.scope.category_id) : nlohmann::json()},
-        {"uncategorized", request.scope.uncategorized}};
+/// A decoded continuation token.
+struct DecodedCursor {
+    std::map<std::string, LibraryPosition> positions;  ///< by library UUID text (metadata sorts)
+    std::size_t offset = 0;                            ///< rows already delivered (relevance)
+};
+
+/// Identifies the result set a cursor belongs to: query, scope, order and the set of libraries.
+std::string query_fingerprint(const SearchRequest& request, std::span<catalog::Library* const> libraries) {
+    const auto optional_json = [](const auto& value) { return value ? nlohmann::json(*value) : nlohmann::json(); };
+    const nlohmann::json scope = {{"root", optional_json(request.scope.root_id)},
+                                  {"folder", optional_json(request.scope.folder)},
+                                  {"collection", optional_json(request.scope.collection_id)},
+                                  {"tag", optional_json(request.scope.tag_id)},
+                                  {"category", optional_json(request.scope.category_id)},
+                                  {"uncategorized", request.scope.uncategorized}};
+    std::vector<std::string> library_set;
+    for (const auto* library : libraries)
+        library_set.push_back(uuids::to_string(library->uuid()));
+    std::ranges::sort(library_set);
     return picosha2::hash256_hex_string(nlohmann::json{
         {"text", request.text},
         {"scope", scope},
         {"sort", to_string(request.sort)},
-        {"descending", request.descending}}.dump());
+        {"descending", request.descending},
+        {"libraries", library_set}}.dump());
+}
+
+/// Reads a cursor without ever throwing: any malformed or foreign token is STALE_CURSOR.
+Result<DecodedCursor> decode_cursor(const std::optional<Cursor>& cursor, const std::string& fingerprint) {
+    DecodedCursor decoded;
+    if (!cursor) return decoded;
+    const auto stale = [] { return fail(ErrorCode::StaleCursor, "the result set changed; refresh the view"); };
+    const auto document = nlohmann::json::parse(cursor->token, nullptr, false);
+    if (!document.is_object()) return stale();
+    const auto version = document.find("v");
+    const auto query = document.find("q");
+    if (version == document.end() || !version->is_number_integer() || version->get<std::int64_t>() != kCursorVersion ||
+        query == document.end() || !query->is_string() || query->get_ref<const std::string&>() != fingerprint)
+        return stale();
+    if (const auto offset = document.find("offset"); offset != document.end()) {
+        if (!offset->is_number_unsigned()) return stale();
+        decoded.offset = offset->get<std::size_t>();
+    }
+    const auto libraries = document.find("libraries");
+    if (libraries == document.end()) return decoded;
+    if (!libraries->is_object()) return stale();
+    for (const auto& [library, state] : libraries->items()) {
+        if (!state.is_object()) return stale();
+        const auto partition = state.find("p");
+        const auto value = state.find("v");
+        const auto last_id = state.find("id");
+        const auto started = state.find("started");
+        const auto exhausted = state.find("done");
+        if (partition == state.end() || !partition->is_number_integer() || value == state.end() ||
+            !(value->is_null() || value->is_number_integer() || value->is_string()) || last_id == state.end() ||
+            !last_id->is_number_integer() || started == state.end() || !started->is_boolean() ||
+            exhausted == state.end() || !exhausted->is_boolean())
+            return stale();
+        LibraryPosition position;
+        const auto partition_value = partition->get<std::int64_t>();
+        if (partition_value != 0 && partition_value != 1) return stale();
+        position.partition = static_cast<int>(partition_value);
+        position.value = *value;
+        position.last_id = last_id->get<std::int64_t>();
+        position.started = started->get<bool>();
+        position.exhausted = exhausted->get<bool>();
+        decoded.positions.emplace(library, std::move(position));
+    }
+    return decoded;
 }
 
 /// Compiles the navigation scope into SQL for one library.
 Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& connection) {
     SqlPredicate out;
     std::vector<std::string> parts;
+    if (scope.folder && !scope.root_id)
+        return fail(ErrorCode::InvalidArgument, "a folder scope needs the root it belongs to");
     if (scope.root_id) {
-        if (scope.folder && !scope.folder->empty()) {
-            parts.emplace_back(
-                "EXISTS(SELECT 1 FROM locations sl WHERE sl.sample_id=s.id AND sl.root_id=? "
-                "AND sl.state<>'retired' AND sl.path_key LIKE ? ESCAPE '\\')");
-            out.parameters.emplace_back(*scope.root_id);
-            std::string key = fold_path_key(*scope.folder);
-            std::string escaped;
-            for (const char character : key) {
-                if (character == '%' || character == '_' || character == '\\') escaped.push_back('\\');
-                escaped.push_back(character);
-            }
-            out.parameters.emplace_back(escaped + "/%");
-        } else {
-            parts.emplace_back(
-                "EXISTS(SELECT 1 FROM locations sl WHERE sl.sample_id=s.id AND sl.root_id=? "
-                "AND sl.state<>'retired')");
-            out.parameters.emplace_back(*scope.root_id);
+        auto root = connection.prepare("SELECT case_sensitive FROM roots WHERE id=?1");
+        if (!root) return std::unexpected(root.error());
+        root->bind(1, *scope.root_id);
+        auto has_row = root->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        const bool case_sensitive = *has_row && root->column_int64(0) != 0;
+        root->reset();
+        std::string folder_key = scope.folder ? path_key(*scope.folder, case_sensitive) : std::string();
+        while (folder_key.ends_with('/'))
+            folder_key.pop_back();
+        std::string part = std::format("EXISTS(SELECT 1 FROM locations sl WHERE sl.id={} AND sl.root_id=?",
+                                       detail::kPrimaryLocationIdSql);
+        out.parameters.emplace_back(*scope.root_id);
+        if (!folder_key.empty()) {
+            const std::string prefix = folder_key + '/';
+            part += " AND sl.path_key>=? AND sl.path_key<?";
+            out.parameters.emplace_back(prefix);
+            out.parameters.emplace_back(detail::prefix_upper_bound(prefix));
         }
+        parts.push_back(part + ')');
     }
     if (scope.collection_id) {
-        auto kind = connection.prepare("SELECT kind, query_json FROM collections WHERE id=?1 AND deleted=0");
-        if (!kind) return std::unexpected(kind.error());
-        kind->bind(1, *scope.collection_id);
-        auto has_row = kind->next_row();
-        if (!has_row) return std::unexpected(has_row.error());
-        if (!*has_row) {
-            parts.emplace_back("0");
-        } else if (kind->column_text(0) == "manual") {
-            parts.emplace_back(
-                "EXISTS(SELECT 1 FROM collection_items ci WHERE ci.collection_id=? AND ci.sample_id=s.id)");
-            out.parameters.emplace_back(*scope.collection_id);
-        } else {
-            const auto document = nlohmann::json::parse(kind->column_optional_text(1).value_or("{}"), nullptr, false);
-            const std::string text = document.is_object() ? document.value("text", std::string()) : std::string();
-            kind->reset();
-            auto parsed = parse_query(text);
-            if (!parsed) return std::unexpected(parsed.error());
-            auto compiled = compile_query(*parsed, connection);
-            if (!compiled) return std::unexpected(compiled.error());
-            parts.push_back('(' + compiled->sql + ')');
-            out.parameters.insert(out.parameters.end(), compiled->parameters.begin(), compiled->parameters.end());
-        }
+        auto collection = compile_collection(*scope.collection_id, connection);
+        if (!collection) return std::unexpected(collection.error());
+        parts.push_back('(' + collection->sql + ')');
+        out.parameters.insert(out.parameters.end(), collection->parameters.begin(), collection->parameters.end());
     }
-    auto subtree = [](std::string_view table) {
+    const auto subtree = [](std::string_view table) {
         return std::format(
             "WITH RECURSIVE subtree(id,depth) AS (SELECT ?,0 UNION ALL SELECT t.id,subtree.depth+1 "
-            "FROM {} t JOIN subtree ON t.parent_id=subtree.id WHERE subtree.depth<16) SELECT id FROM subtree",
-            table);
+            "FROM {} t JOIN subtree ON t.parent_id=subtree.id WHERE subtree.depth<{}) SELECT id FROM subtree",
+            table, kMaxTaxonomyDepth);
     };
     if (scope.tag_id) {
         parts.push_back(std::format(
@@ -201,148 +244,44 @@ Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& conne
     return out;
 }
 
-/// Fills location, availability, tags and category for hydrated rows.
-Result<void> hydrate_relations(sqlite::Connection& connection, SampleRow& row, std::optional<std::int64_t> category_id,
-                               std::map<std::int64_t, std::string>& tag_path_cache) {
-    auto location = connection.prepare(
-        "SELECT l.relative_path, l.state, r.name, r.uuid, r.mode, r.availability FROM locations l "
-        "JOIN roots r ON r.id=l.root_id WHERE l.sample_id=?1 AND l.state<>'retired' "
-        "ORDER BY (l.state='present' AND r.availability<>'offline') DESC, l.state='present' DESC, l.id LIMIT 1");
-    if (!location) return std::unexpected(location.error());
-    location->bind(1, row.sample_id);
-    auto has_row = location->next_row();
-    if (!has_row) return std::unexpected(has_row.error());
-    if (*has_row) {
-        row.relative_path = location->column_text(0);
-        const std::string state = location->column_text(1);
-        row.root_name = location->column_text(2);
-        row.root_uuid = uuids::uuid::from_string(location->column_text(3)).value_or(uuids::uuid());
-        row.root_mode = catalog::parse_root_mode(location->column_text(4)).value_or(catalog::RootMode::Referenced);
-        const std::string root_availability = location->column_text(5);
-        if (state == "present")
-            row.availability =
-                root_availability == "offline" ? RowAvailability::SourceOffline : RowAvailability::Available;
-        else if (state == "missing")
-            row.availability = RowAvailability::Missing;
-        const auto slash = row.relative_path.rfind('/');
-        row.file_name = slash == std::string::npos ? row.relative_path : row.relative_path.substr(slash + 1);
-        location->reset();
-    }
-
-    auto tags = connection.prepare("SELECT tag_id FROM sample_tags WHERE sample_id=?1");
-    if (!tags) return std::unexpected(tags.error());
-    tags->bind(1, row.sample_id);
-    std::vector<std::string> paths;
-    while (true) {
-        auto next = tags->next_row();
-        if (!next) return std::unexpected(next.error());
-        if (!*next) break;
-        const auto tag_id = tags->column_int64(0);
-        auto cached = tag_path_cache.find(tag_id);
-        if (cached == tag_path_cache.end()) {
-            auto path = connection.prepare(
-                "WITH RECURSIVE chain(id,parent_id,name,depth) AS (SELECT id,parent_id,name,0 FROM tags WHERE id=?1 "
-                "UNION ALL SELECT t.id,t.parent_id,t.name,c.depth+1 FROM tags t JOIN chain c ON t.id=c.parent_id "
-                "WHERE c.depth<16) SELECT group_concat(name,'/') FROM (SELECT name FROM chain ORDER BY depth DESC)");
-            if (!path) return std::unexpected(path.error());
-            path->bind(1, tag_id);
-            auto found = path->next_row();
-            if (!found) return std::unexpected(found.error());
-            cached = tag_path_cache.emplace(tag_id, *found ? path->column_optional_text(0).value_or("") : "").first;
-        }
-        paths.push_back(cached->second);
-    }
-    std::ranges::sort(paths);
-    for (const auto& path : paths)
-        row.tags += (row.tags.empty() ? "" : ", ") + path;
-    row.tag_paths = std::move(paths);
-
-    if (category_id) {
-        auto category = connection.prepare(
-            "WITH RECURSIVE chain(id,parent_id,name,depth) AS (SELECT id,parent_id,name,0 FROM categories WHERE id=?1 "
-            "UNION ALL SELECT c.id,c.parent_id,c.name,h.depth+1 FROM categories c JOIN chain h ON c.id=h.parent_id "
-            "WHERE h.depth<16) SELECT group_concat(name,'/') FROM (SELECT name FROM chain ORDER BY depth DESC)");
-        if (!category) return std::unexpected(category.error());
-        category->bind(1, *category_id);
-        auto found = category->next_row();
-        if (!found) return std::unexpected(found.error());
-        if (*found) row.category = category->column_optional_text(0).value_or("");
-    }
-    return {};
-}
-
-/// Reads the base columns of a result row.
-SampleRow read_base_row(const sqlite::PreparedStatement& statement, const uuids::uuid& library) {
-    SampleRow row;
-    row.library = library;
-    row.sample_id = statement.column_int64(0);
-    row.sample_uuid = uuids::uuid::from_string(statement.column_text(1)).value_or(uuids::uuid());
-    row.display_name = statement.column_text(2);
-    row.rating = static_cast<int>(statement.column_int64(3));
-    row.favorite = statement.column_int64(4) != 0;
-    row.created_at = statement.column_int64(5);
-    row.format = statement.column_optional_text(7).value_or("");
-    row.codec = statement.column_optional_text(8).value_or("");
-    row.duration_us = statement.column_optional_int64(9);
-    row.duration_exact = statement.column_int64(10) != 0;
-    row.sample_rate = statement.column_optional_int64(11);
-    row.channels = statement.column_optional_int64(12);
-    row.bit_depth = statement.column_optional_int64(13);
-    row.byte_size = statement.column_optional_int64(14);
-    row.bpm_milli = statement.column_optional_int64(15);
-    row.bpm_source = statement.column_optional_text(16).value_or("");
-    row.bpm_confidence = statement.column_optional_double(17);
-    if (auto pitch_class = statement.column_optional_int64(18)) {
-        const auto mode =
-            parse_key_mode(statement.column_optional_text(19).value_or("unknown")).value_or(KeyMode::Unknown);
-        row.key = MusicalKey{static_cast<int>(*pitch_class), mode};
-    }
-    row.key_source = statement.column_optional_text(20).value_or("");
-    row.key_confidence = statement.column_optional_double(21);
-    row.analysis_flags = statement.column_int64(22);
-    return row;
-}
-
-/// True for sorts whose key is text (compared as normalized strings); others are integers.
-bool is_text_sort(SortField field) {
-    return field == SortField::Name || field == SortField::Format;
-}
-
-/// The sort key of the current row as JSON (null, integer or string) for cursors and merging.
-nlohmann::json sort_value_json(const sqlite::PreparedStatement& statement, SortField field) {
-    if (statement.column_is_null(kSortValueColumn)) return nlohmann::json();
-    if (is_text_sort(field)) return nlohmann::json(statement.column_text(kSortValueColumn));
-    return nlohmann::json(statement.column_int64(kSortValueColumn));
-}
-
-/// Everything needed to run one library's part of a request.
-struct LibraryQuery {
-    catalog::Library* library = nullptr;
-    LibraryCoverage coverage;
+/// The query and scope of a request compiled for one library.
+struct LibraryFilter {
+    SqlPredicate query;
+    SqlPredicate scope;
 };
 
-/// Runs the filtered, keyset-paged query of one library, filling up to `limit` rows across
-/// the non-null and null partitions.
-Result<std::vector<OrderedRow>> fetch_library_page(catalog::Library& library, const Query& query,
+Result<LibraryFilter> compile_filter(const Query& query, const Scope& scope, sqlite::Connection& connection) {
+    auto compiled_query = compile_query(query, connection);
+    if (!compiled_query) return std::unexpected(compiled_query.error());
+    auto compiled_scope = compile_scope(scope, connection);
+    if (!compiled_scope) return std::unexpected(compiled_scope.error());
+    return LibraryFilter{std::move(*compiled_query), std::move(*compiled_scope)};
+}
+
+/// The sort key of the current row (column 1) as JSON (null, integer or string).
+nlohmann::json sort_value_json(const sqlite::PreparedStatement& statement, SortField field) {
+    if (statement.column_is_null(1)) return nlohmann::json();
+    if (is_text_sort(field)) return nlohmann::json(statement.column_text(1));
+    return nlohmann::json(statement.column_int64(1));
+}
+
+/// The ids and sort keys of up to `limit` matches of one library after its keyset position,
+/// across the non-null and null partitions (no hydration).
+Result<std::vector<OrderedKey>> fetch_library_keys(catalog::Library& library, const Query& query,
                                                    const SearchRequest& request, const LibraryPosition& position,
                                                    std::size_t limit) {
     auto reader = library.acquire_reader();
     if (!reader) return std::unexpected(reader.error());
     auto& connection = reader->connection();
-    auto filter = compile_query(query, connection);
+    auto filter = compile_filter(query, request.scope, connection);
     if (!filter) return std::unexpected(filter.error());
-    auto scope = compile_scope(request.scope, connection);
-    if (!scope) return std::unexpected(scope.error());
 
     const std::string expression(sort_expression(request.sort));
     const std::string_view direction = request.descending ? "DESC" : "ASC";
     const std::string_view after = request.descending ? "<" : ">";
-    const uuids::uuid library_uuid = library.identity().uuid;
-    std::vector<OrderedRow> rows;
-    std::map<std::int64_t, std::string> tag_path_cache;
-
-    for (int partition = position.partition; partition <= 1 && rows.size() < limit; ++partition) {
-        const bool resume = position.started && partition == position.partition && !rows.size();
+    std::vector<OrderedKey> keys;
+    for (int partition = position.partition; partition <= 1 && keys.size() < limit; ++partition) {
+        const bool resume = position.started && partition == position.partition;
         std::string keyset;
         if (partition == 0) {
             keyset = std::format("{} IS NOT NULL", expression);
@@ -352,78 +291,290 @@ Result<std::vector<OrderedRow>> fetch_library_page(catalog::Library& library, co
             if (resume) keyset += std::format(" AND s.id {} ?", after);
         }
         const std::string sql = std::format(
-            "SELECT {0}, {1} FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
-            "WHERE s.deleted=0 AND ({2}) AND ({3}) AND {4} ORDER BY {1} {5}, s.id {5} LIMIT ?",
-            kRowColumns, expression, filter->sql, scope->sql, keyset, direction);
+            "SELECT s.id, {0} FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
+            "WHERE s.deleted=0 AND ({1}) AND ({2}) AND {3} ORDER BY {0} {4}, s.id {4} LIMIT ?",
+            expression, filter->query.sql, filter->scope.sql, keyset, direction);
         auto statement = connection.prepare(sql);
         if (!statement) return std::unexpected(statement.error());
-        int next = bind_parameters(*statement, filter->parameters, 1);
-        next = bind_parameters(*statement, scope->parameters, next);
+        int next = bind_parameters(*statement, filter->query.parameters, 1);
+        next = bind_parameters(*statement, filter->scope.parameters, next);
         if (resume && partition == 0) {
             const nlohmann::json& value = position.value;
             for (int repeat = 0; repeat < 2; ++repeat) {
                 if (value.is_number_integer())
                     statement->bind(next++, value.get<std::int64_t>());
                 else
-                    statement->bind(next++, value.is_string() ? value.get<std::string>() : std::string());
+                    statement->bind(next++, value.is_string() ? value.get_ref<const std::string&>() : std::string());
             }
             statement->bind(next++, position.last_id);
         } else if (resume) {
             statement->bind(next++, position.last_id);
         }
-        statement->bind(next, static_cast<std::int64_t>(limit - rows.size()));
+        statement->bind(next, static_cast<std::int64_t>(limit - keys.size()));
         while (true) {
             auto has_row = statement->next_row();
             if (!has_row) return std::unexpected(has_row.error());
             if (!*has_row) break;
-            OrderedRow ordered{read_base_row(*statement, library_uuid), partition,
-                               sort_value_json(*statement, request.sort)};
-            const auto category_id = statement->column_optional_int64(6);
-            if (auto hydrated = hydrate_relations(connection, ordered.row, category_id, tag_path_cache); !hydrated)
-                return std::unexpected(hydrated.error());
-            rows.push_back(std::move(ordered));
+            keys.push_back(
+                {library.uuid(), statement->column_int64(0), partition, sort_value_json(*statement, request.sort)});
         }
     }
-    return rows;
+    return keys;
 }
 
 /// Global order across libraries: partition, value (by direction), library UUID, id.
-bool comes_before(const OrderedRow& left, const OrderedRow& right, bool descending) {
+bool comes_before(const OrderedKey& left, const OrderedKey& right, bool descending) {
     if (left.partition != right.partition) return left.partition < right.partition;
     if (left.sort_value != right.sort_value)
         return descending ? right.sort_value < left.sort_value : left.sort_value < right.sort_value;
-    const auto left_library = uuids::to_string(left.row.library);
-    const auto right_library = uuids::to_string(right.row.library);
-    if (left_library != right_library) return left_library < right_library;
-    return descending ? left.row.sample_id > right.row.sample_id : left.row.sample_id < right.row.sample_id;
+    if (left.library != right.library) return left.library < right.library;
+    return descending ? left.sample_id > right.sample_id : left.sample_id < right.sample_id;
 }
 
-Result<std::map<std::string, LibraryPosition>> decode_cursor(const std::optional<Cursor>& cursor,
-                                                             const std::string& fingerprint) {
-    std::map<std::string, LibraryPosition> positions;
-    if (!cursor) return positions;
-    const auto document = nlohmann::json::parse(cursor->token, nullptr, false);
-    if (!document.is_object() || document.value("v", 0) != kCursorVersion ||
-        document.value("q", std::string()) != fingerprint)
-        return fail(ErrorCode::StaleCursor, "the result set changed; refresh the view");
-    for (const auto& [library, state] : document["libraries"].items()) {
-        LibraryPosition position;
-        position.partition = state.value("p", 0);
-        position.value = state.contains("v") ? state["v"] : nlohmann::json();
-        position.last_id = state.value("id", std::int64_t{0});
-        position.started = state.value("started", false);
-        position.exhausted = state.value("done", false);
-        positions.emplace(library, std::move(position));
+/// A sample to hydrate, identified by library and id.
+struct PageEntry {
+    uuids::uuid library;
+    std::int64_t sample_id = 0;
+};
+
+/// Hydrates exactly the rows of one page (one load_rows call per library) in page order. A
+/// library whose rows cannot be loaded is marked incomplete in `coverage` and its rows are left
+/// out; the set of such libraries is returned.
+std::vector<uuids::uuid> hydrate_page(std::span<catalog::Library* const> libraries,
+                                      const std::vector<PageEntry>& entries, std::vector<LibraryCoverage>& coverage,
+                                      std::vector<SampleRow>& rows) {
+    std::map<uuids::uuid, std::map<std::int64_t, SampleRow>> loaded;
+    std::vector<uuids::uuid> failed;
+    for (auto* library : libraries) {
+        std::vector<std::int64_t> ids;
+        for (const auto& entry : entries)
+            if (entry.library == library->uuid()) ids.push_back(entry.sample_id);
+        if (ids.empty()) continue;
+        auto hydrated = load_rows(*library, ids);
+        if (!hydrated) {
+            failed.push_back(library->uuid());
+            for (auto& entry : coverage)
+                if (entry.library == library->uuid()) {
+                    entry.complete = false;
+                    entry.error = hydrated.error();
+                }
+            continue;
+        }
+        auto& by_id = loaded[library->uuid()];
+        for (auto& row : *hydrated)
+            by_id.emplace(row.sample_id, std::move(row));
     }
-    if (document.contains("offset")) positions["@offset"].last_id = document["offset"].get<std::int64_t>();
-    return positions;
+    for (const auto& entry : entries) {
+        auto library = loaded.find(entry.library);
+        if (library == loaded.end()) continue;
+        auto row = library->second.find(entry.sample_id);
+        if (row != library->second.end()) rows.push_back(std::move(row->second));  // deleted meanwhile: skipped
+    }
+    return failed;
 }
 
 std::size_t clamp_page_size(std::size_t requested) {
     return std::clamp<std::size_t>(requested, 1, SearchService::kMaxPageSize);
 }
 
+/// One relevance candidate of one library.
+struct RankedKey {
+    uuids::uuid library;
+    std::int64_t sample_id = 0;
+    bool text_match = false;  ///< matched a positive text term (has a BM25 score)
+    double fused_score = 0;   ///< 1 / (k + rank within its library)
+};
+
+/// Relevance sort: per library, the top kRelevanceDepth matches of the full filter, full-text hits
+/// by BM25 first; libraries are fused by reciprocal rank, text hits ahead of rows that matched
+/// only through a non-text branch (`kick OR tag:Drums`), which rank by name.
+Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries, const SearchRequest& request,
+                                    const Query& query, const DecodedCursor& cursor, std::size_t page_size,
+                                    const std::string& fingerprint) {
+    std::string match;
+    for (const auto& term : positive_text_terms(query))
+        match += (match.empty() ? "" : " OR ") + fts_expression(term);
+    // When every match necessarily hits a text term, the FTS index can drive the query.
+    const bool text_driven = requires_text_match(query);
+
+    SearchPage page;
+    std::vector<RankedKey> fused;
+    for (auto* library : libraries) {
+        const auto identity = library->identity();
+        LibraryCoverage coverage{identity.uuid, identity.name, true, std::nullopt};
+        auto ranked = [&]() -> Result<std::vector<RankedKey>> {
+            auto reader = library->acquire_reader();
+            if (!reader) return std::unexpected(reader.error());
+            auto filter = compile_filter(query, request.scope, reader->connection());
+            if (!filter) return std::unexpected(filter.error());
+            constexpr std::string_view kRanked =
+                "(SELECT rowid AS id, bm25(sample_fts) AS score FROM sample_fts WHERE sample_fts MATCH ?)";
+            const std::string sql =
+                text_driven ? std::format(
+                                  "SELECT s.id, ranked.score FROM {0} ranked JOIN samples s ON s.id=ranked.id "
+                                  "LEFT JOIN effective_metadata e ON e.sample_id=s.id WHERE s.deleted=0 AND ({1}) "
+                                  "AND ({2}) ORDER BY ranked.score, s.id LIMIT ?",
+                                  kRanked, filter->query.sql, filter->scope.sql)
+                            : std::format(
+                                  "SELECT s.id, ranked.score FROM samples s LEFT JOIN effective_metadata e "
+                                  "ON e.sample_id=s.id LEFT JOIN {0} ranked ON ranked.id=s.id WHERE s.deleted=0 "
+                                  "AND ({1}) AND ({2}) ORDER BY ranked.score IS NULL, ranked.score, s.name_key, s.id "
+                                  "LIMIT ?",
+                                  kRanked, filter->query.sql, filter->scope.sql);
+            auto statement = reader->connection().prepare(sql);
+            if (!statement) return std::unexpected(statement.error());
+            statement->bind(1, match);
+            int next = bind_parameters(*statement, filter->query.parameters, 2);
+            next = bind_parameters(*statement, filter->scope.parameters, next);
+            statement->bind(next, static_cast<std::int64_t>(SearchService::kRelevanceDepth + 1));
+            std::vector<RankedKey> keys;
+            while (true) {
+                auto has_row = statement->next_row();
+                if (!has_row) return std::unexpected(has_row.error());
+                if (!*has_row) break;
+                const double rank = static_cast<double>(keys.size() + 1);
+                keys.push_back({identity.uuid, statement->column_int64(0), !statement->column_is_null(1),
+                                1.0 / (SearchService::kReciprocalRankConstant + rank)});
+            }
+            return keys;
+        }();
+        if (!ranked) {
+            if (auto request_error = record_library_error(coverage, ranked.error()))
+                return std::unexpected(*request_error);
+        } else {
+            if (ranked->size() > SearchService::kRelevanceDepth) {
+                page.relevance_window_limited = true;
+                ranked->resize(SearchService::kRelevanceDepth);
+            }
+            fused.insert(fused.end(), ranked->begin(), ranked->end());
+        }
+        page.coverage.push_back(std::move(coverage));
+    }
+    std::ranges::stable_sort(fused, [](const RankedKey& left, const RankedKey& right) {
+        if (left.text_match != right.text_match) return left.text_match;
+        if (left.fused_score != right.fused_score) return left.fused_score > right.fused_score;
+        if (left.library != right.library) return left.library < right.library;
+        return left.sample_id < right.sample_id;
+    });
+
+    const std::size_t first = std::min(cursor.offset, fused.size());
+    const std::size_t last = std::min(first + page_size, fused.size());
+    std::vector<PageEntry> entries;
+    for (std::size_t index = first; index < last; ++index)
+        entries.push_back({fused[index].library, fused[index].sample_id});
+    hydrate_page(libraries, entries, page.coverage, page.rows);
+    std::map<std::pair<uuids::uuid, std::int64_t>, double> scores;
+    for (std::size_t index = first; index < last; ++index)
+        scores.emplace(std::pair{fused[index].library, fused[index].sample_id},
+                       fused[index].text_match ? fused[index].fused_score : 0.0);
+    for (auto& row : page.rows)
+        row.relevance = scores[{row.library, row.sample_id}];
+    if (last < fused.size())
+        page.next = Cursor{nlohmann::json{
+            {"v", kCursorVersion},
+            {"q", fingerprint},
+            {"libraries", nlohmann::json::object()},
+            {"offset", last}}.dump()};
+    return page;
+}
+
+/// Metadata sort: a page from each library after its own keyset position, k-way merged.
+Result<SearchPage> metadata_search(std::span<catalog::Library* const> libraries, const SearchRequest& request,
+                                   const Query& query, const DecodedCursor& cursor, std::size_t page_size,
+                                   const std::string& fingerprint) {
+    SearchRequest effective = request;
+    if (effective.sort == SortField::Relevance) effective.sort = SortField::Name;
+    SearchPage page;
+    std::vector<OrderedKey> merged;
+    std::map<uuids::uuid, std::size_t> fetched_counts;
+    for (auto* library : libraries) {
+        const auto identity = library->identity();
+        LibraryCoverage coverage{identity.uuid, identity.name, true, std::nullopt};
+        const auto key = uuids::to_string(identity.uuid);
+        const auto stored = cursor.positions.find(key);
+        const LibraryPosition position = stored != cursor.positions.end() ? stored->second : LibraryPosition{};
+        if (!position.exhausted) {
+            auto keys = fetch_library_keys(*library, query, effective, position, page_size);
+            if (!keys) {
+                if (auto request_error = record_library_error(coverage, keys.error()))
+                    return std::unexpected(*request_error);
+            } else {
+                fetched_counts[identity.uuid] = keys->size();
+                merged.insert(merged.end(), std::make_move_iterator(keys->begin()),
+                              std::make_move_iterator(keys->end()));
+            }
+        }
+        page.coverage.push_back(std::move(coverage));
+    }
+    std::ranges::stable_sort(merged, [&](const OrderedKey& left, const OrderedKey& right) {
+        return comes_before(left, right, effective.descending);
+    });
+    if (merged.size() > page_size) merged.resize(page_size);
+
+    std::vector<PageEntry> entries;
+    for (const auto& key : merged)
+        entries.push_back({key.library, key.sample_id});
+    const auto failed = hydrate_page(libraries, entries, page.coverage, page.rows);
+
+    // New per-library positions: the last key consumed from each; untouched libraries, and those
+    // whose rows could not be hydrated, keep theirs so the next page retries them.
+    std::map<std::string, LibraryPosition> next_positions = cursor.positions;
+    std::map<uuids::uuid, std::size_t> consumed;
+    for (const auto& key : merged) {
+        if (std::ranges::contains(failed, key.library)) continue;
+        ++consumed[key.library];
+        auto& position = next_positions[uuids::to_string(key.library)];
+        position.partition = key.partition;
+        position.value = key.sort_value;
+        position.last_id = key.sample_id;
+        position.started = true;
+    }
+    bool more = false;
+    for (const auto& [library, fetched] : fetched_counts) {
+        const bool library_has_more =
+            std::ranges::contains(failed, library) || fetched == page_size || consumed[library] < fetched;
+        next_positions[uuids::to_string(library)].exhausted = !library_has_more;
+        more = more || library_has_more;
+    }
+    if (more) {
+        nlohmann::json state = nlohmann::json::object();
+        for (const auto& [key, position] : next_positions)
+            state[key] = {{"p", position.partition},
+                          {"v", position.value},
+                          {"id", position.last_id},
+                          {"started", position.started},
+                          {"done", position.exhausted}};
+        page.next = Cursor{nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"libraries", state}}.dump()};
+    }
+    return page;
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------- free functions
+
+Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const SearchRequest& request) {
+    auto query = parse_query(request.text);
+    if (!query) return std::unexpected(query.error());
+    auto reader = library.acquire_reader();
+    if (!reader) return std::unexpected(reader.error());
+    auto filter = compile_filter(*query, request.scope, reader->connection());
+    if (!filter) return std::unexpected(filter.error());
+    auto statement = reader->connection().prepare(
+        std::format("SELECT s.id FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
+                    "WHERE s.deleted=0 AND ({}) AND ({}) ORDER BY s.id",
+                    filter->query.sql, filter->scope.sql));
+    if (!statement) return std::unexpected(statement.error());
+    bind_parameters(*statement, filter->scope.parameters, bind_parameters(*statement, filter->query.parameters, 1));
+    std::vector<std::int64_t> ids;
+    while (true) {
+        auto has_row = statement->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        if (!*has_row) break;
+        ids.push_back(statement->column_int64(0));
+    }
+    return ids;
+}
 
 // ---------------------------------------------------------------- SearchService
 
@@ -438,140 +589,12 @@ Result<SearchPage> SearchService::search(std::span<catalog::Library* const> libr
     auto query = parse_query(request.text);
     if (!query) return std::unexpected(query.error());
     const std::size_t page_size = clamp_page_size(request.page_size);
-    const std::string fingerprint = query_fingerprint(request);
-    auto positions = decode_cursor(request.cursor, fingerprint);
-    if (!positions) return std::unexpected(positions.error());
-
-    SearchPage page;
-    const auto ranked_terms = positive_text_terms(*query);
-    if (request.sort == SortField::Relevance && !ranked_terms.empty()) {
-        // Bounded top-K per library by BM25, fused across libraries with reciprocal rank fusion.
-        std::string match;
-        for (const auto& term : ranked_terms)
-            match += (match.empty() ? "" : " OR ") + fts_expression(term);
-        std::vector<SampleRow> fused;
-        for (auto* library : libraries) {
-            LibraryCoverage coverage{library->identity().uuid, library->identity().name, true, std::nullopt};
-            auto reader = library->acquire_reader();
-            auto filter = reader ? compile_query(*query, reader->connection())
-                                 : Result<SqlPredicate>(std::unexpected(reader.error()));
-            auto scope = reader && filter ? compile_scope(request.scope, reader->connection())
-                                          : Result<SqlPredicate>(SqlPredicate{});
-            if (!reader || !filter || !scope) {
-                coverage.complete = false;
-                coverage.error = !reader ? reader.error() : !filter ? filter.error() : scope.error();
-                page.coverage.push_back(std::move(coverage));
-                continue;
-            }
-            const std::string sql = std::format(
-                "SELECT {0}, ranked.score FROM (SELECT rowid AS id, bm25(sample_fts) AS score FROM sample_fts "
-                "WHERE sample_fts MATCH ?) ranked JOIN samples s ON s.id=ranked.id LEFT JOIN effective_metadata e "
-                "ON e.sample_id=s.id WHERE s.deleted=0 AND ({1}) AND ({2}) ORDER BY ranked.score, s.id LIMIT ?",
-                kRowColumns, filter->sql, scope->sql);
-            auto statement = reader->connection().prepare(sql);
-            if (!statement) return std::unexpected(statement.error());
-            statement->bind(1, match);
-            int next = bind_parameters(*statement, filter->parameters, 2);
-            next = bind_parameters(*statement, scope->parameters, next);
-            statement->bind(next, static_cast<std::int64_t>(kRelevanceDepth));
-            std::map<std::int64_t, std::string> cache;
-            for (std::size_t rank = 1;; ++rank) {
-                auto has_row = statement->next_row();
-                if (!has_row) return std::unexpected(has_row.error());
-                if (!*has_row) break;
-                SampleRow row = read_base_row(*statement, coverage.library);
-                row.relevance = 1.0 / (kReciprocalRankConstant + static_cast<double>(rank));
-                if (auto hydrated =
-                        hydrate_relations(reader->connection(), row, statement->column_optional_int64(6), cache);
-                    !hydrated)
-                    return std::unexpected(hydrated.error());
-                if (rank == kRelevanceDepth) page.relevance_window_limited = true;
-                fused.push_back(std::move(row));
-            }
-            page.coverage.push_back(std::move(coverage));
-        }
-        std::ranges::stable_sort(fused, [](const SampleRow& left, const SampleRow& right) {
-            if (left.relevance != right.relevance) return left.relevance > right.relevance;
-            if (uuids::to_string(left.library) != uuids::to_string(right.library))
-                return uuids::to_string(left.library) < uuids::to_string(right.library);
-            return left.sample_id < right.sample_id;
-        });
-        const auto offset = static_cast<std::size_t>((*positions)["@offset"].last_id);
-        for (std::size_t index = offset; index < fused.size() && page.rows.size() < page_size; ++index)
-            page.rows.push_back(std::move(fused[index]));
-        if (offset + page.rows.size() < fused.size())
-            page.next = Cursor{nlohmann::json{{"v", kCursorVersion},
-                                              {"q", fingerprint},
-                                              {"libraries", nlohmann::json::object()},
-                                              {"offset", offset + page.rows.size()}}
-                                   .dump()};
-        return page;
-    }
-
-    // Metadata sort: fetch a page from each library after its own position, then k-way merge.
-    SearchRequest effective = request;
-    if (effective.sort == SortField::Relevance) effective.sort = SortField::Name;
-    std::vector<OrderedRow> merged;
-    std::map<std::string, std::size_t> fetched_counts;
-    for (auto* library : libraries) {
-        const auto identity = library->identity();
-        LibraryCoverage coverage{identity.uuid, identity.name, true, std::nullopt};
-        const auto key = uuids::to_string(identity.uuid);
-        const LibraryPosition position = positions->contains(key) ? positions->at(key) : LibraryPosition{};
-        if (position.exhausted) {
-            page.coverage.push_back(std::move(coverage));
-            continue;
-        }
-        auto rows = fetch_library_page(*library, *query, effective, position, page_size);
-        if (!rows) {
-            if (rows.error().code == ErrorCode::InvalidArgument || rows.error().code == ErrorCode::ParseError)
-                return std::unexpected(rows.error());
-            coverage.complete = false;
-            coverage.error = rows.error();
-        } else {
-            fetched_counts[key] = rows->size();
-            for (auto& row : *rows)
-                merged.push_back(std::move(row));
-        }
-        page.coverage.push_back(std::move(coverage));
-    }
-    std::ranges::stable_sort(merged, [&](const OrderedRow& left, const OrderedRow& right) {
-        return comes_before(left, right, effective.descending);
-    });
-    if (merged.size() > page_size) merged.resize(page_size);
-
-    // New per-library positions: the last row consumed from each; untouched libraries keep theirs.
-    std::map<std::string, LibraryPosition> next_positions = *positions;
-    next_positions.erase("@offset");
-    std::map<std::string, std::size_t> consumed;
-    for (const auto& ordered : merged) {
-        const auto key = uuids::to_string(ordered.row.library);
-        ++consumed[key];
-        auto& position = next_positions[key];
-        position.partition = ordered.partition;
-        position.value = ordered.sort_value;
-        position.last_id = ordered.row.sample_id;
-        position.started = true;
-    }
-    bool more = false;
-    for (const auto& [key, fetched] : fetched_counts) {
-        const bool library_has_more = fetched == page_size || consumed[key] < fetched;
-        next_positions[key].exhausted = !library_has_more;
-        more = more || library_has_more;
-    }
-    for (auto& ordered : merged)
-        page.rows.push_back(std::move(ordered.row));
-    if (more) {
-        nlohmann::json state = nlohmann::json::object();
-        for (const auto& [key, position] : next_positions)
-            state[key] = {{"p", position.partition},
-                          {"v", position.value},
-                          {"id", position.last_id},
-                          {"started", position.started},
-                          {"done", position.exhausted}};
-        page.next = Cursor{nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"libraries", state}}.dump()};
-    }
-    return page;
+    const std::string fingerprint = query_fingerprint(request, libraries);
+    auto cursor = decode_cursor(request.cursor, fingerprint);
+    if (!cursor) return std::unexpected(cursor.error());
+    if (request.sort == SortField::Relevance && !positive_text_terms(*query).empty())
+        return relevance_search(libraries, request, *query, *cursor, page_size, fingerprint);
+    return metadata_search(libraries, request, *query, *cursor, page_size, fingerprint);
 }
 
 Result<CountResult> SearchService::count(std::span<catalog::Library* const> libraries,
@@ -582,30 +605,26 @@ Result<CountResult> SearchService::count(std::span<catalog::Library* const> libr
     for (auto* library : libraries) {
         const auto identity = library->identity();
         LibraryCoverage coverage{identity.uuid, identity.name, true, std::nullopt};
-        auto reader = library->acquire_reader();
-        if (!reader) {
-            coverage.complete = false;
-            coverage.error = reader.error();
-            result.coverage.push_back(std::move(coverage));
-            continue;
-        }
-        auto filter = compile_query(*query, reader->connection());
-        if (!filter) return std::unexpected(filter.error());
-        auto scope = compile_scope(request.scope, reader->connection());
-        if (!scope) return std::unexpected(scope.error());
-        auto statement = reader->connection().prepare(
-            std::format("SELECT count(*) FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
-                        "WHERE s.deleted=0 AND ({}) AND ({})",
-                        filter->sql, scope->sql));
-        if (!statement) return std::unexpected(statement.error());
-        bind_parameters(*statement, scope->parameters, bind_parameters(*statement, filter->parameters, 1));
-        auto has_row = statement->next_row();
-        if (!has_row) {
-            coverage.complete = false;
-            coverage.error = has_row.error();
-        } else if (*has_row) {
-            result.total += statement->column_int64(0);
-        }
+        auto counted = [&]() -> Result<std::int64_t> {
+            auto reader = library->acquire_reader();
+            if (!reader) return std::unexpected(reader.error());
+            auto filter = compile_filter(*query, request.scope, reader->connection());
+            if (!filter) return std::unexpected(filter.error());
+            auto statement = reader->connection().prepare(
+                std::format("SELECT count(*) FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
+                            "WHERE s.deleted=0 AND ({}) AND ({})",
+                            filter->query.sql, filter->scope.sql));
+            if (!statement) return std::unexpected(statement.error());
+            bind_parameters(*statement, filter->scope.parameters,
+                            bind_parameters(*statement, filter->query.parameters, 1));
+            auto has_row = statement->next_row();
+            if (!has_row) return std::unexpected(has_row.error());
+            return *has_row ? statement->column_int64(0) : 0;
+        }();
+        if (counted)
+            result.total += *counted;
+        else if (auto request_error = record_library_error(coverage, counted.error()))
+            return std::unexpected(*request_error);
         result.coverage.push_back(std::move(coverage));
     }
     return result;

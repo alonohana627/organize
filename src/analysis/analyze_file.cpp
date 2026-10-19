@@ -1,11 +1,18 @@
 /// @file
 /// analyze_file(): input evidence, byte hashing and the shared decode pass for one file.
+///
+/// Byte hashing and decoding each read the file once. Folding the byte hash into the decode pass
+/// would need a decoder that reads through a caller-supplied byte stream, which media::open_decoder
+/// does not offer; the second read is usually served by the OS page cache, and only slow network
+/// shares pay for it twice.
 #include <chrono>
 #include <exception>
+#include <format>
 #include <memory>
 #include <new>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -27,16 +34,29 @@ struct FileStamp {
     std::int64_t modified_ns = 0;
 };
 
+/// Maps a failed filesystem query to the error taxonomy: a vanished path is FILE_MISSING, a
+/// permission problem ACCESS_DENIED, and anything else (I/O error, unreachable share) a retryable
+/// SOURCE_OFFLINE.
+std::unexpected<Error> file_query_failure(const std::error_code& error, std::string_view what) {
+    if (error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory)
+        return fail(ErrorCode::FileMissing, "file not found");
+    if (error == std::errc::permission_denied || error == std::errc::operation_not_permitted)
+        return fail(ErrorCode::AccessDenied, std::format("cannot read the file's {}", what));
+    return fail(ErrorCode::SourceOffline, std::format("cannot read the file's {}", what), /*retryable=*/true);
+}
+
+/// Reads the size and modification time of a regular file without throwing.
 Result<FileStamp> read_file_stamp(const std::filesystem::path& file) {
     std::error_code error;
     const auto status = std::filesystem::status(file, error);
-    if (!std::filesystem::exists(status)) return fail(ErrorCode::FileMissing, "file not found");
+    if (status.type() == std::filesystem::file_type::not_found) return fail(ErrorCode::FileMissing, "file not found");
+    if (error) return file_query_failure(error, "attributes");
     if (!std::filesystem::is_regular_file(status)) return fail(ErrorCode::InvalidArgument, "not a regular file");
 
     const auto size = std::filesystem::file_size(file, error);
-    if (error) return fail(ErrorCode::AccessDenied, "cannot read file size");
+    if (error) return file_query_failure(error, "size");
     const auto modified = std::filesystem::last_write_time(file, error);
-    if (error) return fail(ErrorCode::AccessDenied, "cannot read modification time");
+    if (error) return file_query_failure(error, "modification time");
 
     FileStamp stamp;
     stamp.size = static_cast<std::int64_t>(size);
@@ -44,8 +64,9 @@ Result<FileStamp> read_file_stamp(const std::filesystem::path& file) {
     return stamp;
 }
 
+/// The body of analyze_file(); library code below it may throw, analyze_file() catches.
 Result<AnalysisReport> analyze_file_or_throw(const AnalysisRequest& request, std::stop_token stop,
-                                             const ProgressCallback& progress) {
+                                             const ProgressCallback& progress, WorkCounter* work_counter) {
     if (auto valid = validate_request(request); !valid) return std::unexpected(valid.error());
     const StageSelection stages = StageSelection::from(request.stages);
 
@@ -53,7 +74,7 @@ Result<AnalysisReport> analyze_file_or_throw(const AnalysisRequest& request, std
     if (!before) return std::unexpected(before.error());
     if (stop.stop_requested()) return fail(ErrorCode::Cancelled, "analysis cancelled");
 
-    ProgressReporter reporter(progress);
+    ProgressReporter reporter(progress, ProgressReporter::kDefaultInterval, work_counter);
     const double byte_hash_share = !stages.byte_hash ? 0.0 : stages.needs_decode() ? kByteHashProgressShare : 1.0;
 
     std::optional<std::string> byte_sha256;
@@ -90,15 +111,18 @@ Result<AnalysisReport> analyze_file_or_throw(const AnalysisRequest& request, std
 }  // namespace
 
 Result<AnalysisReport> analyze_file(const AnalysisRequest& request, std::stop_token stop,
-                                    const ProgressCallback& progress) {
+                                    const ProgressCallback& progress, WorkCounter* work_counter) {
     // No exception crosses the module boundary: allocation failure and library exceptions
-    // (pocketfft, std::filesystem) become ordinary errors.
+    // (pocketfft, std::format, the progress callback) become ordinary errors. The final handler
+    // exists because the callback is caller code that may throw anything.
     try {
-        return analyze_file_or_throw(request, std::move(stop), progress);
+        return analyze_file_or_throw(request, std::move(stop), progress, work_counter);
     } catch (const std::bad_alloc&) {
         return fail(ErrorCode::ResourceLimit, "out of memory during analysis");
     } catch (const std::exception& error) {
         return fail(ErrorCode::Internal, std::string("analysis failed: ") + error.what());
+    } catch (...) {
+        return fail(ErrorCode::Internal, "analysis failed with an unknown exception");
     }
 }
 

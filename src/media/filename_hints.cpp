@@ -38,10 +38,12 @@ constexpr std::array<std::string_view, 9> kIndexWords = {
     "take", "vol", "volume", "no", "part", "pt", "track", "version", "ver",
 };
 
-bool contains(auto& list, std::string_view word) {
+/// True when `word` is one of the entries of `list`.
+bool contains(const auto& list, std::string_view word) {
     return std::ranges::find(list, word) != list.end();
 }
 
+/// Characters that belong to tokens: ASCII letters and digits, '#', and every non-ASCII byte.
 bool is_word_character(char character) {
     const auto byte = static_cast<unsigned char>(character);
     return byte >= 0x80 || std::isalnum(byte) || character == '#';  // non-ASCII bytes belong to words
@@ -85,7 +87,7 @@ std::optional<double> parse_tempo_number(std::string_view text) {
     const std::size_t integer_digits = std::min(text.find('.'), text.size());
     if (integer_digits < 2 || integer_digits > 3) return std::nullopt;
     if (!std::ranges::all_of(text.substr(0, integer_digits),
-                             [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
+                             [](char character) { return std::isdigit(static_cast<unsigned char>(character)); })) {
         return std::nullopt;
     }
     double value = 0.0;
@@ -94,6 +96,7 @@ std::optional<double> parse_tempo_number(std::string_view text) {
     return value;
 }
 
+/// Milli-BPM for a tempo marked with "bpm", within the UI's manual range.
 std::optional<std::int64_t> marked_bpm(double value) {
     if (value < kMinMarkedBpm || value > kMaxMarkedBpm) return std::nullopt;
     return static_cast<std::int64_t>(std::llround(value * 1000.0));
@@ -126,8 +129,9 @@ std::set<std::int64_t> bare_tempos(const std::vector<std::string>& lowered) {
     for (std::size_t index = 1; index < lowered.size(); ++index) {
         const std::string& token = lowered[index];
         if (token.size() < 2 || token.size() > 3 || token.front() == '0') continue;
-        if (!std::ranges::all_of(token, [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) continue;
-        const int value = std::stoi(token);
+        int value = 0;
+        const auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), value);
+        if (error != std::errc{} || end != token.data() + token.size()) continue;  // not all digits
         if (value < kMinBareBpm || value > kMaxBareBpm) continue;
         const std::string_view previous = lowered[index - 1];
         if (contains(kModelPrefixes, previous) || contains(kIndexWords, previous)) continue;
@@ -145,6 +149,7 @@ struct KeyToken {
     bool has_accidental = false;
 };
 
+/// Parses a key spelled in one token; nullopt when the token is not a key.
 std::optional<KeyToken> parse_key_token(std::string_view token) {
     if (token.empty() || token[0] < 'A' || token[0] > 'G') return std::nullopt;
     std::size_t root_length = 1;
@@ -163,6 +168,7 @@ std::optional<KeyToken> parse_key_token(std::string_view token) {
     return key;
 }
 
+/// Mode named by a separate word ("minor", "maj", ...).
 std::optional<KeyMode> parse_mode_word(std::string_view lowered) {
     if (lowered == "minor" || lowered == "min") return KeyMode::Minor;
     if (lowered == "major" || lowered == "maj") return KeyMode::Major;

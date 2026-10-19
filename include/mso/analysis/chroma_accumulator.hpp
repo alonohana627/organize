@@ -49,6 +49,7 @@ public:
 private:
     /// Receives each new frame; accumulates the pending (previous) one now that its successor is known.
     void on_frame(std::span<const float> magnitudes);
+    /// Adds the pending frame's spectral peaks to the fine chroma, weighted by tonality x stationarity.
     void accumulate_pending_frame(double stationarity);
 
     SpectrogramStream spectrogram_;

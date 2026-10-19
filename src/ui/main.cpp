@@ -81,7 +81,10 @@ int main(int argc, char* argv[]) {
                 });
             });
         }
-        window.resize(1600, 950);
+        // Saved layout and shortcuts apply before the first paint, so the window never jumps.
+        session.preload_preferences();
+        window.restore_saved_state();
+        if (parser.isSet(screenshot_option)) window.resize(1600, 950);  // reproducible documentation shots
         window.show();
         session.start();
         exit_code = QApplication::exec();

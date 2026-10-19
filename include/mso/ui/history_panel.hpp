@@ -24,6 +24,7 @@ class HistoryPanel final : public QWidget {
     Q_OBJECT
 
 public:
+    /// Most recent actions listed.
     static constexpr std::size_t kVisibleEntries = 100;
 
     explicit HistoryPanel(ApplicationSession& session, QWidget* parent = nullptr);
@@ -35,13 +36,19 @@ public:
     const std::optional<uuids::uuid>& library() const { return library_; }
 
 signals:
+    /// Undo the latest action of the shown library.
     void undoRequested();
+    /// Redo the latest undone action of the shown library.
     void redoRequested();
 
 private:
+    /// Reads the history through the Application.
     ApplicationSession& session_;
+    /// Library whose history is shown.
     std::optional<uuids::uuid> library_;
+    /// Drops stale history deliveries.
     std::uint64_t request_ = 0;
+    /// Widgets (owned through Qt's parent tree).
     QLabel* title_label_ = nullptr;
     QListWidget* list_ = nullptr;
     QPushButton* undo_button_ = nullptr;

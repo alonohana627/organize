@@ -1,4 +1,4 @@
-#include "mso/media/text_decoding.hpp"
+#include "mso/media/detail/text_decoding.hpp"
 
 #include <utf8proc.h>
 
@@ -20,6 +20,7 @@ void append_utf8(std::string& output, char32_t code_point) {
     output.append(reinterpret_cast<const char*>(encoded), static_cast<std::size_t>(length));
 }
 
+/// Decodes ISO-8859-1 bytes (each byte is its own code point).
 std::string decode_latin1(Bytes bytes) {
     std::string output;
     output.reserve(bytes.size());

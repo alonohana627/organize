@@ -1,17 +1,17 @@
-#include "mso/audio/playback_renderer.hpp"
+#include "mso/audio/detail/playback_renderer.hpp"
 
 #include <algorithm>
 
-#include "mso/audio/sample_safety.hpp"
+#include "mso/audio/detail/sample_safety.hpp"
 
-namespace mso::audio {
+namespace mso::audio::detail {
 namespace {
 
-/// Fade applied by the callback when output is enabled or disabled (play/pause).
+/// Fade when output is disabled (pause) or re-enters the signal (resume, underrun recovery).
 constexpr double kTransportFadeMilliseconds = 5.0;
 /// Time a full-scale volume change takes; smaller changes take proportionally less.
 constexpr double kVolumeGlideMilliseconds = 20.0;
-/// Decay of the last output value when audio stops abruptly (flush, underrun).
+/// Decay of the last output value when audio is cut (flush, underrun).
 constexpr double kDeclickDecayMilliseconds = 5.0;
 
 }  // namespace
@@ -19,7 +19,9 @@ constexpr double kDeclickDecayMilliseconds = 5.0;
 PlaybackRenderer::PlaybackRenderer(PcmRing& ring, SharedPlaybackState& shared) noexcept
     : ring_(ring), shared_(shared), volume_gain_(1.0f, 1.0f) {}
 
-void PlaybackRenderer::configure(std::uint32_t output_rate) noexcept {
+void PlaybackRenderer::configure(std::uint32_t output_rate, std::uint32_t latency_frames) noexcept {
+    output_rate_ = output_rate;
+    latency_frames_ = latency_frames;
     transport_gain_.set_step(LinearRamp::step_for(output_rate, kTransportFadeMilliseconds));
     volume_gain_.set_step(LinearRamp::step_for(output_rate, kVolumeGlideMilliseconds));
     decay_length_ = std::max<std::uint32_t>(
@@ -28,22 +30,28 @@ void PlaybackRenderer::configure(std::uint32_t output_rate) noexcept {
 }
 
 void PlaybackRenderer::render(std::span<float> stereo_output) noexcept {
-    const bool output_enabled = shared_.output_enabled.load(std::memory_order_acquire);
-    follow_current_epoch(output_enabled);
-    transport_gain_.set_target(output_enabled ? 1.0f : 0.0f);
+    adopt_gate(TransportGate::unpacked(shared_.transport_gate.load(std::memory_order_acquire)));
     volume_gain_.set_target(shared_.target_volume.load(std::memory_order_relaxed));
+    dropped_foreign_rate_ = false;
 
     bool starved = false;
     const std::size_t frame_count = stereo_output.size() / kOutputChannels;
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
         float left = 0.0f;
         float right = 0.0f;
-        // Keep consuming while a fade-out is still audible; stop once it reaches silence.
-        const bool consuming = transport_gain_.target() > 0.0f || transport_gain_.value() > 0.0f;
-        const bool has_audio = consuming && read_frame(left, right);
-        starved = starved || (consuming && !has_audio);
+        const bool wanted = consuming();
+        const bool has_audio = wanted && read_frame(left, right);
+        if (wanted && !has_audio && output_enabled_) {
+            starved = true;
+            // Re-entering the signal after a gap is a mid-signal start: fade the next audio in.
+            fade_in_after_underrun_ = position_epoch_ == epoch_;
+        }
+        if (has_audio && fade_in_after_underrun_) {
+            transport_gain_.restart_from(0.0f);
+            fade_in_after_underrun_ = false;
+        }
         if (!has_audio && previous_frame_had_audio_) {
-            start_decay_from_last_output();
+            cut_audio();
         }
         previous_frame_had_audio_ = has_audio;
 
@@ -62,38 +70,50 @@ void PlaybackRenderer::render(std::span<float> stereo_output) noexcept {
         stereo_output[frame * kOutputChannels + 1] = right;
         last_output_ = {left, right};
     }
+    output_frames_ += frame_count;
 
-    publish_position();
+    publish_progress();
     const bool primed = position_epoch_ == epoch_ && epoch_ != 0;
     const bool ended = shared_.ended_epoch.load(std::memory_order_relaxed) == epoch_;
-    if (starved && output_enabled && primed && !ended) {
+    if (starved && primed && !ended && !dropped_foreign_rate_) {
         shared_.underrun_count.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-void PlaybackRenderer::follow_current_epoch(bool output_enabled) noexcept {
-    const std::uint64_t newest = shared_.pcm_epoch.load(std::memory_order_acquire);
-    if (newest == epoch_) {
-        return;
-    }
-    epoch_ = newest;
-    if (!output_enabled) {
-        // Stop, end of source, new source, device loss: the old audio is cut (and decayed below);
-        // the new epoch's first frames must not leak out under a fade-out.
-        transport_gain_.jump_to(0.0f);
-    }
-    if (current_block_ && current_block_->header->epoch < epoch_) {
-        ring_.pop_front();
-        current_block_.reset();
-        if (previous_frame_had_audio_) {
-            start_decay_from_last_output();
-            previous_frame_had_audio_ = false;
+void PlaybackRenderer::adopt_gate(TransportGate gate) noexcept {
+    if (gate.epoch != epoch_) {
+        epoch_ = gate.epoch;
+        if (current_block_ && is_superseded(*current_block_->header)) {
+            ring_.pop_front();
+            current_block_.reset();
+            cut_audio();
+        }
+        // Blocks are in production order, so every superseded block sits in front of the current ones.
+        for (auto block = ring_.front(); block && is_superseded(*block->header); block = ring_.front()) {
+            ring_.pop_front();
+        }
+        fade_in_after_underrun_ = false;
+        if (!gate.output_enabled) {
+            // Stop, end of source, new source, device loss: nothing of the new epoch may leak out
+            // under the old fade-out; the old audio is decayed by cut_audio().
+            transport_gain_.jump_to(0.0f);
         }
     }
-    // Blocks are in production order, so every superseded block sits in front of the current ones.
-    for (auto block = ring_.front(); block && block->header->epoch < epoch_; block = ring_.front()) {
-        ring_.pop_front();
+    if (gate.output_enabled != output_enabled_) {
+        output_enabled_ = gate.output_enabled;
+        if (!output_enabled_) {
+            transport_gain_.set_target(0.0f);
+        } else if (position_epoch_ != epoch_) {
+            // A fresh epoch begins clean (frame 0, or faded in by the decoder thread): full gain at once.
+            transport_gain_.jump_to(1.0f);
+        } else {
+            transport_gain_.set_target(1.0f);  // resuming mid-signal after a pause
+        }
     }
+}
+
+bool PlaybackRenderer::is_superseded(const PcmBlockHeader& header) const noexcept {
+    return header.epoch < epoch_ || header.output_rate != output_rate_;
 }
 
 bool PlaybackRenderer::read_frame(float& left, float& right) noexcept {
@@ -104,10 +124,18 @@ bool PlaybackRenderer::read_frame(float& left, float& right) noexcept {
                 return false;
             }
             if (block->header->epoch > epoch_) {
-                // Written after this callback began: the published epoch is at least as new.
-                epoch_ = shared_.pcm_epoch.load(std::memory_order_acquire);
+                // Written after this callback began: the decoder thread published the gate before the
+                // block, so adopting it now brings the matching output switch along.
+                adopt_gate(TransportGate::unpacked(shared_.transport_gate.load(std::memory_order_acquire)));
+                if (block->header->epoch > epoch_ || !consuming()) {
+                    // Not yet announced (never happens with a well-behaved producer), or the new state
+                    // stopped output: consume nothing of it in this frame.
+                    return false;
+                }
+                continue;
             }
-            if (block->header->epoch < epoch_) {
+            if (is_superseded(*block->header)) {
+                dropped_foreign_rate_ = dropped_foreign_rate_ || block->header->output_rate != output_rate_;
                 ring_.pop_front();
                 continue;
             }
@@ -149,15 +177,25 @@ void PlaybackRenderer::finish_block() noexcept {
     current_block_.reset();
 }
 
-void PlaybackRenderer::start_decay_from_last_output() noexcept {
+void PlaybackRenderer::cut_audio() noexcept {
+    if (!previous_frame_had_audio_) {
+        return;
+    }
     decay_start_ = last_output_;
     decay_remaining_ = decay_length_;
+    previous_frame_had_audio_ = false;
 }
 
-void PlaybackRenderer::publish_position() noexcept {
-    shared_.played_frame.store(position_frame_, std::memory_order_relaxed);
-    shared_.played_epoch_frames.store(epoch_frames_played_, std::memory_order_relaxed);
-    shared_.played_epoch.store(position_epoch_, std::memory_order_release);
+void PlaybackRenderer::publish_progress() noexcept {
+    playhead_history_.record({output_frames_, position_epoch_, position_frame_});
+    PlaybackProgress progress;
+    progress.consumed_epoch = position_epoch_;
+    progress.consumed_frames = epoch_frames_played_;
+    if (const auto heard = playhead_history_.audible(output_frames_, latency_frames_)) {
+        progress.audible_epoch = heard->epoch;
+        progress.audible_frame = heard->position;
+    }
+    shared_.progress.store(progress);
 }
 
-}  // namespace mso::audio
+}  // namespace mso::audio::detail

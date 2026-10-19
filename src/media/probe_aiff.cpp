@@ -3,10 +3,10 @@
 #include <map>
 
 #include "mso/domain/core.hpp"
-#include "mso/media/id3.hpp"
-#include "mso/media/probe_formats.hpp"
-#include "mso/media/tag_mapping.hpp"
-#include "mso/media/text_decoding.hpp"
+#include "mso/media/detail/id3.hpp"
+#include "mso/media/detail/probe_formats.hpp"
+#include "mso/media/detail/tag_mapping.hpp"
+#include "mso/media/detail/text_decoding.hpp"
 
 namespace mso::media::detail {
 
@@ -36,9 +36,10 @@ std::optional<std::int64_t> extended_to_integer(Bytes ten_bytes) {
 /// The AIFF-C compression types this probe can name, and what they mean.
 struct CompressionType {
     std::string_view fourcc;
-    std::string_view codec;  // empty: linear PCM named from the sample size
+    std::string_view codec;  ///< empty: linear PCM named from the sample size
     bool is_float = false;
     bool is_unsigned = false;
+    std::int64_t fixed_bits = 0;  ///< sample width implied by the type; 0 when sampleSize decides
 };
 
 constexpr CompressionType kCompressionTypes[] = {
@@ -55,6 +56,11 @@ constexpr CompressionType kCompressionTypes[] = {
     {"ulaw", "pcm_mulaw"},
     {"ULAW", "pcm_mulaw"},
     {"ima4", "adpcm_ima_qt"},
+    // QuickTime fixed-width integer PCM; the bit width comes from the type, not sampleSize.
+    {"in24", "", false, false, 24},
+    {"in32", "", false, false, 32},
+    {"23ni", "", false, false, 24},  // little-endian in24
+    {"42ni", "", false, false, 32},  // little-endian in32
 };
 
 /// Parses the AIFF/AIFF-C chunk list into the probe result.
@@ -63,6 +69,7 @@ public:
     AiffParser(BoundedFileReader& reader, ProbeResult& result, bool is_compressed_form)
         : reader_(reader), result_(result), is_compressed_form_(is_compressed_form) {}
 
+    /// Walks every chunk, then checks that the essential COMM and SSND chunks were present.
     Result<void> run() {
         const Result<void> walk = walk_chunks();
         resolve_loops();
@@ -73,6 +80,7 @@ public:
     }
 
 private:
+    /// Visits chunks in file order with header-sized reads (at most kMaxChunkCount).
     Result<void> walk_chunks() {
         std::uint64_t offset = kFormHeaderSize;
         for (int count = 0; count < kMaxChunkCount; ++count) {
@@ -89,10 +97,15 @@ private:
         return {};
     }
 
+    /// Notes the sound data, or loads and parses a metadata chunk this probe reads.
     Result<void> visit(std::string_view id, std::uint64_t payload_offset, std::uint64_t size) {
         if (id == "SSND") {
             has_sound_data_ = true;
             return {};
+        }
+        if (id == "ID3 " || id == "id3 ") {
+            // Walked frame by frame in the file: embedded pictures are skipped unread.
+            return read_id3v2(reader_, payload_offset, size, result_.tags);
         }
         std::uint64_t limit = 0;
         if (id == "COMM")
@@ -101,8 +114,8 @@ private:
             limit = kMaxMarkerChunkBytes;
         else if (id == "INST")
             limit = kInstrumentChunkBytes;
-        else if (id == "NAME" || id == "AUTH" || id == "ANNO" || id == "ID3 " || id == "id3 ")
-            limit = kMaxTagBytes;
+        else if (id == "NAME" || id == "AUTH" || id == "ANNO")
+            limit = kMaxTextItemBytes;
         else
             return {};
 
@@ -117,13 +130,12 @@ private:
             store_tag(result_.tags, TagField::Title, decode_legacy_text(*payload));
         else if (id == "AUTH")
             store_tag(result_.tags, TagField::Artist, decode_legacy_text(*payload));
-        else if (id == "ANNO")
-            store_tag(result_.tags, TagField::Comment, decode_legacy_text(*payload));
         else
-            parse_id3v2(*payload, result_.tags);
+            store_tag(result_.tags, TagField::Comment, decode_legacy_text(*payload));
         return {};
     }
 
+    /// COMM: channels, frame count, sample size, 80-bit rate and (AIFF-C) compression type.
     Result<void> parse_common(Bytes payload) {
         ByteCursor cursor(payload);
         const std::int64_t channels = cursor.u16_be();
@@ -149,7 +161,8 @@ private:
         }
         // Float compression types fix the sample width; some writers leave sampleSize at 0.
         const bool is_double = compression == "fl64" || compression == "FL64";
-        const std::int64_t bits = known->is_float ? (is_double ? 64 : 32) : sample_size;
+        std::int64_t bits = known->is_float ? (is_double ? 64 : 32) : sample_size;
+        if (known->fixed_bits > 0) bits = known->fixed_bits;
         const auto codec = pcm_codec_name(bits, known->is_float, known->is_unsigned);
         if (!codec) return fail(ErrorCode::CorruptAudio, "unsupported AIFF sample size");
         result_.codec = *codec;

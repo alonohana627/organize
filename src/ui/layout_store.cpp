@@ -8,6 +8,9 @@
 #include <QScreen>
 
 #include <string>
+#include <string_view>
+
+#include "mso/app/json_fields.hpp"
 
 namespace mso::ui {
 
@@ -17,10 +20,11 @@ std::string encode(const QByteArray& bytes) {
     return bytes.toBase64().toStdString();
 }
 
-QByteArray decode(const nlohmann::json& value) {
-    if (!value.is_string()) return {};
-    const std::string text = value.get<std::string>();
-    return QByteArray::fromBase64(QByteArray(text.data(), static_cast<qsizetype>(text.size())));
+/// Base64 field `key` of `layout`, or empty when absent or not a string.
+QByteArray decode(const nlohmann::json& layout, std::string_view key) {
+    const auto text = app::string_field(layout, key);
+    if (!text) return {};
+    return QByteArray::fromBase64(QByteArray(text->data(), static_cast<qsizetype>(text->size())));
 }
 
 }  // namespace
@@ -33,17 +37,18 @@ nlohmann::json LayoutStore::capture(const QMainWindow& window, const QHeaderView
 }
 
 bool LayoutStore::restore(QMainWindow& window, QHeaderView& header, const nlohmann::json& layout) {
-    if (!layout.is_object() || layout.value("version", 0) != kSchemaVersion) return false;
-    const QByteArray geometry = decode(layout.value("geometry", nlohmann::json()));
-    const QByteArray state = decode(layout.value("state", nlohmann::json()));
-    const QByteArray header_state = decode(layout.value("header", nlohmann::json()));
-    if (!geometry.isEmpty()) window.restoreGeometry(geometry);
-    if (!state.isEmpty()) window.restoreState(state, kSchemaVersion);
-    if (!header_state.isEmpty()) header.restoreState(header_state);
+    if (app::integer_field(layout, "version") != kSchemaVersion) return false;
+    const QByteArray geometry = decode(layout, "geometry");
+    const QByteArray state = decode(layout, "state");
+    const QByteArray header_state = decode(layout, "header");
+    bool restored = true;
+    if (!geometry.isEmpty()) restored = window.restoreGeometry(geometry) && restored;
+    if (!state.isEmpty()) restored = window.restoreState(state, kSchemaVersion) && restored;
+    if (!header_state.isEmpty()) restored = header.restoreState(header_state) && restored;
     clamp_to_screens(window);
     for (QDockWidget* dock : window.findChildren<QDockWidget*>())
         if (dock->isFloating()) clamp_to_screens(*dock);
-    return true;
+    return restored;
 }
 
 void LayoutStore::clamp_to_screens(QWidget& window) {

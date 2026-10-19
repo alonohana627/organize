@@ -1,10 +1,10 @@
-#include "mso/audio/stereo_downmix.hpp"
+#include "mso/audio/detail/stereo_downmix.hpp"
 
 #include <algorithm>
 
 #include <miniaudio.h>
 
-namespace mso::audio {
+namespace mso::audio::detail {
 namespace {
 
 constexpr float kMinusThreeDecibels = 0.70710678f;
@@ -72,4 +72,4 @@ StereoDownmix::StereoDownmix(std::size_t channel_count) : gains_(std::max<std::s
     }
 }
 
-}  // namespace mso::audio
+}  // namespace mso::audio::detail

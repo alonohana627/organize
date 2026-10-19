@@ -1,11 +1,12 @@
 {
-  "comment": "Pinned third-party sources vendored into deps/. Edit 'ref' and run: python deps/update_deps.py <name>",
+  "comment": "Pinned third-party sources vendored into deps/. Change 'ref'/'commit'/'version' (or 'url'/'sha256') and run: python deps/update_deps.py <name>. 'content_sha256' is written by that script (post-patch digest of every vendored file) and verified offline by --check. 'system_dependencies' are found at configure time, not vendored; CMake lists them in the generated About-box notices.",
   "dependencies": [
     {
       "name": "sqlite",
       "purpose": "Catalog database engine (amalgamation with FTS5)",
       "version": "3.53.4",
       "license": "Public domain",
+      "homepage": "https://sqlite.org",
       "kind": "archive",
       "url": "https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip",
       "sha256": "1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d",
@@ -13,6 +14,11 @@
         "*/sqlite3.c": "sqlite/sqlite3.c",
         "*/sqlite3.h": "sqlite/sqlite3.h",
         "*/sqlite3ext.h": "sqlite/sqlite3ext.h"
+      },
+      "content_sha256": {
+        "sqlite/sqlite3.c": "b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189",
+        "sqlite/sqlite3.h": "919e7f2e8ed1d8f56ac17b412b8971c76aa5d1a879752cc6058f75e7d5910e1d",
+        "sqlite/sqlite3ext.h": "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be"
       }
     },
     {
@@ -20,12 +26,19 @@
       "purpose": "JSON for history patches, outbox envelopes, settings, export and worker IPC",
       "version": "3.12.0",
       "license": "MIT",
+      "homepage": "https://github.com/nlohmann/json",
       "kind": "git",
       "url": "https://github.com/nlohmann/json",
       "ref": "v3.12.0",
+      "commit": "55f93686c01528224f448c19128836e7df245f72",
       "files": {
         "single_include/nlohmann/json.hpp": "nlohmann_json/include/nlohmann/json.hpp",
         "LICENSE.MIT": "nlohmann_json/LICENSE.MIT"
+      },
+      "license_file": "nlohmann_json/LICENSE.MIT",
+      "content_sha256": {
+        "nlohmann_json/LICENSE.MIT": "b9715282b2f1db1359a919bb3a542dd4362fd9e38ae72d421367eb11abe62eec",
+        "nlohmann_json/include/nlohmann/json.hpp": "5f09d1eebe9b3557f21df155869af13bcde79b74a0748f82ca946e8cc088aaa0"
       }
     },
     {
@@ -33,14 +46,23 @@
       "purpose": "Unicode normalization and case folding for name, sort and sibling keys",
       "version": "2.12.0",
       "license": "MIT",
+      "homepage": "https://github.com/JuliaStrings/utf8proc",
       "kind": "git",
       "url": "https://github.com/JuliaStrings/utf8proc",
       "ref": "v2.12.0",
+      "commit": "79cdd5ab40c79afa559f689ffc13b76812dee1ac",
       "files": {
         "utf8proc.c": "utf8proc/utf8proc.c",
         "utf8proc.h": "utf8proc/utf8proc.h",
         "utf8proc_data.c": "utf8proc/utf8proc_data.c",
         "LICENSE.md": "utf8proc/LICENSE.md"
+      },
+      "license_file": "utf8proc/LICENSE.md",
+      "content_sha256": {
+        "utf8proc/LICENSE.md": "767edbcafb23016d7f203aaf2cbdef5690ad58bcede52ee241427dcb816cd644",
+        "utf8proc/utf8proc.c": "d6a44162d63e831139c027bfd5af824d9e35f5802b76a740c88d524ce0323525",
+        "utf8proc/utf8proc.h": "07e9f32cc5a39f3f59ffc1fd848f02b3c86401123ee499deb46d91232a24df43",
+        "utf8proc/utf8proc_data.c": "0168d10ff1a2c0b4ff2164a0284b74e521ebd4a54b4a330ef5d2aeb0c0e65b8d"
       }
     },
     {
@@ -48,12 +70,21 @@
       "purpose": "RFC 4122 UUIDs for libraries, samples, operations",
       "version": "1.2.3",
       "license": "MIT",
+      "homepage": "https://github.com/mariusbancila/stduuid",
       "kind": "git",
       "url": "https://github.com/mariusbancila/stduuid",
       "ref": "v1.2.3",
+      "commit": "3afe7193facd5d674de709fccc44d5055e144d7a",
       "files": {
         "include/uuid.h": "stduuid/include/uuid.h",
-        "LICENSE": "stduuid/LICENSE"
+        "LICENSE": "stduuid/LICENSE",
+        "README.md": "stduuid/README.md"
+      },
+      "license_file": "stduuid/LICENSE",
+      "content_sha256": {
+        "stduuid/LICENSE": "c6170664187466c22ecb6046c69b7476f6a578db3c1707b5ed0723c290969808",
+        "stduuid/README.md": "37282d1f23cb968bafa64dcf88a58e9c7a6ae7b4b35098099b0e771ba0db30e3",
+        "stduuid/include/uuid.h": "36880bd470c3bd9e5fd1d8ca66028911b17253bb057dbda8709c3c9789b0079f"
       }
     },
     {
@@ -61,12 +92,21 @@
       "purpose": "SHA-256 for migration checksums, integrity verification and byte-exact duplicates",
       "version": "1.0.1",
       "license": "MIT",
+      "homepage": "https://github.com/okdshin/PicoSHA2",
       "kind": "git",
       "url": "https://github.com/okdshin/PicoSHA2",
       "ref": "v1.0.1",
+      "commit": "161cb3fc4170fa7a3eca9e582cebd27cc4d1fe29",
       "files": {
         "picosha2.h": "picosha2/picosha2.h",
-        "LICENSE": "picosha2/LICENSE"
+        "LICENSE": "picosha2/LICENSE",
+        "README.md": "picosha2/README.md"
+      },
+      "license_file": "picosha2/LICENSE",
+      "content_sha256": {
+        "picosha2/LICENSE": "3e4ca187c6ffc8b0ed48f84fb06b9a44eb6fd2c15af856806fc51d44911b4496",
+        "picosha2/README.md": "4da16028cb7d5bbb2af88e7cc0915cd11bf8123a7e642880bfeed209b72e50c3",
+        "picosha2/picosha2.h": "ae5613548dbd3ff1028b136af97d8bb409036566febc5c0fd9b48099f9c55b8d"
       }
     },
     {
@@ -74,14 +114,21 @@
       "purpose": "WASAPI preview output, resampling, WAV/FLAC/MP3 decoding",
       "version": "0.11.25",
       "license": "Public domain or MIT-0",
+      "homepage": "https://miniaud.io",
       "kind": "git",
       "url": "https://github.com/mackron/miniaudio",
       "ref": "0.11.25",
+      "commit": "9634bedb5b5a2ca38c1ee7108a9358a4e233f14d",
       "files": {
         "miniaudio.h": "miniaudio/miniaudio.h",
-        "miniaudio.c": "miniaudio/miniaudio.c",
         "extras/stb_vorbis.c": "miniaudio/extras/stb_vorbis.c",
         "LICENSE": "miniaudio/LICENSE"
+      },
+      "license_file": "miniaudio/LICENSE",
+      "content_sha256": {
+        "miniaudio/LICENSE": "cf00884e3bae1ec7b49e96bc014079f5b4c803987586b894ac431779927c67b3",
+        "miniaudio/extras/stb_vorbis.c": "c8daf8d9f0dad818a1cb6c9194eeb4503b63b8cbf8c744efc12942f3d679f686",
+        "miniaudio/miniaudio.h": "e9e742f8c4d7cdd0fc81ba7f1c47b719d98d45e0138849aa0ec1e574d554a1ee"
       }
     },
     {
@@ -89,6 +136,7 @@
       "purpose": "FFT for spectral onset, tempo and chroma (key) analysis",
       "version": "cpp@c90e55b",
       "license": "BSD-3-Clause",
+      "homepage": "https://github.com/mreineck/pocketfft",
       "kind": "git",
       "url": "https://github.com/mreineck/pocketfft",
       "ref": "cpp",
@@ -96,6 +144,11 @@
       "files": {
         "pocketfft_hdronly.h": "pocketfft/pocketfft_hdronly.h",
         "LICENSE.md": "pocketfft/LICENSE.md"
+      },
+      "license_file": "pocketfft/LICENSE.md",
+      "content_sha256": {
+        "pocketfft/LICENSE.md": "8db000e158c162e7249787852d8c69764706502ccee725c06641b31c1e95c8af",
+        "pocketfft/pocketfft_hdronly.h": "22c16c8ed7dc4fce3ee3732422a8b05bf12db0f944363aa0d07d02dd09d20975"
       }
     },
     {
@@ -103,9 +156,11 @@
       "purpose": "FFT/STFT support library required by signalsmith-stretch",
       "version": "0.6.5",
       "license": "MIT",
+      "homepage": "https://github.com/Signalsmith-Audio/linear",
       "kind": "git",
       "url": "https://github.com/Signalsmith-Audio/linear",
       "ref": "0.6.5",
+      "commit": "146b26f91b48835d665fa0498d64d9617818d27a",
       "files": {
         "approx.h": "signalsmith_linear/approx.h",
         "fft.h": "signalsmith_linear/fft.h",
@@ -125,9 +180,31 @@
         "platform/fft-pffft.h": "signalsmith_linear/platform/fft-pffft.h",
         "platform/linear-accelerate.h": "signalsmith_linear/platform/linear-accelerate.h",
         "platform/linear-cmsisdsp.h": "signalsmith_linear/platform/linear-cmsisdsp.h",
-        "platform/linear-xsimd-dispatch.cpp": "signalsmith_linear/platform/linear-xsimd-dispatch.cpp",
         "platform/linear-xsimd.h": "signalsmith_linear/platform/linear-xsimd.h",
         "stft.h": "signalsmith_linear/stft.h"
+      },
+      "license_file": "signalsmith_linear/LICENSE.txt",
+      "content_sha256": {
+        "signalsmith_linear/LICENSE.txt": "a91f5703b0f5fa22e8c14a8bd854559a7c512bbe58656ea8bdcd4964e923ab2f",
+        "signalsmith_linear/approx.h": "bc3e6dfb911ac50fb5841784b5633751fc14ae9b0f881a88b427c60c7a628cf1",
+        "signalsmith_linear/fft.h": "af0df3ff84c6f69ec00f09e0e53634b7ccacd3198a4acb2b482cb7d93854d207",
+        "signalsmith_linear/include/signalsmith-linear/approx.h": "eac208cc0e94556dde10e1d9bb0d53d8df9453aa8d2157421073f0497649ec3b",
+        "signalsmith_linear/include/signalsmith-linear/fft.h": "30e4054a9df4f1f31318ffefb43b52d69378788a344fb09c8995a36d5bc28148",
+        "signalsmith_linear/include/signalsmith-linear/linear.h": "38560f893be3ecbd18e6ce45b17dc7c3f3d3e4e6ed2890572b4aba385e36c03d",
+        "signalsmith_linear/include/signalsmith-linear/stft.h": "db40c535f6554daf2f0a12540730dc22bce71c5007210e515f463a0cbd1a16b7",
+        "signalsmith_linear/linear.h": "7e43d30cfd9c7d9989d58f875c9cb7e07c559aa93f86733c571c0bbc9ae0ea63",
+        "signalsmith_linear/platform/approx-cmsisdsp.h": "190d7487b4afc4353e8b5205bb78be0eab48fb180c11647d56beb57ddeab4994",
+        "signalsmith_linear/platform/basic-fill-warnings.h": "5f21ba12381d360dc166d034723dfbd43f5676dc4b2131f99a633fc9ab9935b2",
+        "signalsmith_linear/platform/fft-accelerate.h": "bbd6b46002acf8eedaf35aad07e2a15c18dd23cd8ff91d7afb0a72bb65c6dae6",
+        "signalsmith_linear/platform/fft-cmsisdsp.h": "3f5325069321b29529d6d5b52964f0d409acad2f46bd87b06897f4ba038430c7",
+        "signalsmith_linear/platform/fft-ipp.h": "94fc6431bde1965aad24c0848265ea3647a3b518d53f0869f869f1fb103381b6",
+        "signalsmith_linear/platform/fft-linear.h": "151fc3f0be8f698ed7d3c529f397c0a04ccf3d96e9abc12d12157873805ee183",
+        "signalsmith_linear/platform/fft-pffft-double.h": "d76907bfb3b9e316355cb32a9d64ac88e79bb22c8c80fbf3dad1eec1cfc87628",
+        "signalsmith_linear/platform/fft-pffft.h": "5d8672af99a0501d6cb5847f577011832ac37d76e3e79835961d9ce22bdb2e43",
+        "signalsmith_linear/platform/linear-accelerate.h": "c786eaf1f057598492e79bc5bba6e60b02d3a1dbc6af29e279ce4890147d5f39",
+        "signalsmith_linear/platform/linear-cmsisdsp.h": "2139c77e8c983c9338d653fd418fa6d34a15cd81b86c5714bed6949590691184",
+        "signalsmith_linear/platform/linear-xsimd.h": "c950c7abae024a6f2755f2cd050bce31fe9a5b098db9fa2c4828120b382d7db1",
+        "signalsmith_linear/stft.h": "0fc36186c3f892d068fff4108536b0f2132552f5a450b1e1ea5657e2899c6df3"
       }
     },
     {
@@ -135,13 +212,21 @@
       "purpose": "Time-stretch / pitch-shift for independent tempo and pitch preview (V2)",
       "version": "1.4.0",
       "license": "MIT",
+      "homepage": "https://github.com/Signalsmith-Audio/signalsmith-stretch",
       "kind": "git",
       "url": "https://github.com/Signalsmith-Audio/signalsmith-stretch",
       "ref": "1.4.0",
+      "commit": "a670068d9aeb64913331d5cc29337b19a457a7df",
       "files": {
         "include/signalsmith-stretch/signalsmith-stretch.h": "signalsmith_stretch/include/signalsmith-stretch/signalsmith-stretch.h",
         "LICENSE.txt": "signalsmith_stretch/LICENSE.txt",
         "signalsmith-stretch.h": "signalsmith_stretch/signalsmith-stretch.h"
+      },
+      "license_file": "signalsmith_stretch/LICENSE.txt",
+      "content_sha256": {
+        "signalsmith_stretch/LICENSE.txt": "16bf62d475af149d96a24853e77c9e0d939259a9d55b23b41da7f9939db85085",
+        "signalsmith_stretch/include/signalsmith-stretch/signalsmith-stretch.h": "869facc1853189bec91fb54960da2f59333284963d6b52a242d55a399d305e4d",
+        "signalsmith_stretch/signalsmith-stretch.h": "45a0b93b1e00257014d48e7ae494ec4e604f56b4ee15189a355cd9794653a37d"
       }
     },
     {
@@ -149,12 +234,19 @@
       "purpose": "Bounded worker pool for parallel import probes",
       "version": "5.1.0",
       "license": "MIT",
+      "homepage": "https://github.com/bshoshany/thread-pool",
       "kind": "git",
       "url": "https://github.com/bshoshany/thread-pool",
       "ref": "v5.1.0",
+      "commit": "bd4533f1f70c2b975cbd5769a60d8eaaea1d2233",
       "files": {
         "include/BS_thread_pool.hpp": "thread_pool/include/BS_thread_pool.hpp",
         "LICENSE.txt": "thread_pool/LICENSE.txt"
+      },
+      "license_file": "thread_pool/LICENSE.txt",
+      "content_sha256": {
+        "thread_pool/LICENSE.txt": "281b77201a734ba85fa039dc57876a997b5367cc9b1ea67d97d92800c5d4557a",
+        "thread_pool/include/BS_thread_pool.hpp": "63c9674aefbb7dc346b246752ac4453b244fa6e0e93cd67177c2d2d8c26bf3fe"
       }
     },
     {
@@ -162,14 +254,23 @@
       "purpose": "Bounded blocking SPSC queue between import enumeration and commit",
       "version": "1.0.7",
       "license": "BSD-2-Clause",
+      "homepage": "https://github.com/cameron314/readerwriterqueue",
       "kind": "git",
       "url": "https://github.com/cameron314/readerwriterqueue",
       "ref": "v1.0.7",
+      "commit": "8b2176698e9bdaba653cdc20c32b54737a934b47",
       "files": {
         "readerwritercircularbuffer.h": "readerwriterqueue/include/readerwriterqueue/readerwritercircularbuffer.h",
         "atomicops.h": "readerwriterqueue/include/readerwriterqueue/atomicops.h",
         "readerwriterqueue.h": "readerwriterqueue/include/readerwriterqueue/readerwriterqueue.h",
         "LICENSE.md": "readerwriterqueue/LICENSE.md"
+      },
+      "license_file": "readerwriterqueue/LICENSE.md",
+      "content_sha256": {
+        "readerwriterqueue/LICENSE.md": "80cab6dacb9e281ee39d83e6ac9aea7e3d2575e466064de5afe36f5109f17a7b",
+        "readerwriterqueue/include/readerwriterqueue/atomicops.h": "4c8f136c47109f330fe1e7425e51f490eb9fd43dbed340da101af17311ba6c8f",
+        "readerwriterqueue/include/readerwriterqueue/readerwritercircularbuffer.h": "e31e824e582fd16fe10015acaa909102697d4f92380375022bcbb848b814cebe",
+        "readerwriterqueue/include/readerwriterqueue/readerwriterqueue.h": "55fae3489100f9bc593b6616379a33f70033eacd7c14c3d12c7808c1d28cf566"
       }
     },
     {
@@ -177,6 +278,7 @@
       "purpose": "RFC 4180 CSV writing for metadata export",
       "version": "5.5.0",
       "license": "MIT",
+      "homepage": "https://github.com/vincentlaucsb/csv-parser",
       "kind": "download",
       "downloads": [
         {
@@ -191,15 +293,22 @@
         }
       ],
       "files": {},
+      "normalize_newlines": true,
+      "license_file": "csv_parser/LICENSE",
       "patches": [
         "patches/csv_parser/0001-crlf-record-terminator.patch"
-      ]
+      ],
+      "content_sha256": {
+        "csv_parser/LICENSE": "59029b5fe7d35208519a89e48e2ba47291b9ad5e9be58f6c3fb549a2f6d41c74",
+        "csv_parser/include/csv.hpp": "35be4f75026d37167cdf67af4459a857384421ae6968a912f4afc166aa886034"
+      }
     },
     {
       "name": "cli11",
       "purpose": "Command-line parsing for the mso tool",
       "version": "2.7.2",
       "license": "BSD-3-Clause",
+      "homepage": "https://github.com/CLIUtils/CLI11",
       "kind": "download",
       "downloads": [
         {
@@ -209,23 +318,50 @@
         },
         {
           "url": "https://raw.githubusercontent.com/CLIUtils/CLI11/v2.7.2/LICENSE",
+          "sha256": "cfc76368aef8f51868fa1cda6bcfa26e583406a4cf8e48e725e7624df24d8855",
           "destination": "cli11/LICENSE"
         }
       ],
-      "files": {}
+      "files": {},
+      "license_file": "cli11/LICENSE",
+      "content_sha256": {
+        "cli11/LICENSE": "cfc76368aef8f51868fa1cda6bcfa26e583406a4cf8e48e725e7624df24d8855",
+        "cli11/include/CLI/CLI11.hpp": "ffa9a30da295c5858fb5f91f9f45771bab09471d7010a34c7c68c857a330dd76"
+      }
     },
     {
       "name": "doctest",
       "purpose": "Test framework for tests/",
       "version": "2.5.3",
       "license": "MIT",
+      "homepage": "https://github.com/doctest/doctest",
       "kind": "git",
       "url": "https://github.com/doctest/doctest",
       "ref": "v2.5.3",
+      "commit": "2d0a9359a60c51affe2a9bebb1be1dca47868151",
       "files": {
         "doctest/doctest.h": "doctest/doctest.h",
         "LICENSE.txt": "doctest/LICENSE.txt"
+      },
+      "license_file": "doctest/LICENSE.txt",
+      "content_sha256": {
+        "doctest/LICENSE.txt": "0fe0b331fa1513dcce8604ff1fa925f32d1cea17d8aeb1c2471fad40d291adc5",
+        "doctest/doctest.h": "cfd518a3ef90f67e1f3ba514df23fb3627437de1a2feeba78cf5062a40021421"
       }
+    }
+  ],
+  "system_dependencies": [
+    {
+      "name": "Qt",
+      "purpose": "Desktop user interface (Qt Widgets, Qt Concurrent)",
+      "license": "LGPL-3.0-only",
+      "homepage": "https://www.qt.io"
+    },
+    {
+      "name": "FFmpeg",
+      "purpose": "AAC, Opus, ALAC, WMA and other decoders (libavformat, libavcodec, libswresample)",
+      "license": "LGPL-2.1-or-later; GPL-3.0-or-later as packaged by MSYS2 and most distributions (--enable-gpl)",
+      "homepage": "https://ffmpeg.org"
     }
   ]
 }

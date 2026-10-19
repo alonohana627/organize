@@ -16,23 +16,59 @@
     },
     {
       "name": "debug",
-      "displayName": "Debug (clang + libc++)",
+      "displayName": "Debug (clang + libc++, libc++ debug hardening)",
       "inherits": "clang-libcxx-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
       "name": "release",
-      "displayName": "Release (clang + libc++)",
+      "displayName": "Release with debug info (clang + libc++, -Werror)",
+      "description": "Optimized build that keeps symbols (RelWithDebInfo) so crashes and profiles stay readable.",
       "inherits": "clang-libcxx-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "MSO_WARNINGS_AS_ERRORS": "ON" }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "Debug + AddressSanitizer + UndefinedBehaviorSanitizer (-Werror)",
+      "inherits": "clang-libcxx-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MSO_SANITIZERS": "address;undefined",
+        "MSO_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI: release; Qt GUI and FFmpeg required",
+      "inherits": "release",
+      "cacheVariables": { "MSO_REQUIRE_GUI": "ON", "MSO_REQUIRE_FFMPEG": "ON" }
+    },
+    {
+      "name": "ci-sanitize",
+      "displayName": "CI: sanitize; Qt GUI and FFmpeg required",
+      "inherits": "sanitize",
+      "cacheVariables": { "MSO_REQUIRE_GUI": "ON", "MSO_REQUIRE_FFMPEG": "ON" }
     }
   ],
   "buildPresets": [
     { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "sanitize", "configurePreset": "sanitize" },
+    { "name": "ci", "configurePreset": "ci" },
+    { "name": "ci-sanitize", "configurePreset": "ci-sanitize" }
   ],
   "testPresets": [
-    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+    {
+      "name": "test-base",
+      "hidden": true,
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    { "name": "debug", "inherits": "test-base", "configurePreset": "debug" },
+    { "name": "release", "inherits": "test-base", "configurePreset": "release" },
+    { "name": "sanitize", "inherits": "test-base", "configurePreset": "sanitize" },
+    { "name": "ci", "inherits": "test-base", "configurePreset": "ci" },
+    { "name": "ci-sanitize", "inherits": "test-base", "configurePreset": "ci-sanitize" }
   ]
 }

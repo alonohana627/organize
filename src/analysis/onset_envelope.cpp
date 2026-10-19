@@ -12,6 +12,7 @@ constexpr double kWindowSeconds = 1024.0 / 22050.0;  ///< about 46 ms, the docum
 constexpr std::size_t kHopDivisor = 4;               ///< hop = window / 4 (256 @ 22.05 kHz)
 constexpr float kLogCompressionGain = 100.0F;        ///< g in log(1 + g*|X|)
 
+/// Onset window length at `sample_rate`: the power of two closest to kWindowSeconds.
 std::size_t onset_window_size(int sample_rate) {
     return nearest_power_of_two(kWindowSeconds * static_cast<double>(sample_rate), 64, 16384);
 }

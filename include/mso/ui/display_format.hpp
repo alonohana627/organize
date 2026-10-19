@@ -3,6 +3,7 @@
 /// Conversions between core value types (UTF-8 strings, paths, musical facts) and display text.
 #include <QCoreApplication>
 #include <QString>
+#include <QUrl>
 
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +32,8 @@ public:
     static QString from_path(const std::filesystem::path& path);
     /// Filesystem path from user-chosen text, without lossy code-page conversion.
     static std::filesystem::path to_path(const QString& text);
+    /// file:// URL of a local path (drag and drop, clipboard, desktop services).
+    static QUrl to_file_url(const std::filesystem::path& path);
 
     /// Canonical text of a UUID (for item data and persisted UI state).
     static QString from_uuid(const uuids::uuid& id);
@@ -43,12 +46,17 @@ public:
     static QString unknown_marker();
     /// "1.25 s" / "1:02"; estimated durations are prefixed with "≈".
     static QString duration(std::optional<std::int64_t> microseconds, bool exact);
+    /// "44.1 kHz"; empty when unknown.
     static QString sample_rate(std::optional<std::int64_t> hertz);
+    /// "Mono", "Stereo" or "6 ch"; empty when unknown.
     static QString channels(std::optional<std::int64_t> count);
     /// Bit depth, or empty for compressed formats where it is not meaningful.
     static QString bit_depth(std::optional<std::int64_t> bits);
+    /// "1.5 KiB" (IEC units, user locale); empty when unknown.
     static QString byte_size(std::optional<std::int64_t> bytes);
+    /// "128.00" from milli-BPM; empty when unknown.
     static QString bpm(std::optional<std::int64_t> milli_bpm);
+    /// "F#m"; empty when unknown.
     static QString key(const std::optional<MusicalKey>& key);
     /// Short label of a metadata source: "tag", "filename", "analysis", "user"...
     static QString source_label(std::string_view source);
@@ -58,8 +66,11 @@ public:
     static QString rating_stars(int rating);
     /// Spoken form for screen readers: "Rated 3 of 5" / "Unrated".
     static QString rating_accessible(int rating);
+    /// Translated availability of a table row.
     static QString availability(search::RowAvailability availability);
+    /// Translated availability of a root.
     static QString root_availability(catalog::Availability availability);
+    /// Translated state of one file location.
     static QString location_state(catalog::LocationState state);
     /// Names of the analysis stages recorded in SampleRow::analysis_flags, or "None".
     static QString analysis_flags(std::int64_t flags);

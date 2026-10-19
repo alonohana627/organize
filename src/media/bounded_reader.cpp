@@ -1,4 +1,4 @@
-#include "mso/media/bounded_reader.hpp"
+#include "mso/media/detail/bounded_reader.hpp"
 
 #include <algorithm>
 #include <utility>

@@ -1,4 +1,7 @@
-// Worker IPC: framing, message schema, and the supervised mso-worker child process.
+// Worker IPC: framing, message schema and range checks, atomic segment writes, and the supervised
+// mso-worker child process, including every misbehaviour the supervisor must detect (driven by the
+// worker's --self-test-fault modes). Timing is never asserted by sleeping: tests wait for events or
+// poll with deadlines derived from the configured intervals.
 #include <doctest.h>
 #include <picosha2.h>
 
@@ -14,17 +17,15 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
-#include <numbers>
+#include <limits>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "mso/analysis/analysis.hpp"
-#include "mso/analysis/worker_process.hpp"
-#include "mso/analysis/worker_protocol.hpp"
 #include "mso/domain/core.hpp"
+#include "mso/worker/worker_process.hpp"
+#include "mso/worker/worker_protocol.hpp"
+#include "test_support.hpp"
 
 namespace {
 
@@ -32,6 +33,7 @@ using namespace std::chrono_literals;
 namespace worker = mso::worker;
 namespace analysis = mso::analysis;
 using mso::ErrorCode;
+using mso::test::ScratchDirectory;
 
 // ---------------------------------------------------------------- in-memory streams
 
@@ -57,6 +59,7 @@ private:
     std::size_t consumed_ = 0;
 };
 
+/// Collects everything written to it.
 class MemorySink final : public worker::ByteSink {
 public:
     mso::Result<void> write_all(std::span<const std::uint8_t> bytes) override {
@@ -94,6 +97,21 @@ worker::AnalyzeTask make_task(double seconds, std::vector<analysis::Stage> stage
     return task;
 }
 
+/// A consistent waveform segment description of `bins` bins of 172 frames each.
+worker::WaveformSegment make_segment(int bins) {
+    worker::WaveformSegment segment;
+    segment.path = "C:/derived/w.seg";
+    segment.byte_length = analysis::encoded_waveform_size(static_cast<std::size_t>(bins));
+    segment.sha256 = std::string(64, 'b');
+    segment.bins = bins;
+    segment.frames_per_bin = 172;
+    segment.frames_covered = 172LL * bins;
+    segment.total_frames = segment.frames_covered;
+    segment.sample_rate = 44100;
+    segment.complete = true;
+    return segment;
+}
+
 worker::TaskResult make_result() {
     worker::TaskResult result;
     result.fence = worker::TaskFence::of(make_task(1.0));
@@ -104,24 +122,18 @@ worker::TaskResult make_result() {
     result.report.evidence = analysis::InputEvidence{1000, 1000, 1234567890123, 1234567890123};
     result.report.frames_decoded = 44100;
     result.report.warnings = {"clipped", "short"};
-    result.waveform_segment =
-        worker::WaveformSegment{"C:/derived/w.seg", 4096, std::string(64, 'b'), 256, 172, 44100, 44100, 44100, true};
+    result.waveform_segment = make_segment(256);
     return result;
 }
 
 // ---------------------------------------------------------------- process fixtures
 
-/// The worker binary next to this test executable (or one directory up for a tests/ subfolder).
-std::filesystem::path worker_executable() {
-    const auto beside = worker::default_worker_executable();
-    if (std::filesystem::exists(beside)) return beside;
-    return beside.parent_path().parent_path() / worker::kWorkerExecutableName;
-}
-
-worker::WorkerOptions self_test_options() {
+/// Options for a self-test worker, optionally misbehaving in the named way.
+worker::WorkerOptions self_test_options(std::string_view fault = {}) {
     worker::WorkerOptions options;
-    options.executable = worker_executable();
-    options.arguments = {"--self-test"};
+    options.executable = mso::test::worker_executable();
+    options.self_test = true;
+    if (!fault.empty()) options.arguments = {"--self-test-fault", std::string(fault)};
     return options;
 }
 
@@ -149,6 +161,13 @@ Event expect_event(worker::WorkerProcess& process, std::chrono::milliseconds tim
     REQUIRE_MESSAGE(event.has_value(), "no event arrived in time");
     REQUIRE_MESSAGE(std::holds_alternative<Event>(*event), "unexpected event type, index ", event->index());
     return std::get<Event>(std::move(*event));
+}
+
+/// The start error of a worker that must fail to start.
+mso::Error expect_start_failure(const worker::WorkerOptions& options) {
+    auto process = worker::WorkerProcess::start(options);
+    REQUIRE_FALSE(process.has_value());
+    return process.error();
 }
 
 #ifdef _WIN32
@@ -187,62 +206,9 @@ void kill_process(std::uint32_t process_id) {
 }
 #endif
 
-/// A fresh directory under %TEMP%, removed with its contents on destruction.
-class ScratchDirectory {
-public:
-    ScratchDirectory()
-        : path_(std::filesystem::temp_directory_path() / ("mso-worker-tests-" + uuids::to_string(mso::new_uuid()))) {
-        std::filesystem::create_directories(path_);
-    }
-    ScratchDirectory(const ScratchDirectory&) = delete;
-    ScratchDirectory& operator=(const ScratchDirectory&) = delete;
-    ~ScratchDirectory() {
-        std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
-    }
-
-    const std::filesystem::path& path() const { return path_; }
-
-private:
-    std::filesystem::path path_;
-};
-
-std::string read_file(const std::filesystem::path& file) {
-    std::ifstream stream(file, std::ios::binary);
-    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
-}
-
-/// One second of a 440 Hz sine at half scale: 16-bit PCM, mono, 44.1 kHz.
-void write_sine_wav(const std::filesystem::path& file) {
-    constexpr std::uint32_t kSampleRate = 44100;
-    constexpr std::uint32_t kFrames = kSampleRate;
-    std::string bytes;
-    const auto put = [&](std::uint32_t value, int byte_count) {
-        for (int index = 0; index < byte_count; ++index)
-            bytes.push_back(static_cast<char>((value >> (8 * index)) & 0xFF));
-    };
-    bytes += "RIFF";
-    put(36 + kFrames * 2, 4);
-    bytes += "WAVEfmt ";
-    put(16, 4);
-    put(1, 2);  // PCM
-    put(1, 2);  // mono
-    put(kSampleRate, 4);
-    put(kSampleRate * 2, 4);
-    put(2, 2);
-    put(16, 2);
-    bytes += "data";
-    put(kFrames * 2, 4);
-    for (std::uint32_t frame = 0; frame < kFrames; ++frame) {
-        const double sample = 0.5 * std::sin(2.0 * std::numbers::pi * 440.0 * frame / kSampleRate);
-        put(static_cast<std::uint16_t>(static_cast<std::int16_t>(std::lround(sample * 32767.0))), 2);
-    }
-    std::ofstream(file, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-}
-
 }  // namespace
 
-TEST_SUITE("analysis") {
+TEST_SUITE("worker") {
     // ------------------------------------------------------------ framing
 
     TEST_CASE("worker frames round-trip through a chunked stream") {
@@ -279,9 +245,9 @@ TEST_SUITE("analysis") {
 
     TEST_CASE("worker frame reader rejects an oversized length before reading the payload") {
         auto bytes = frame_bytes(5, "{}");
-        const std::uint32_t oversized = worker::kMaxPayloadBytes + 1;
+        const std::uint32_t oversized = worker::kMaximumPayloadBytes + 1;
         for (int index = 0; index < 4; ++index)
-            bytes[8 + index] = static_cast<std::uint8_t>(oversized >> (8 * index));
+            bytes[8 + static_cast<std::size_t>(index)] = static_cast<std::uint8_t>(oversized >> (8 * index));
         MemorySource source(bytes);
         const auto frame = worker::read_frame(source);
         REQUIRE_FALSE(frame.has_value());
@@ -320,8 +286,8 @@ TEST_SUITE("analysis") {
     }
 
     TEST_CASE("encode_frame refuses payloads above 1 MiB") {
-        CHECK(worker::encode_frame(1, std::string(worker::kMaxPayloadBytes, ' ')).has_value());
-        const auto oversized = worker::encode_frame(1, std::string(worker::kMaxPayloadBytes + 1, ' '));
+        CHECK(worker::encode_frame(1, std::string(worker::kMaximumPayloadBytes, ' ')).has_value());
+        const auto oversized = worker::encode_frame(1, std::string(worker::kMaximumPayloadBytes + 1, ' '));
         REQUIRE_FALSE(oversized.has_value());
         CHECK(oversized.error().code == ErrorCode::InvalidArgument);
     }
@@ -369,6 +335,22 @@ TEST_SUITE("analysis") {
         CHECK(round_tripped->waveform_segment->complete);
     }
 
+    TEST_CASE("heartbeats carry the active task and its work counter") {
+        const worker::Heartbeat busy{mso::new_uuid(), 4711};
+        const auto payload = worker::encode_message(worker::WorkerMessage{busy});
+        REQUIRE(payload.has_value());
+        const auto decoded = worker::decode_worker_message(*payload);
+        REQUIRE(decoded.has_value());
+        const auto& heartbeat = std::get<worker::Heartbeat>(*decoded);
+        CHECK(heartbeat.active_job_id == busy.active_job_id);
+        CHECK(heartbeat.task_progress == 4711u);
+
+        // A protocol-minor-0 heartbeat without the member is still valid.
+        const auto old_style = worker::decode_worker_message(R"({"type":"heartbeat","active_job_id":null})");
+        REQUIRE(old_style.has_value());
+        CHECK_FALSE(std::get<worker::Heartbeat>(*old_style).task_progress.has_value());
+    }
+
     TEST_CASE("task failure carries its stable error code") {
         const worker::TaskFailed failure{worker::TaskFence::of(make_task(1.0)), ErrorCode::UnsupportedCodec, false,
                                          "no decoder for alac"};
@@ -380,6 +362,16 @@ TEST_SUITE("analysis") {
         const auto error = std::get<worker::TaskFailed>(*decoded).to_error();
         CHECK(error.code == ErrorCode::UnsupportedCodec);
         CHECK(error.safe_detail == "no decoder for alac");
+    }
+
+    TEST_CASE("every error code round-trips through its stable name") {
+        for (const ErrorCode code : {ErrorCode::SourceOffline, ErrorCode::FileMissing, ErrorCode::ResourceLimit,
+                                     ErrorCode::WorkerCrash, ErrorCode::Cancelled, ErrorCode::Internal}) {
+            CAPTURE(mso::to_string(code));
+            CHECK(worker::parse_error_code(mso::to_string(code)) == code);
+        }
+        CHECK_FALSE(worker::parse_error_code("TELEPATHY_FAILED").has_value());
+        CHECK_FALSE(worker::parse_error_code("").has_value());
     }
 
     TEST_CASE("malformed messages are parse errors, never exceptions") {
@@ -424,18 +416,109 @@ TEST_SUITE("analysis") {
         CHECK(worker::validate_task(task).has_value());
         task.stages = {analysis::Stage::Key, analysis::Stage::Key};
         CHECK_FALSE(worker::validate_task(task).has_value());
+        task.stages.clear();
+        task.waveform_bins = analysis::kMaximumWaveformBins + 1;
+        CHECK_FALSE(worker::validate_task(task).has_value());
+    }
+
+    TEST_CASE("result validation rejects out-of-range values, and decoding applies it") {
+        CHECK(worker::validate_result(make_result()).has_value());
+
+        const auto rejected = [](const std::function<void(worker::TaskResult&)>& corrupt) {
+            auto result = make_result();
+            corrupt(result);
+            const auto valid = worker::validate_result(result);
+            if (valid) return false;
+            CHECK(valid.error().code == ErrorCode::InvalidArgument);
+            // The same result from a worker is a protocol violation, not a value to publish.
+            const auto payload = worker::encode_message(worker::WorkerMessage{result});
+            if (payload) {
+                const auto decoded = worker::decode_worker_message(*payload);
+                REQUIRE_FALSE(decoded.has_value());
+                CHECK(decoded.error().code == ErrorCode::ParseError);
+            }
+            return true;
+        };
+        CHECK(rejected([](auto& result) { result.report.tempo->confidence = 1.5; }));
+        CHECK(rejected([](auto& result) { result.report.tempo->milli_bpm = 20'000; }));
+        CHECK(rejected([](auto& result) { result.report.tempo->milli_bpm = 999'000; }));
+        CHECK(rejected([](auto& result) { result.report.key->confidence = -0.1; }));
+        CHECK(rejected([](auto& result) { result.report.key->key = mso::MusicalKey{12, mso::KeyMode::Major}; }));
+        CHECK(rejected([](auto& result) { result.report.key->key = mso::MusicalKey{3, mso::KeyMode::Unknown}; }));
+        CHECK(rejected([](auto& result) { result.report.loudness->rms_dbfs = 3.0; }));  // above the peak
+        CHECK(rejected([](auto& result) { result.report.loudness->peak_dbfs = -1000.0; }));
+        CHECK(rejected([](auto& result) { result.report.hashes.byte_sha256 = std::string(64, 'G'); }));
+        CHECK(rejected([](auto& result) { result.report.hashes.pcm_sha256 = std::string(63, 'a'); }));
+        CHECK(rejected([](auto& result) { result.report.evidence.size_after = -1; }));
+        CHECK(rejected([](auto& result) { result.report.frames_decoded = -5; }));
+        CHECK(rejected(
+            [](auto& result) { result.report.warnings.assign(worker::kMaximumWarnings + 1, std::string("w")); }));
+        CHECK(rejected([](auto& result) { result.waveform_segment->byte_length += 1; }));
+        CHECK(rejected([](auto& result) { result.waveform_segment->bins = analysis::kMaximumWaveformBins + 1; }));
+        CHECK(rejected([](auto& result) { result.waveform_segment->frames_covered += 172; }));
+        CHECK(rejected([](auto& result) { result.waveform_segment->sample_rate = 0; }));
+        CHECK(rejected([](auto& result) { result.waveform_segment->total_frames += 1; }));
+        CHECK(rejected([](auto& result) { result.waveform_segment->path.clear(); }));
+    }
+
+    // ------------------------------------------------------------ atomic segment files
+
+    TEST_CASE("write_file_atomically publishes complete files only") {
+        ScratchDirectory scratch("worker-atomic");
+        const auto destination = scratch.file("segment \u00e9.seg");
+        auto partial = destination;
+        partial += ".partial";
+
+        const std::vector<std::uint8_t> first(100'000, 0x5A);
+        REQUIRE(worker::write_file_atomically(destination, first).has_value());
+        CHECK(mso::test::read_file(destination) == std::string(first.begin(), first.end()));
+        CHECK_FALSE(std::filesystem::exists(partial));
+
+        // Replacing an existing file swaps the whole content.
+        const std::vector<std::uint8_t> second{1, 2, 3};
+        REQUIRE(worker::write_file_atomically(destination, second).has_value());
+        CHECK(mso::test::read_file(destination) == std::string(second.begin(), second.end()));
+
+        // A missing directory fails cleanly and leaves nothing behind.
+        const auto unreachable = scratch.file("missing-directory/segment.seg");
+        const auto failed = worker::write_file_atomically(unreachable, second);
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error().code == ErrorCode::FileMissing);
+        CHECK_FALSE(std::filesystem::exists(scratch.file("missing-directory")));
+    }
+
+    // ------------------------------------------------------------ options
+
+    TEST_CASE("worker options that would make supervision unsafe are refused") {
+        const auto refused = [](const std::function<void(worker::WorkerOptions&)>& change) {
+            auto options = self_test_options();
+            change(options);
+            const auto error = expect_start_failure(options);
+            return error.code == ErrorCode::InvalidArgument;
+        };
+        CHECK(refused([](auto& options) { options.lease_deadline = worker::kHeartbeatInterval; }));
+        CHECK(refused([](auto& options) { options.task_stall_deadline = worker::kHeartbeatInterval; }));
+        CHECK(refused([](auto& options) { options.cancel_grace = 0ms; }));
+        CHECK(refused([](auto& options) { options.shutdown_grace = -1ms; }));
+        CHECK(refused([](auto& options) { options.handshake_timeout = 0ms; }));
+        CHECK(refused([](auto& options) { options.memory_limit_bytes = 1024; }));
+        CHECK(refused([](auto& options) { options.cpu_rate_percent = 101; }));
+        CHECK(refused([](auto& options) { options.arguments = {"two words"}; }));
     }
 
     // ------------------------------------------------------------ supervised process
 
-    TEST_CASE("worker handshake reports protocol, process identity and job limits") {
+    TEST_CASE("worker handshake reports protocol, process identity, algorithms and job limits") {
         auto process = start_worker(self_test_options());
         const auto handshake = process->handshake();
         CHECK(handshake.protocol_major == worker::kProtocolMajor);
+        CHECK(handshake.protocol_minor == worker::kProtocolMinor);
         CHECK(handshake.process_id == process->process_id());
         CHECK(handshake.self_test);
+        CHECK(handshake.algorithm_versions == worker::current_algorithm_versions());
         CHECK(handshake.algorithm_versions.at("waveform") == analysis::AlgorithmVersions::kWaveform);
         CHECK(handshake.limits.concurrent_tasks == 1);
+        CHECK(handshake.limits.maximum_waveform_bins == analysis::kMaximumWaveformBins);
 
         const auto limits = process->limits_status();
         CHECK(limits.memory_limit_applied);
@@ -449,13 +532,76 @@ TEST_SUITE("analysis") {
         CHECK_FALSE(limits.detail.empty());
 #endif
         CHECK(process->is_running());
+        CHECK_FALSE(process->task_activity().has_value());
+    }
+
+    TEST_CASE("a relative worker path is resolved before the worker starts") {
+        std::error_code error;
+        const auto relative = std::filesystem::relative(mso::test::worker_executable(), error);
+        REQUIRE_FALSE(error);
+        REQUIRE(relative.is_relative());
+        auto options = self_test_options();
+        options.executable = relative;
+        auto process = start_worker(options);
+        CHECK(process->is_running());
+    }
+
+    TEST_CASE("self-test mode is refused unless it was requested") {
+        auto options = self_test_options();
+        options.self_test = false;
+        options.arguments = {"--self-test"};
+        const auto error = expect_start_failure(options);
+        CHECK(error.code == ErrorCode::WorkerCrash);
+        CHECK(error.safe_detail.find("self-test") != std::string::npos);
+    }
+
+    TEST_CASE("an invalid handshake keeps the worker from starting") {
+        for (const std::string_view fault : {"wrong-process-id", "message-before-handshake", "stale-algorithm"}) {
+            CAPTURE(fault);
+            const auto error = expect_start_failure(self_test_options(fault));
+            CHECK(error.code == ErrorCode::WorkerCrash);
+        }
+    }
+
+    TEST_CASE("a worker that never handshakes is terminated at the handshake timeout") {
+        auto options = self_test_options("no-handshake");
+        options.handshake_timeout = 1000ms;
+        const auto started = std::chrono::steady_clock::now();
+        const auto error = expect_start_failure(options);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        CHECK(error.code == ErrorCode::WorkerCrash);
+        CHECK(error.safe_detail.find("handshake") != std::string::npos);
+        CHECK(elapsed >= options.handshake_timeout);
+        CHECK(elapsed < options.handshake_timeout + 10s);  // the watchdog, not a lease, ended it
+    }
+
+    TEST_CASE("garbage, a second handshake or an unsequenced outcome from a live worker is a protocol violation") {
+        for (const std::string_view fault : {"garbage-after-handshake", "second-handshake"}) {
+            CAPTURE(fault);
+            auto process = start_worker(self_test_options(fault));
+            const auto exited = expect_event<worker::WorkerExited>(*process, 10s);
+            REQUIRE(exited.failure.has_value());
+            CHECK(exited.failure->code == ErrorCode::WorkerCrash);
+            CHECK(exited.failure->safe_detail.find("protocol violation") != std::string::npos);
+            CHECK_FALSE(process->is_running());
+        }
+
+        auto process = start_worker(self_test_options("unsequenced-outcome"));
+        const auto task = make_task(0.1);
+        REQUIRE(process->submit(task).has_value());
+        const auto failure = expect_event<worker::TaskFailed>(*process, 10s);
+        CHECK(failure.code == ErrorCode::WorkerCrash);
+        CHECK(failure.fence == worker::TaskFence::of(task));
+        const auto exited = expect_event<worker::WorkerExited>(*process, 10s);
+        REQUIRE(exited.failure.has_value());
+        CHECK(exited.failure->safe_detail.find("protocol violation") != std::string::npos);
     }
 
     TEST_CASE("self-test task reports progress and publishes a complete waveform segment") {
-        ScratchDirectory scratch;
-        const auto segment_path = scratch.path() / mso::path_from_utf8("waveform \u00e9\u00e8.seg");
+        ScratchDirectory scratch("worker-segment");
+        const auto segment_path = scratch.file("waveform \u00e9\u00e8.seg");
         auto process = start_worker(self_test_options());
-        const auto task = make_task(0.5, {analysis::Stage::Waveform}, segment_path);
+        const auto task = make_task(0.5, {analysis::Stage::Waveform, analysis::Stage::Loudness}, segment_path);
         REQUIRE(process->submit(task).has_value());
 
         bool saw_progress = false;
@@ -472,13 +618,16 @@ TEST_SUITE("analysis") {
         CHECK(saw_progress);
         CHECK(result->fence == worker::TaskFence::of(task));
         CHECK_FALSE(result->report.waveform.has_value());
+        CHECK(result->report.loudness.has_value());
         REQUIRE(result->waveform_segment.has_value());
 
         const auto& segment = *result->waveform_segment;
         CHECK(segment.bins == 256);
         CHECK(segment.complete);
-        CHECK_FALSE(std::filesystem::exists(std::filesystem::path(segment_path) += ".partial"));
-        const auto bytes = read_file(segment_path);
+        auto partial = segment_path;
+        partial += ".partial";
+        CHECK_FALSE(std::filesystem::exists(partial));
+        const auto bytes = mso::test::read_file(segment_path);
         CHECK(bytes.size() == segment.byte_length);
         CHECK(picosha2::hash256_hex_string(bytes) == segment.sha256);
         const auto overview = analysis::decode_waveform(std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
@@ -487,7 +636,7 @@ TEST_SUITE("analysis") {
         CHECK_FALSE(process->is_busy());
     }
 
-    TEST_CASE("worker heartbeats during a long task, refuses a second task and honors cancel") {
+    TEST_CASE("worker heartbeats with task progress during a long task, refuses a second task and honors cancel") {
         auto process = start_worker(self_test_options());
         const auto long_task = make_task(60.0);
         REQUIRE(process->submit(long_task).has_value());
@@ -495,15 +644,27 @@ TEST_SUITE("analysis") {
         REQUIRE_FALSE(second.has_value());
         CHECK(second.error().code == ErrorCode::InvalidArgument);
 
-        std::this_thread::sleep_for(4500ms);
-        CHECK(process->heartbeats_received() >= 2);
+        // Two heartbeats, the later one carrying a moving work counter.
+        const auto heartbeat_wait = 3 * worker::kHeartbeatInterval;
+        CHECK(mso::test::wait_until([&] { return process->heartbeats_received() >= 2; }, 2 * heartbeat_wait));
+        CHECK(mso::test::wait_until(
+            [&] {
+                const auto activity = process->task_activity();
+                return activity && activity->work_units > 0;
+            },
+            heartbeat_wait));
+        const auto activity = process->task_activity();
+        REQUIRE(activity.has_value());
+        CHECK(activity->job_id == long_task.job_id);
+        CHECK_FALSE(activity->cancelling);
 
         const auto cancel_started = std::chrono::steady_clock::now();
         REQUIRE(process->cancel(long_task.job_id, long_task.cancel_epoch + 1).has_value());
         const auto failure = expect_event<worker::TaskFailed>(*process, 3s);
         CHECK(failure.code == ErrorCode::Cancelled);
         CHECK(failure.fence == worker::TaskFence::of(long_task));
-        CHECK(std::chrono::steady_clock::now() - cancel_started < 2s);
+        // Cooperative: the task ended well before the grace period would have forced it.
+        CHECK(std::chrono::steady_clock::now() - cancel_started < worker::WorkerOptions{}.cancel_grace);
 
         // The worker survives a cooperative cancel and takes the next task.
         CHECK(process->is_running());
@@ -511,6 +672,57 @@ TEST_SUITE("analysis") {
         REQUIRE(process->submit(next_task).has_value());
         const auto result = expect_event<worker::TaskResult>(*process, 5s);
         CHECK(result.fence == worker::TaskFence::of(next_task));
+    }
+
+    TEST_CASE("a task thread stuck in a call is cancelled, then its worker terminated, while heartbeats run") {
+        auto options = self_test_options("stall-task");
+        options.task_stall_deadline = 2 * worker::kHeartbeatInterval;
+        options.cancel_grace = 500ms;
+        auto process = start_worker(options);
+        const auto task = make_task(60.0);
+        REQUIRE(process->submit(task).has_value());
+
+        const auto failure = expect_event<worker::TaskFailed>(*process, options.task_stall_deadline + 15s);
+        CHECK(failure.code == ErrorCode::WorkerCrash);
+        CHECK(failure.retryable);
+        CHECK(failure.fence == worker::TaskFence::of(task));
+        CHECK(failure.safe_detail.find("no progress") != std::string::npos);
+        // The process was alive all along: its heartbeats kept the lease, only the task was stuck.
+        CHECK(process->heartbeats_received() >= 1);
+        const auto exited = expect_event<worker::WorkerExited>(*process, 10s);
+        REQUIRE(exited.failure.has_value());
+        CHECK(exited.failure->code == ErrorCode::WorkerCrash);
+        CHECK_FALSE(process->is_running());
+    }
+
+    TEST_CASE("a stalled task that honors cancellation fails retryably and the worker keeps running") {
+        auto options = self_test_options("silent-task");
+        options.task_stall_deadline = 2 * worker::kHeartbeatInterval;
+        auto process = start_worker(options);
+        const auto task = make_task(60.0);
+        REQUIRE(process->submit(task).has_value());
+
+        const auto failure = expect_event<worker::TaskFailed>(*process, options.task_stall_deadline + 15s);
+        CHECK(failure.code == ErrorCode::WorkerCrash);
+        CHECK(failure.retryable);
+        CHECK(failure.safe_detail.find("no progress") != std::string::npos);
+        CHECK(process->is_running());
+        CHECK_FALSE(process->is_busy());
+    }
+
+    TEST_CASE("a worker that exceeds its memory cap fails the task with RESOURCE_LIMIT") {
+        auto options = self_test_options("exhaust-memory");
+#ifdef _WIN32
+        options.memory_limit_bytes = 256ull * 1024 * 1024;
+#else
+        // RLIMIT_AS counts every mapping (shared libraries, thread stacks), so it needs headroom.
+        options.memory_limit_bytes = 1024ull * 1024 * 1024;
+#endif
+        auto process = start_worker(options);
+        REQUIRE(process->limits_status().memory_limit_applied);
+        REQUIRE(process->submit(make_task(1.0)).has_value());
+        const auto failure = expect_event<worker::TaskFailed>(*process, 60s);
+        CHECK(failure.code == ErrorCode::ResourceLimit);
     }
 
     TEST_CASE("a worker that ignores cancellation is terminated after the grace period") {
@@ -532,11 +744,11 @@ TEST_SUITE("analysis") {
 
     TEST_CASE("a hung worker loses its heartbeat lease") {
         auto options = self_test_options();
-        options.lease_deadline = 1500ms;
+        options.lease_deadline = 2 * worker::kHeartbeatInterval;
         auto process = start_worker(options);
         suspend_process(process->process_id());
 
-        const auto exited = expect_event<worker::WorkerExited>(*process, 6s);
+        const auto exited = expect_event<worker::WorkerExited>(*process, options.lease_deadline + 5s);
         REQUIRE(exited.failure.has_value());
         CHECK(exited.failure->code == ErrorCode::WorkerCrash);
         CHECK(exited.failure->retryable);
@@ -588,20 +800,19 @@ TEST_SUITE("analysis") {
 
     TEST_CASE("a missing worker executable fails to start") {
         auto options = self_test_options();
-        options.executable = worker_executable().parent_path() / "no-such-worker";
-        const auto process = worker::WorkerProcess::start(options);
-        REQUIRE_FALSE(process.has_value());
-        CHECK(process.error().code == ErrorCode::WorkerCrash);
+        options.executable = mso::test::worker_executable().parent_path() / "no-such-worker";
+        const auto error = expect_start_failure(options);
+        CHECK(error.code == ErrorCode::WorkerCrash);
     }
 
     TEST_CASE("real analysis of a generated WAV runs in the worker") {
-        ScratchDirectory scratch;
-        const auto wav_path = scratch.path() / mso::path_from_utf8("sine 440 \u266a.wav");
-        const auto segment_path = scratch.path() / "sine.seg";
-        write_sine_wav(wav_path);
+        ScratchDirectory scratch("worker-real");
+        const auto wav_path = scratch.file("sine 440 \u266a.wav");
+        const auto segment_path = scratch.file("sine.seg");
+        mso::test::write_sine_wav(wav_path, 1.0);
 
         worker::WorkerOptions options;
-        options.executable = worker_executable();
+        options.executable = mso::test::worker_executable();
         auto process = start_worker(options);
         CHECK_FALSE(process->handshake().self_test);
 
@@ -618,11 +829,11 @@ TEST_SUITE("analysis") {
 
         REQUIRE(result.report.loudness.has_value());
         CHECK(result.report.loudness->peak_dbfs == doctest::Approx(20.0 * std::log10(0.5)).epsilon(0.01));
-        CHECK(result.report.hashes.byte_sha256 == picosha2::hash256_hex_string(read_file(wav_path)));
+        CHECK(result.report.hashes.byte_sha256 == picosha2::hash256_hex_string(mso::test::read_file(wav_path)));
         CHECK(result.report.evidence.unchanged());
         CHECK(result.report.evidence.size_before == static_cast<std::int64_t>(std::filesystem::file_size(wav_path)));
         REQUIRE(result.waveform_segment.has_value());
-        const auto bytes = read_file(segment_path);
+        const auto bytes = mso::test::read_file(segment_path);
         const auto overview = analysis::decode_waveform(std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
         REQUIRE(overview.has_value());
         CHECK(overview->maximum.size() == 128);
@@ -630,7 +841,7 @@ TEST_SUITE("analysis") {
 
         SUBCASE("a missing input file is a terminal FILE_MISSING failure") {
             auto missing = make_task(30.0, {analysis::Stage::Loudness});
-            missing.file_path = mso::path_to_utf8(scratch.path() / "gone.wav");
+            missing.file_path = mso::path_to_utf8(scratch.file("gone.wav"));
             REQUIRE(process->submit(missing).has_value());
             const auto failure = expect_event<worker::TaskFailed>(*process, 10s);
             CHECK(failure.code == ErrorCode::FileMissing);

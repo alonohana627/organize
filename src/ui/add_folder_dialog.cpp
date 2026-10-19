@@ -33,8 +33,9 @@ AddFolderDialog::AddFolderDialog(const QString& folder, const std::vector<std::p
     copy->setEnabled(false);
     copy->setToolTip(tr("Managed copies are not available in this version yet."));
 
-    auto* note = new QLabel(tr("Import reads file names and container metadata only. Waveforms, BPM and key "
-                               "analysis run later, only when you ask for them."),
+    auto* note = new QLabel(tr("The folder is scanned now (file names and container metadata). Waveforms, BPM "
+                               "and key are then analyzed automatically in the background; you can pause or "
+                               "cancel that in the Jobs panel."),
                             this);
     note->setWordWrap(true);
 

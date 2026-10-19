@@ -31,15 +31,16 @@ void WaveformBuilder::BinAccumulator::merge(const BinAccumulator& other) noexcep
     sample_count += other.sample_count;
 }
 
-WaveformBuilder::WaveformBuilder(int max_bins, int sample_rate, std::optional<std::int64_t> expected_total_frames)
+WaveformBuilder::WaveformBuilder(int max_bins, int sample_rate, std::optional<std::int64_t> exact_total_frames)
     : max_bins_(static_cast<std::size_t>(std::clamp(max_bins, 1, kMaximumWaveformBins))),
       sample_rate_(sample_rate),
-      expected_total_frames_(expected_total_frames) {
-    if (expected_total_frames && *expected_total_frames > 0) {
+      exact_total_frames_(exact_total_frames) {
+    if (exact_total_frames && *exact_total_frames > 0) {
         const auto bin_limit = static_cast<std::int64_t>(max_bins_);
-        frames_per_bin_ = std::max<std::int64_t>(1, (*expected_total_frames + bin_limit - 1) / bin_limit);
+        frames_per_bin_ = std::max<std::int64_t>(1, (*exact_total_frames + bin_limit - 1) / bin_limit);
+        // Reserve what the known length needs, not max_bins: a short file stays small.
+        bins_.reserve(static_cast<std::size_t>((*exact_total_frames + frames_per_bin_ - 1) / frames_per_bin_));
     }
-    bins_.reserve(max_bins_);
 }
 
 void WaveformBuilder::add(std::span<const float> interleaved_samples, int channels) {
@@ -87,8 +88,8 @@ WaveformOverview WaveformBuilder::overview(bool complete) const {
     overview.complete = complete;
     if (complete) {
         overview.total_frames = frames_covered_;
-    } else if (expected_total_frames_ && *expected_total_frames_ >= frames_covered_) {
-        overview.total_frames = *expected_total_frames_;
+    } else if (exact_total_frames_ && *exact_total_frames_ >= frames_covered_) {
+        overview.total_frames = *exact_total_frames_;
     }
 
     overview.minimum.reserve(bins_.size());

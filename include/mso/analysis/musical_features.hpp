@@ -30,6 +30,7 @@ public:
 
     /// True once max_frames frames have been analyzed; later audio is ignored.
     bool saturated() const noexcept { return frames_analyzed_ >= max_frames_; }
+    /// Frames fed to the builders so far (at most max_frames).
     std::int64_t frames_analyzed() const noexcept { return frames_analyzed_; }
 
     /// Tempo of the analyzed audio; nullopt when tempo analysis was not requested.

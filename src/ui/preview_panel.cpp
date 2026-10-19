@@ -9,18 +9,19 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStyle>
+#include <QTime>
 #include <QToolButton>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <string_view>
 
-#include "mso/analysis/analysis.hpp"
+#include "mso/analysis/waveform_preview.hpp"
 #include "mso/ui/application_session.hpp"
 #include "mso/ui/background_tasks.hpp"
 #include "mso/ui/display_format.hpp"
+#include "mso/ui/ui_preferences.hpp"
 
 namespace mso::ui {
 
@@ -31,28 +32,30 @@ constexpr int kSeekResolution = 1000;        ///< slider steps across the whole 
 constexpr int kMinimumVolumeDecibels = -60;  ///< slider bottom = silence
 constexpr int kWaveformBins = 1024;
 constexpr std::size_t kWaveformCacheEntries = 8;
-constexpr const char* kVolumePreference = "preview.volume_db";
+constexpr std::int64_t kMillisecondsPerHour = 3'600'000;
 
-/// "1:02.3" from a frame position and rate.
+/// "1:02.3" (or "1:02:03.4" past an hour) from a frame position and rate, via QTime.
 QString format_clock(std::int64_t frames, int sample_rate) {
-    if (sample_rate <= 0) return QStringLiteral("–:––");
-    const double seconds = static_cast<double>(frames) / sample_rate;
-    const int minutes = static_cast<int>(seconds / 60.0);
-    const double remainder = seconds - minutes * 60.0;
-    return QStringLiteral("%1:%2").arg(minutes).arg(remainder, 4, 'f', 1, QLatin1Char('0'));
+    if (sample_rate <= 0) return PreviewPanel::tr("–:––");
+    // Rounded to tenths, so QTime's "z" (milliseconds without trailing zeros) shows one digit.
+    const std::int64_t milliseconds = (frames * 1000 / sample_rate + 50) / 100 * 100;
+    const QTime time = QTime::fromMSecsSinceStartOfDay(static_cast<int>(milliseconds % (24 * kMillisecondsPerHour)));
+    return time.toString(milliseconds >= kMillisecondsPerHour ? QStringLiteral("h:mm:ss.z") : QStringLiteral("m:ss.z"));
 }
 
 /// Backend chosen by MSO_AUDIO_BACKEND ("null" or "system"); the system device by default.
 audio::OutputBackend backend_from_environment() {
-    const char* value = std::getenv("MSO_AUDIO_BACKEND");
-    if (value && std::string_view(value) == "null") return audio::OutputBackend::Null;
-    return audio::OutputBackend::System;
+    return qEnvironmentVariable("MSO_AUDIO_BACKEND") == QLatin1String("null") ? audio::OutputBackend::Null
+                                                                              : audio::OutputBackend::System;
 }
 
 }  // namespace
 
 PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidget(parent), session_(session) {
     waveform_pool_.setMaxThreadCount(1);
+    engine_pool_.setMaxThreadCount(1);
+    // Open the output device in the background right away, so the first preview starts instantly.
+    QTimer::singleShot(0, this, &PreviewPanel::request_engine);
     poll_timer_.setInterval(kPollIntervalMilliseconds);
     connect(&poll_timer_, &QTimer::timeout, this, &PreviewPanel::poll_engine);
 
@@ -86,7 +89,7 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
             seek_to_slider();  // live scrubbing
     });
 
-    time_label_ = new QLabel(QStringLiteral("0:00.0 / –:––"), this);
+    time_label_ = new QLabel(tr("0:00.0 / –:––"), this);
     time_label_->setAccessibleName(tr("Playback time"));
 
     waveform_view_ = new WaveformView(this);
@@ -113,12 +116,27 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
         else
             post(audio::transport::SetVolumeDecibels{static_cast<double>(decibels)});
         volume_slider_->setToolTip(tr("Preview volume: %1 dB").arg(decibels));
-        session_.set_preference(kVolumePreference, decibels);
+        // Only the session's cache changes here; its coalesced writer persists the final value.
+        session_.set_preference(UiPreferenceKeys::kPreviewVolume, decibels);
     });
 
     loop_check_ = new QCheckBox(tr("Loop"), this);
     loop_check_->setAccessibleName(tr("Loop preview"));
     connect(loop_check_, &QCheckBox::toggled, this, &PreviewPanel::apply_loop);
+
+    // Seam fades are opt-in: they hide a click at a loop seam but alter what is auditioned.
+    seam_fades_check_ = new QCheckBox(tr("Seam fades"), this);
+    seam_fades_check_->setAccessibleName(tr("Fade at loop seams"));
+    seam_fades_check_->setToolTip(
+        tr("Short fades at every loop seam hide clicks in loops that are not seamless, but "
+           "they also dip the level and soften the first transient: what you hear is no "
+           "longer exactly the file."));
+    connect(seam_fades_check_, &QCheckBox::toggled, this,
+            [this](bool enabled) { post(audio::transport::SetSeamFades{enabled}); });
+    seam_fades_check_->setEnabled(false);  // seams exist only while looping
+    connect(loop_check_, &QCheckBox::toggled, seam_fades_check_, &QCheckBox::setEnabled);
+    loop_label_ = new QLabel(this);
+    loop_label_->setAccessibleName(tr("Loop region"));
 
     speed_spin_ = new QDoubleSpinBox(this);
     speed_spin_->setRange(audio::kMinimumSpeedRatio, audio::kMaximumSpeedRatio);
@@ -144,6 +162,8 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
     options_row->addWidget(new QLabel(tr("Volume"), this));
     options_row->addWidget(volume_slider_, 1);
     options_row->addWidget(loop_check_);
+    options_row->addWidget(seam_fades_check_);
+    options_row->addWidget(loop_label_);
     options_row->addWidget(new QLabel(tr("Speed"), this));
     options_row->addWidget(speed_spin_);
     options_row->addWidget(generate_button_);
@@ -161,11 +181,12 @@ PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidg
 PreviewPanel::~PreviewPanel() {
     cancel_waveform();
     waveform_pool_.waitForDone();
-    engine_.reset();  // stops the device and joins the decoder thread on the control thread
+    engine_pool_.waitForDone();  // an engine still being created is destroyed with its future
+    engine_.reset();             // stops the device and joins the decoder thread
 }
 
 void PreviewPanel::load_preferences() {
-    const auto stored = session_.preference(kVolumePreference);
+    const auto stored = session_.preference(UiPreferenceKeys::kPreviewVolume);
     if (stored.is_number_integer()) {
         const QSignalBlocker blocker(volume_slider_);
         volume_slider_->setValue(std::clamp(stored.get<int>(), kMinimumVolumeDecibels, 0));
@@ -228,7 +249,12 @@ void PreviewPanel::on_path_resolved(const SampleKey& key, const std::filesystem:
     selected_path_ = path;
     // Previewing authorizes bounded decoding of this one file for its waveform.
     if (waveform_view_->state() != WaveformView::State::Ready && waveform_key_ != key) start_waveform(key, path);
-    if (!ensure_engine()) return;
+    if (!engine_) {
+        // The device is still being opened in the background: play as soon as it is ready.
+        pending_open_ = PendingOpen{key, path, autoplay};
+        request_engine();
+        return;
+    }
     if (auto opened = engine_->open(path); !opened) {
         status_label_->setText(tr("Cannot preview: %1").arg(DisplayFormat::error(opened.error())));
         return;
@@ -241,25 +267,38 @@ void PreviewPanel::on_path_resolved(const SampleKey& key, const std::filesystem:
     update_controls_enabled();
 }
 
-bool PreviewPanel::ensure_engine() {
-    if (engine_) return true;
-    if (engine_unavailable_) return false;
-    audio::PreviewOptions options;
-    options.backend = backend_from_environment();
-    auto created = audio::PreviewEngine::create(options);
-    if (!created) {
-        engine_unavailable_ = true;
-        status_label_->setText(tr("Audio output unavailable: %1").arg(DisplayFormat::error(created.error())));
-        update_controls_enabled();
-        return false;
-    }
-    engine_ = std::move(*created);
-    const int decibels = volume_slider_->value();
-    if (decibels <= kMinimumVolumeDecibels)
-        engine_->post(audio::transport::SetVolumeLinear{0.0});
-    else
-        engine_->post(audio::transport::SetVolumeDecibels{static_cast<double>(decibels)});
-    return true;
+void PreviewPanel::request_engine() {
+    if (engine_ || engine_requested_ || engine_unavailable_) return;
+    engine_requested_ = true;
+    using Creation = Result<std::unique_ptr<audio::PreviewEngine>>;
+    // Opening the output device can take hundreds of milliseconds: never on the UI thread.
+    run_in_background(
+        engine_pool_, this,
+        []() -> Creation {
+            audio::PreviewOptions options;
+            options.backend = backend_from_environment();
+            return audio::PreviewEngine::create(options);
+        },
+        [this](Creation created) {
+            engine_requested_ = false;
+            if (!created) {
+                engine_unavailable_ = true;
+                pending_open_.reset();
+                status_label_->setText(tr("Audio output unavailable: %1").arg(DisplayFormat::error(created.error())));
+                update_controls_enabled();
+                return;
+            }
+            engine_ = std::move(*created);
+            const int decibels = volume_slider_->value();
+            if (decibels <= kMinimumVolumeDecibels)
+                engine_->post(audio::transport::SetVolumeLinear{0.0});
+            else
+                engine_->post(audio::transport::SetVolumeDecibels{static_cast<double>(decibels)});
+            engine_->post(audio::transport::SetSeamFades{seam_fades_check_->isChecked()});
+            if (auto pending = std::exchange(pending_open_, std::nullopt); pending && pending->key == selected_key_)
+                on_path_resolved(pending->key, pending->path, pending->autoplay);
+            update_controls_enabled();
+        });
 }
 
 void PreviewPanel::post(audio::TransportCommand command) {
@@ -275,8 +314,12 @@ void PreviewPanel::poll_engine() {
     }
     const audio::PreviewSnapshot snapshot = engine_->snapshot();
     const bool playing = snapshot.state == audio::PreviewState::Playing;
-    play_button_->setIcon(style()->standardIcon(playing ? QStyle::SP_MediaPause : QStyle::SP_MediaPlay));
-    play_button_->setAccessibleName(playing ? tr("Pause") : tr("Play"));
+    if (playing != showing_pause_) {
+        // Only on a change: screen readers announce every accessible-name update.
+        showing_pause_ = playing;
+        play_button_->setIcon(style()->standardIcon(playing ? QStyle::SP_MediaPause : QStyle::SP_MediaPlay));
+        play_button_->setAccessibleName(playing ? tr("Pause") : tr("Play"));
+    }
 
     total_frames_ = snapshot.total_frames;
     const bool known_length = snapshot.total_frames && *snapshot.total_frames > 0;
@@ -288,11 +331,10 @@ void PreviewPanel::poll_engine() {
         const QSignalBlocker blocker(seek_slider_);
         seek_slider_->setValue(static_cast<int>(std::lround(*fraction * kSeekResolution)));
     }
-    const QString total =
-        known_length ? format_clock(*snapshot.total_frames, snapshot.source_sample_rate) : QStringLiteral("–:––");
-    time_label_->setText(QStringLiteral("%1 / %2%3")
-                             .arg(format_clock(snapshot.position_frames, snapshot.source_sample_rate), total,
-                                  snapshot.total_frames_exact || !known_length ? QString() : tr(" (estimated)")));
+    const QString position = format_clock(snapshot.position_frames, snapshot.source_sample_rate);
+    const QString total = known_length ? format_clock(*snapshot.total_frames, snapshot.source_sample_rate) : tr("–:––");
+    time_label_->setText(snapshot.total_frames_exact || !known_length ? tr("%1 / %2").arg(position, total)
+                                                                      : tr("%1 / %2 (estimated)").arg(position, total));
     const bool showing_loaded =
         loaded_key_ && loaded_key_ == selected_key_ && snapshot.generation == loaded_generation_;
     waveform_view_->set_playhead(showing_loaded ? fraction : std::nullopt);
@@ -304,6 +346,19 @@ void PreviewPanel::poll_engine() {
         status_label_->setText(*snapshot.last_error == ErrorCode::DeviceLost
                                    ? tr("Audio device lost (%1); playback paused.").arg(error)
                                    : tr("Playback error: %1").arg(error));
+    }
+    // Show what the engine actually loops (clamped to the source, at least kMinimumLoopMilliseconds)
+    // and whether seam fades are on, as reported rather than as requested.
+    if (snapshot.loop && snapshot.source_sample_rate > 0) {
+        loop_label_->setText(tr("Looping %1–%2")
+                                 .arg(format_clock(snapshot.loop->start_frame, snapshot.source_sample_rate),
+                                      format_clock(snapshot.loop->end_frame, snapshot.source_sample_rate)));
+    } else {
+        loop_label_->clear();
+    }
+    if (seam_fades_check_->isChecked() != snapshot.seam_fades) {
+        const QSignalBlocker blocker(seam_fades_check_);
+        seam_fades_check_->setChecked(snapshot.seam_fades);
     }
     if (loop_check_->isChecked() && known_length && showing_loaded && loop_generation_ != snapshot.generation)
         apply_loop();
@@ -333,11 +388,8 @@ void PreviewPanel::start_waveform(const SampleKey& key, const std::filesystem::p
     run_in_background(
         waveform_pool_, this,
         [this, path, stop, request]() {
-            analysis::AnalysisRequest analysis_request;
-            analysis_request.file = path;
-            analysis_request.stages = {analysis::Stage::Waveform};
-            analysis_request.waveform_bins = kWaveformBins;
-            return analysis::analyze_file(analysis_request, stop, [this, request](double fraction) {
+            // Only the decoder and the waveform builder: preview decoding is not an analysis run.
+            return analysis::compute_waveform_overview(path, kWaveformBins, stop, [this, request](double fraction) {
                 // Worker thread: hop to the UI thread; the destructor waits for this pool.
                 QMetaObject::invokeMethod(
                     this,
@@ -348,20 +400,19 @@ void PreviewPanel::start_waveform(const SampleKey& key, const std::filesystem::p
                     Qt::QueuedConnection);
             });
         },
-        [this, key, request](Result<analysis::AnalysisReport> report) {
+        [this, key, request](Result<analysis::WaveformOverview> overview) {
             if (request != waveform_request_) return;
             waveform_key_.reset();
-            if (!report) {
-                if (report.error().code != ErrorCode::Cancelled && key == selected_key_)
-                    waveform_view_->show_failed(DisplayFormat::error(report.error()));
+            if (!overview) {
+                if (overview.error().code != ErrorCode::Cancelled && key == selected_key_)
+                    waveform_view_->show_failed(DisplayFormat::error(overview.error()));
                 return;
             }
-            if (!report->waveform) {
+            if (overview->maximum.empty()) {
                 if (key == selected_key_) waveform_view_->show_failed(tr("no audio was decoded"));
                 return;
             }
-            WaveformBins bins{std::move(report->waveform->minimum), std::move(report->waveform->maximum),
-                              std::move(report->waveform->rms)};
+            WaveformBins bins{std::move(overview->minimum), std::move(overview->maximum), std::move(overview->rms)};
             waveform_cache_.emplace_front(key, bins);
             if (waveform_cache_.size() > kWaveformCacheEntries) waveform_cache_.pop_back();
             if (key == selected_key_) waveform_view_->show_waveform(std::move(bins));

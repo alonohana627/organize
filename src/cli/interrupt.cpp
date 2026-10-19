@@ -1,0 +1,88 @@
+#include "mso/cli/interrupt.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <csignal>
+#endif
+
+namespace mso::cli {
+
+namespace {
+
+/// Set by the handler; read by the watcher. Lock-free, hence safe to store from a signal handler.
+std::atomic<bool> interrupt_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
+
+/// How often the watcher looks at the flag (Ctrl+C latency; no busy loop).
+constexpr auto kWatchInterval = std::chrono::milliseconds(50);
+
+#ifdef _WIN32
+/// Console control handler: records Ctrl+C / Ctrl+Break and keeps the process alive.
+BOOL WINAPI on_console_control(DWORD control) {
+    if (control != CTRL_C_EVENT && control != CTRL_BREAK_EVENT) return FALSE;
+    interrupt_requested.store(true);
+    return TRUE;  // handled: the process keeps running and stops cooperatively
+}
+#else
+/// The SIGINT disposition to restore when the scope ends.
+struct sigaction previous_action{};
+
+/// SIGINT handler: only stores the lock-free flag (async-signal-safe).
+void on_interrupt_signal(int) {
+    interrupt_requested.store(true);  // the only thing done in signal context
+}
+#endif
+
+}  // namespace
+
+InterruptScope::InterruptScope() {
+    interrupt_requested.store(false);
+#ifdef _WIN32
+    SetConsoleCtrlHandler(on_console_control, TRUE);
+#else
+    struct sigaction action{};
+    action.sa_handler = on_interrupt_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, &previous_action);
+#endif
+    watcher_ = std::jthread([this](std::stop_token stop) {
+        // Exception barrier: if waiting ever fails, treat it like Ctrl+C so the command stops
+        // cooperatively instead of the process terminating.
+        try {
+            std::mutex sleep_mutex;
+            std::condition_variable_any sleeper;
+            while (!stop.stop_requested()) {
+                if (interrupt_requested.load()) {
+                    stop_.request_stop();
+                    return;
+                }
+                std::unique_lock lock(sleep_mutex);
+                sleeper.wait_for(lock, stop, kWatchInterval, [] { return false; });
+            }
+        } catch (const std::exception&) {
+            stop_.request_stop();
+        }
+    });
+}
+
+InterruptScope::~InterruptScope() {
+    watcher_ = {};  // request stop and join before the handler goes away
+#ifdef _WIN32
+    SetConsoleCtrlHandler(on_console_control, FALSE);
+#else
+    sigaction(SIGINT, &previous_action, nullptr);
+#endif
+    interrupt_requested.store(false);
+}
+
+void InterruptScope::simulate_interrupt() noexcept {
+    interrupt_requested.store(true);
+}
+
+}  // namespace mso::cli

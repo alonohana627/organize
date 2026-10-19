@@ -3,6 +3,16 @@
 *.sql text eol=lf
 *.py text eol=lf
 *.json text eol=lf
+*.sh text eol=lf
+# Embeds migration SQL whose checksums are pinned: the bytes must not depend on the checkout platform.
+src/catalog/migrations.cpp text eol=lf
 # Vendored sources and patches are kept byte-exact (no line-ending conversion).
 deps/** -text
 patches/** -text
+# Project files inside deps/ (not vendored) are ordinary LF text.
+deps/CMakeLists.txt text eol=lf
+deps/README.md text eol=lf
+deps/manifest.json text eol=lf
+deps/update_deps.py text eol=lf
+deps/miniaudio_impl.c text eol=lf
+deps/.clang-format text eol=lf

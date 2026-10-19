@@ -1,11 +1,12 @@
 /// @file
-/// Autocorrelation / beat-contrast comb tempo estimator.
+/// Autocorrelation beat-comb tempo estimator with accent-based metrical-level selection.
 #include "mso/analysis/tempo_estimator.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -23,14 +24,27 @@ constexpr double kRefineSpanFraction = 0.03;  ///< fine search within +-3% of th
 constexpr double kRefineStepBpm = 0.005;
 constexpr int kRefineHarmonics = 32;
 constexpr double kPriorCenterBpm = 120.0;
-constexpr double kPriorWidthOctaves = 1.5;  ///< weak: only breaks near-ties between octaves
+constexpr double kPriorWidthOctaves = 1.5;  ///< weak: only breaks near-ties between metrical levels
+/// Comb peaks scoring at least this fraction of the best prior-weighted comb are candidate beat
+/// levels. A dense groove (16th-note hats) makes every multiple of its tatum score almost equally,
+/// including musically implausible ones such as 4/3 or 5/4 of the beat.
+constexpr double kCandidateFraction = 0.85;
 constexpr double kOctaveFactors[] = {2.0, 3.0};
-constexpr double kOctaveAcceptance = 0.85;      ///< the faster tempo wins at >= 85% of the slower comb
+/// The faster tempo wins at >= 85% of the slower one's prior-weighted comb...
+constexpr double kOctaveAcceptance = 0.85;
+/// ...and only when its prior-weighted beat salience reaches 79% of the slower one's: its grid
+/// must land on onsets nearly as strong as the slower grid does. A subdivision that falls between
+/// the accents (the 8th or 16th hats of a groove) fails, unless the prior pulls towards it, as for
+/// a half-time backbeat at 70 BPM whose 140 BPM pulse is the musically conventional reading.
+constexpr double kSalienceAcceptance = 0.79;
 constexpr double kOctaveSearchFraction = 0.02;  ///< faster tempo searched within +-2% of factor x bpm
 constexpr double kMinimumPeriodicity = 0.25;    ///< beat-comb score below which tempo is unknown
 constexpr double kTransientPeakFraction = 0.2;  ///< transient = local maximum above 20% of the largest
 constexpr double kTransientMinimumSpacingSeconds = 0.1;
 constexpr std::size_t kMinimumTransients = 3;
+/// Beat-grid points snap to the strongest novelty within this many frames, absorbing the drift of a
+/// coarse-grid tempo over the analysis window.
+constexpr std::size_t kGridSnapFrames = 1;
 
 /// Envelope minus its moving average, half-wave rectified: keeps the transients and drops slow
 /// loudness changes so sustained material does not masquerade as periodicity.
@@ -113,6 +127,7 @@ private:
     double max_lag_ = 0.0;
 };
 
+/// Length of one beat at `bpm`, in envelope frames.
 double beat_lag_frames(double bpm, double frame_rate) {
     return 60.0 * frame_rate / bpm;
 }
@@ -141,47 +156,125 @@ struct TempoCandidate {
     double comb = 0.0;
 };
 
-/// Best beat comb, optionally weighted by the prior, on the coarse grid within [lowest, highest].
+/// Best beat comb, unweighted, on the coarse grid within [lowest, highest].
 std::optional<TempoCandidate> best_candidate(const LagCorrelation& correlation, double frame_rate, double lowest,
-                                             double highest, bool weight_by_prior) {
+                                             double highest) {
     std::optional<TempoCandidate> best;
-    double best_score = 0.0;
     const auto steps = static_cast<int>(std::floor((highest - lowest) / kCoarseStepBpm));
     for (int step = 0; step <= steps; ++step) {
         const double bpm = lowest + step * kCoarseStepBpm;
         const std::optional<double> comb = beat_comb(correlation, bpm, frame_rate);
         if (!comb || *comb <= 0.0) continue;
-        const double score = weight_by_prior ? *comb * tempo_prior(bpm) : *comb;
-        if (score > best_score) {
-            best_score = score;
-            best = TempoCandidate{bpm, *comb};
-        }
+        if (!best || *comb > best->comb) best = TempoCandidate{bpm, *comb};
     }
     return best;
 }
 
-/// Octave handling. A slow tempo's comb also hits every multiple of the true beat, so while two or
-/// three times the current tempo (still in range) explains the correlation nearly as well, the
-/// faster tempo is taken as the beat and the slower one as a grouping of beats.
-TempoCandidate climb_octaves(const LagCorrelation& correlation, double frame_rate, TempoCandidate candidate) {
+/// Local maxima of the prior-weighted comb over the whole reported range that score at least
+/// kCandidateFraction of the best one: the metrical levels the periodicity alone cannot tell apart.
+std::vector<TempoCandidate> candidate_levels(const LagCorrelation& correlation, double frame_rate) {
+    const auto steps = static_cast<int>(std::floor((kMaximumReportedBpm - kMinimumReportedBpm) / kCoarseStepBpm));
+    std::vector<TempoCandidate> grid;
+    std::vector<double> weighted;
+    grid.reserve(static_cast<std::size_t>(steps) + 1);
+    weighted.reserve(static_cast<std::size_t>(steps) + 1);
+    for (int step = 0; step <= steps; ++step) {
+        const double bpm = kMinimumReportedBpm + step * kCoarseStepBpm;
+        const double comb = beat_comb(correlation, bpm, frame_rate).value_or(0.0);
+        grid.push_back(TempoCandidate{bpm, comb});
+        weighted.push_back(comb > 0.0 ? comb * tempo_prior(bpm) : 0.0);
+    }
+    const double best = weighted.empty() ? 0.0 : *std::max_element(weighted.begin(), weighted.end());
+    std::vector<TempoCandidate> levels;
+    if (!(best > 0.0)) return levels;
+    for (std::size_t index = 0; index < weighted.size(); ++index) {
+        const bool rises = index == 0 || weighted[index] > weighted[index - 1];
+        const bool falls = index + 1 == weighted.size() || weighted[index] >= weighted[index + 1];
+        if (rises && falls && weighted[index] >= kCandidateFraction * best) levels.push_back(grid[index]);
+    }
+    return levels;
+}
+
+/// How strongly a beat grid at `bpm` lands on onsets: the mean novelty at the grid points (each
+/// snapped to the strongest frame within kGridSnapFrames), for the best phase, relative to the
+/// mean novelty of the whole signal. A grid on the accents (kick and snare) scores higher than one
+/// that also visits the weaker onsets in between (hats), even when both are equally periodic.
+double beat_salience(std::span<const double> novelty, double novelty_mean, double bpm, double frame_rate) {
+    const double beat_lag = beat_lag_frames(bpm, frame_rate);
+    if (!(novelty_mean > 0.0) || !(beat_lag >= 1.0) || novelty.empty()) return 0.0;
+    const std::size_t count = novelty.size();
+    const auto snapped = [&](double position) {
+        const auto center = static_cast<std::size_t>(std::llround(position));
+        const std::size_t first = center > kGridSnapFrames ? center - kGridSnapFrames : 0;
+        const std::size_t last = std::min(count - 1, center + kGridSnapFrames);
+        return *std::max_element(novelty.begin() + static_cast<std::ptrdiff_t>(first),
+                                 novelty.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    };
+    double best_mean = 0.0;
+    const auto phases = static_cast<std::size_t>(std::ceil(beat_lag));
+    for (std::size_t phase = 0; phase < phases; ++phase) {
+        double sum = 0.0;
+        std::size_t points = 0;
+        for (double position = static_cast<double>(phase); position < static_cast<double>(count - 1);
+             position += beat_lag) {
+            sum += snapped(position);
+            ++points;
+        }
+        if (points > 0) best_mean = std::max(best_mean, sum / static_cast<double>(points));
+    }
+    return best_mean / novelty_mean;
+}
+
+/// Metrical-level selection. Among the candidate `levels` (non-empty), the beat is the one whose
+/// grid best lands on the accents, weighted by the prior; then, while two or three times the tempo
+/// (still in range) explains the correlation nearly as well and its grid still lands on onsets
+/// nearly as strong (both weighted by the prior), the faster tempo is taken as the beat and the
+/// slower one as a grouping of beats. The salience test keeps a dense subdivision (16th-note hats
+/// over a kick on every beat, 8th-note hats over an 85 BPM half-time backbeat) from doubling the
+/// tempo, while an even pulse (a kick on every beat) still climbs from its half-tempo comb peak.
+TempoCandidate choose_beat_level(const LagCorrelation& correlation, std::span<const TempoCandidate> levels,
+                                 std::span<const double> novelty, double frame_rate) {
+    double novelty_sum = 0.0;
+    for (const double value : novelty)
+        novelty_sum += value;
+    const double novelty_mean = novelty.empty() ? 0.0 : novelty_sum / static_cast<double>(novelty.size());
+    // Salience weighted by the prior: how well a grid at `bpm` lands on accents, and how plausible
+    // the tempo is.
+    const auto weighted_salience = [&](double bpm) {
+        return beat_salience(novelty, novelty_mean, bpm, frame_rate) * tempo_prior(bpm);
+    };
+
+    TempoCandidate beat = levels.front();
+    double beat_score = weighted_salience(beat.bpm);
+    for (const TempoCandidate& level : levels) {
+        const double score = weighted_salience(level.bpm);
+        if (score > beat_score) {
+            beat = level;
+            beat_score = score;
+        }
+    }
+
     bool climbed = true;
     while (climbed) {
         climbed = false;
         for (const double factor : kOctaveFactors) {
-            const double target = candidate.bpm * factor;
+            const double target = beat.bpm * factor;
             const double lowest = target * (1.0 - kOctaveSearchFraction);
             if (lowest > kMaximumReportedBpm) continue;
             const double highest = std::min(kMaximumReportedBpm, target * (1.0 + kOctaveSearchFraction));
-            const std::optional<TempoCandidate> faster =
-                best_candidate(correlation, frame_rate, lowest, highest, false);
-            if (faster && faster->comb >= kOctaveAcceptance * candidate.comb) {
-                candidate = *faster;
+            const std::optional<TempoCandidate> faster = best_candidate(correlation, frame_rate, lowest, highest);
+            if (!faster) continue;
+            const bool periodic_enough =
+                faster->comb * tempo_prior(faster->bpm) >= kOctaveAcceptance * beat.comb * tempo_prior(beat.bpm);
+            if (periodic_enough &&
+                weighted_salience(faster->bpm) >= kSalienceAcceptance * weighted_salience(beat.bpm)) {
+                beat = *faster;
                 climbed = true;
                 break;
             }
         }
     }
-    return candidate;
+    return beat;
 }
 
 /// Sum of r over the first `harmonics` beat multiples. Sharpens the period estimate because the
@@ -221,17 +314,15 @@ TempoResult estimate_tempo(std::span<const float> onset_envelope, double frame_r
     const TempoResult unknown;
     if (!(frame_rate > 0.0) || onset_envelope.empty()) return unknown;
 
-    std::vector<double> novelty = rectified_novelty(onset_envelope, frame_rate);
+    const std::vector<double> novelty = rectified_novelty(onset_envelope, frame_rate);
     if (count_transients(novelty, frame_rate) < kMinimumTransients) return unknown;
 
-    const LagCorrelation correlation(std::move(novelty));
+    const LagCorrelation correlation(novelty);
     if (!correlation.valid()) return unknown;
+    const std::vector<TempoCandidate> levels = candidate_levels(correlation, frame_rate);
+    if (levels.empty()) return unknown;
 
-    const std::optional<TempoCandidate> coarse =
-        best_candidate(correlation, frame_rate, kMinimumReportedBpm, kMaximumReportedBpm, true);
-    if (!coarse) return unknown;
-
-    const TempoCandidate beat = climb_octaves(correlation, frame_rate, *coarse);
+    const TempoCandidate beat = choose_beat_level(correlation, levels, novelty, frame_rate);
     const double bpm = refine_bpm(correlation, beat.bpm, frame_rate);
     const double periodicity = beat_comb(correlation, bpm, frame_rate).value_or(0.0);
     if (periodicity < kMinimumPeriodicity) return unknown;

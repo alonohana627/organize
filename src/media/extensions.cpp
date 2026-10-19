@@ -16,8 +16,8 @@ constexpr std::array<std::string_view, 19> kCandidateExtensions = {
 
 }  // namespace
 
-bool is_candidate_extension(std::string_view ext_lower) noexcept {
-    return std::ranges::find(kCandidateExtensions, ext_lower) != kCandidateExtensions.end();
+bool is_candidate_extension(std::string_view extension_lowercase) noexcept {
+    return std::ranges::find(kCandidateExtensions, extension_lowercase) != kCandidateExtensions.end();
 }
 
 }  // namespace mso::media

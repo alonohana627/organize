@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <utility>
 
 #include "mso/ui/display_format.hpp"
 
@@ -17,11 +18,12 @@ using Column = SampleTableModel::Column;
 
 /// True when two navigation scopes select the same samples.
 bool same_scope(const NavigationScope& left, const NavigationScope& right) {
-    const search::Scope& a = left.scope;
-    const search::Scope& b = right.scope;
-    return left.library == right.library && a.root_id == b.root_id && a.folder == b.folder &&
-           a.collection_id == b.collection_id && a.tag_id == b.tag_id && a.category_id == b.category_id &&
-           a.uncategorized == b.uncategorized;
+    const search::Scope& left_scope = left.scope;
+    const search::Scope& right_scope = right.scope;
+    return left.library == right.library && left_scope.root_id == right_scope.root_id &&
+           left_scope.folder == right_scope.folder && left_scope.collection_id == right_scope.collection_id &&
+           left_scope.tag_id == right_scope.tag_id && left_scope.category_id == right_scope.category_id &&
+           left_scope.uncategorized == right_scope.uncategorized;
 }
 
 /// Columns whose values are numbers and read best right-aligned.
@@ -47,10 +49,18 @@ QString or_unknown(const QString& text) {
     return text.isEmpty() ? DisplayFormat::unknown_marker() : text;
 }
 
+SampleKey key_of(const search::SampleRow& row) {
+    return SampleKey{row.library, row.sample_id};
+}
+
 }  // namespace
 
 SampleTableModel::SampleTableModel(SamplePageSource& source, QObject* parent)
-    : QAbstractTableModel(parent), source_(source) {}
+    : QAbstractTableModel(parent), source_(source) {
+    hydration_timer_.setSingleShot(true);
+    hydration_timer_.setInterval(0);
+    connect(&hydration_timer_, &QTimer::timeout, this, &SampleTableModel::hydrate_wanted_pages);
+}
 
 // ---------------------------------------------------------------- QAbstractItemModel
 
@@ -73,9 +83,12 @@ QVariant SampleTableModel::data(const QModelIndex& index, int role) const {
     const auto offset = static_cast<std::size_t>(index.row() - page.first_row);
 
     if (offset >= page.rows.size()) {
-        // Evicted (or not yet re-read) row: show a distinct loading state and fetch it again.
+        // Evicted row: show a distinct loading state and ask for a re-read (started outside data()).
         // While a new query is pending these rows belong to the old one: never re-read them.
-        if (page.rows.empty() && !page.hydrating && !replacing_) request_hydration(page_index);
+        if (page.rows.empty() && !page.hydrating && !replacing_ && page.retry_after.hasExpired()) {
+            wanted_pages_.insert(page_index);
+            hydration_timer_.start();
+        }
         switch (role) {
             case Qt::DisplayRole:
                 return column == Column::Name ? tr("Loading…") : QVariant();
@@ -102,8 +115,6 @@ QVariant SampleTableModel::data(const QModelIndex& index, int role) const {
             if (column == Column::Rating) return DisplayFormat::rating_accessible(row.rating);
             if (column == Column::Favorite) return row.favorite ? tr("Favorite") : tr("Not favorite");
             return display_value(row, column);
-        case SampleKeyRole:
-            return QVariant::fromValue(SampleKey{row.library, row.sample_id});
         case LoadingRole:
             return false;
         case AvailabilityRole:
@@ -149,7 +160,7 @@ QVariant SampleTableModel::display_value(const search::SampleRow& row, Column co
             const QString root = DisplayFormat::from_utf8(row.root_name);
             const QString path = DisplayFormat::from_utf8(row.relative_path);
             if (path.isEmpty()) return root;
-            return root.isEmpty() ? path : root + QLatin1Char('/') + path;
+            return root.isEmpty() ? path : tr("%1/%2").arg(root, path);
         }
         case Column::Availability:
             return DisplayFormat::availability(row.availability);
@@ -296,29 +307,51 @@ void SampleTableModel::clear() {
     refreshing_ = false;
     append_pending_ = false;
     staged_pages_.clear();
+    wanted_pages_.clear();
     beginResetModel();
     pages_.clear();
     endResetModel();
-    set_pending(-pending_requests_);
+    reset_pending();
     emit coverageChanged({});
     emit countChanged(0, true);
 }
 
 void SampleTableModel::refresh(int anchor_row) {
     if (!active_) return;
-    if (pages_.empty()) {
+    if (pages_.empty() || replacing_) {
+        // Nothing to keep, or a new query is already on its way: a fresh generation covers both
+        // (and never leaves replacing_ set, which would stop paging).
         restart();
         return;
     }
     ++generation_;
-    set_pending(-pending_requests_);
+    reset_pending();
     append_pending_ = false;
     refreshing_ = true;
     staged_pages_.clear();
+    wanted_pages_.clear();
+    for (Page& page : pages_)
+        page.hydrating = false;  // their deliveries belong to the old generation and are dropped
     const int anchor_page = std::max(0, page_index_of_row(anchor_row));
     // The anchor page plus the next one: a viewport can straddle a page boundary.
     refresh_target_pages_ = std::clamp(anchor_page + 2, 1, kMaxHydratedPages);
     request_staged_page();
+}
+
+void SampleTableModel::refresh_rows(const std::vector<SampleKey>& keys) {
+    if (!active_ || pages_.empty()) return;
+    std::vector<SampleKey> loaded;
+    for (const auto& [key, row] : rows_of(keys))
+        if (!has_pending_edit(key)) loaded.push_back(key);
+    if (loaded.empty()) return;
+    const std::uint64_t generation = generation_;
+    source_.request_rows(loaded, this, [this, generation, loaded](std::vector<search::SampleRow> current) {
+        if (generation != generation_) return;  // the rows were replaced meanwhile
+        std::vector<SampleKey> still_settled;
+        for (const SampleKey& key : loaded)
+            if (!has_pending_edit(key)) still_settled.push_back(key);
+        apply_rows(still_settled, current);
+    });
 }
 
 int SampleTableModel::sort_column() const {
@@ -352,6 +385,84 @@ std::optional<search::SortField> SampleTableModel::sort_field_for(Column column)
     }
 }
 
+// ---------------------------------------------------------------- optimistic edits
+
+std::vector<search::SampleRow> SampleTableModel::patch_rows(const std::vector<SampleKey>& keys,
+                                                            const std::function<void(search::SampleRow&)>& patch) {
+    std::vector<search::SampleRow> previous;
+    for (const auto& [key, row] : rows_of(keys)) {
+        search::SampleRow* sample = loaded_row_for_update(row);
+        previous.push_back(*sample);
+        patch(*sample);
+        emit_row_changed(row);
+    }
+    return previous;
+}
+
+void SampleTableModel::apply_rows(const std::vector<SampleKey>& requested,
+                                  const std::vector<search::SampleRow>& current) {
+    std::map<SampleKey, const search::SampleRow*> by_key;
+    for (const search::SampleRow& row : current)
+        by_key.emplace(key_of(row), &row);
+    std::vector<SampleKey> deleted;
+    for (const auto& [key, row] : rows_of(requested)) {
+        const auto found = by_key.find(key);
+        if (found == by_key.end()) {
+            deleted.push_back(key);
+            continue;
+        }
+        *loaded_row_for_update(row) = *found->second;
+        emit_row_changed(row);
+    }
+    remove_rows(deleted);
+}
+
+void SampleTableModel::remove_rows(const std::vector<SampleKey>& keys) {
+    std::vector<int> rows;
+    for (const auto& [key, row] : rows_of(keys))
+        rows.push_back(row);
+    std::ranges::sort(rows, std::greater<>());  // bottom-up keeps the remaining row numbers valid
+    for (int row : rows)
+        remove_row(row);
+}
+
+void SampleTableModel::remove_row(int row) {
+    const int page_index = page_index_of_row(row);
+    if (page_index < 0) return;
+    beginRemoveRows({}, row, row);
+    Page& page = pages_[static_cast<std::size_t>(page_index)];
+    page.rows.erase(page.rows.begin() + (row - page.first_row));
+    --page.row_count;
+    for (std::size_t later = static_cast<std::size_t>(page_index) + 1; later < pages_.size(); ++later)
+        --pages_[later].first_row;
+    if (page.row_count == 0) {
+        // Keep the chain of cursors: the previous page now continues where this one did.
+        if (page_index > 0) pages_[static_cast<std::size_t>(page_index) - 1].next = page.next;
+        pages_.erase(pages_.begin() + page_index);
+    }
+    endRemoveRows();
+}
+
+void SampleTableModel::begin_pending_edit(const std::vector<SampleKey>& keys) {
+    for (const SampleKey& key : keys)
+        ++pending_edits_[key];
+}
+
+void SampleTableModel::end_pending_edit(const std::vector<SampleKey>& keys) {
+    for (const SampleKey& key : keys) {
+        const auto found = pending_edits_.find(key);
+        if (found != pending_edits_.end() && --found->second <= 0) pending_edits_.erase(found);
+    }
+}
+
+bool SampleTableModel::has_pending_edit(const SampleKey& key) const {
+    return pending_edits_.contains(key);
+}
+
+void SampleTableModel::emit_row_changed(int row) {
+    emit dataChanged(index(row, 0), index(row, kColumnCount - 1));
+}
+
 // ---------------------------------------------------------------- row access
 
 const search::SampleRow* SampleTableModel::loaded_row(int row) const {
@@ -363,14 +474,30 @@ const search::SampleRow* SampleTableModel::loaded_row(int row) const {
 }
 
 std::optional<int> SampleTableModel::row_of(const SampleKey& key) const {
+    const auto rows = rows_of({key});
+    if (rows.empty()) return std::nullopt;
+    return rows.begin()->second;
+}
+
+std::map<SampleKey, int> SampleTableModel::rows_of(const std::vector<SampleKey>& keys) const {
+    std::map<SampleKey, int> found;
+    if (keys.empty()) return found;
+    const std::set<SampleKey> wanted(keys.begin(), keys.end());
     for (const Page& page : pages_) {
         for (std::size_t offset = 0; offset < page.rows.size(); ++offset) {
-            const search::SampleRow& row = page.rows[offset];
-            if (row.sample_id == key.sample_id && row.library == key.library)
-                return page.first_row + static_cast<int>(offset);
+            const SampleKey key = key_of(page.rows[offset]);
+            if (wanted.contains(key)) found.emplace(key, page.first_row + static_cast<int>(offset));
         }
     }
-    return std::nullopt;
+    return found;
+}
+
+search::SampleRow* SampleTableModel::loaded_row_for_update(int row) {
+    const int page_index = page_index_of_row(row);
+    if (page_index < 0) return nullptr;
+    Page& page = pages_[static_cast<std::size_t>(page_index)];
+    const auto offset = static_cast<std::size_t>(row - page.first_row);
+    return offset < page.rows.size() ? &page.rows[offset] : nullptr;
 }
 
 bool SampleTableModel::is_loading() const {
@@ -402,9 +529,10 @@ search::SearchRequest SampleTableModel::make_request(const std::optional<search:
 
 void SampleTableModel::restart() {
     ++generation_;
-    set_pending(-pending_requests_);
+    reset_pending();
     refreshing_ = false;
     staged_pages_.clear();
+    wanted_pages_.clear();
     replacing_ = true;
     append_pending_ = true;
     emit coverageChanged({});
@@ -458,21 +586,21 @@ void SampleTableModel::request_next_page() {
                                  return;
                              }
                              report_coverage(result->coverage);
-                             if (!result->rows.empty()) {
-                                 Page page;
-                                 page.start = start;
-                                 page.next = std::move(result->next);
-                                 page.first_row = rowCount();
-                                 page.row_count = static_cast<int>(result->rows.size());
-                                 page.rows = std::move(result->rows);
-                                 page.last_used = ++lru_clock_;
-                                 beginInsertRows({}, page.first_row, page.first_row + page.row_count - 1);
-                                 pages_.push_back(std::move(page));
-                                 endInsertRows();
-                                 evict_least_recently_used();
-                             } else {
-                                 pages_.back().next.reset();  // an empty continuation ends the result
+                             if (result->rows.empty()) {
+                                 if (!pages_.empty()) pages_.back().next.reset();  // the result ends here
+                                 return;
                              }
+                             Page page;
+                             page.start = start;
+                             page.next = std::move(result->next);
+                             page.first_row = rowCount();
+                             page.row_count = static_cast<int>(result->rows.size());
+                             page.rows = std::move(result->rows);
+                             page.last_used = ++lru_clock_;
+                             beginInsertRows({}, page.first_row, page.first_row + page.row_count - 1);
+                             pages_.push_back(std::move(page));
+                             endInsertRows();
+                             evict_least_recently_used();
                          });
 }
 
@@ -517,49 +645,111 @@ void SampleTableModel::commit_staged_pages() {
     refreshing_ = false;
     // Hydrations requested against the old page table must not land in the new one.
     ++generation_;
-    set_pending(-pending_requests_);
+    reset_pending();
+    std::vector<Page> staged = std::exchange(staged_pages_, {});
     const int old_rows = rowCount();
-    const int new_rows = staged_pages_.empty() ? 0 : staged_pages_.back().first_row + staged_pages_.back().row_count;
+    const int new_rows = staged.empty() ? 0 : staged.back().first_row + staged.back().row_count;
+
+    // A shrinking result loses rows at the end first (ordinary row removal on the old data) …
     if (new_rows < old_rows) {
         beginRemoveRows({}, new_rows, old_rows - 1);
-        pages_ = std::move(staged_pages_);
+        truncate_pages(pages_, new_rows);
         endRemoveRows();
-    } else if (new_rows > old_rows) {
-        beginInsertRows({}, old_rows, new_rows - 1);
-        pages_ = std::move(staged_pages_);
-        endInsertRows();
-    } else {
-        pages_ = std::move(staged_pages_);
     }
-    staged_pages_.clear();
-    const int unchanged_rows = std::min(old_rows, new_rows);
-    if (unchanged_rows > 0) emit dataChanged(index(0, 0), index(unchanged_rows - 1, kColumnCount - 1));
+    // … then the overlapping rows are replaced as a layout change: persistent indexes (selection,
+    // current row) follow their sample by key instead of staying on a row number, and the view keeps
+    // its scroll position (a model reset would jump to the top).
+    const int common_rows = std::min(old_rows, new_rows);
+    emit layoutAboutToBeChanged();
+    std::map<SampleKey, int> new_row_of_key;
+    for (const Page& page : staged)
+        for (std::size_t offset = 0; offset < page.rows.size(); ++offset)
+            if (page.first_row + static_cast<int>(offset) < common_rows)
+                new_row_of_key.emplace(key_of(page.rows[offset]), page.first_row + static_cast<int>(offset));
+    const QModelIndexList persistent = persistentIndexList();
+    QModelIndexList moved;
+    for (const QModelIndex& old_index : persistent) {
+        const search::SampleRow* sample = loaded_row(old_index.row());
+        const auto found = sample ? new_row_of_key.find(key_of(*sample)) : new_row_of_key.end();
+        moved << (found == new_row_of_key.end() ? QModelIndex() : index(found->second, old_index.column()));
+    }
+    std::vector<Page> remaining = staged;
+    truncate_pages(staged, common_rows);
+    pages_ = std::move(staged);
+    changePersistentIndexList(persistent, moved);
+    emit layoutChanged();
+    // … and a growing result gains rows at the end.
+    if (new_rows > old_rows) {
+        beginInsertRows({}, old_rows, new_rows - 1);
+        pages_ = std::move(remaining);
+        endInsertRows();
+    }
     emit refreshed();
     request_count();
 }
 
-void SampleTableModel::request_hydration(int page_index) const {
+void SampleTableModel::truncate_pages(std::vector<Page>& pages, int rows) {
+    while (!pages.empty() && pages.back().first_row >= rows)
+        pages.pop_back();
+    if (pages.empty()) return;
+    Page& last = pages.back();
+    const int kept = rows - last.first_row;
+    if (kept < last.row_count) {
+        last.row_count = kept;
+        if (static_cast<int>(last.rows.size()) > kept) last.rows.resize(static_cast<std::size_t>(kept));
+        last.next.reset();  // the following rows are gone; a later fetch re-reads from a full refresh
+    }
+}
+
+void SampleTableModel::hydrate_wanted_pages() {
+    const std::set<int> wanted = std::exchange(wanted_pages_, {});
+    for (int page_index : wanted) {
+        if (page_index < 0 || static_cast<std::size_t>(page_index) >= pages_.size()) continue;
+        const Page& page = pages_[static_cast<std::size_t>(page_index)];
+        if (page.rows.empty() && !page.hydrating) request_hydration(page_index);
+    }
+}
+
+void SampleTableModel::request_hydration(int page_index) {
     Page& page = pages_[static_cast<std::size_t>(page_index)];
     page.hydrating = true;
-    // data() is const by Qt's API; re-reading an evicted page only refills this model's cache.
-    auto* self = const_cast<SampleTableModel*>(this);
     const std::uint64_t generation = generation_;
-    source_.request_page(make_request(page.start), scope_.library, self,
-                         [self, generation, page_index](Result<search::SearchPage> result) {
-                             if (generation != self->generation_) return;
+    source_.request_page(make_request(page.start), scope_.library, this,
+                         [this, generation, page_index](Result<search::SearchPage> result) {
+                             if (generation != generation_) return;
                              if (!result) {
-                                 self->pages_[static_cast<std::size_t>(page_index)].hydrating = false;
-                                 self->report_failure(result.error());
+                                 on_hydration_failed(page_index, result.error());
                                  return;
                              }
-                             self->on_page_hydrated(page_index, std::move(*result));
+                             on_page_hydrated(page_index, std::move(*result));
                          });
+}
+
+void SampleTableModel::on_hydration_failed(int page_index, const Error& error) {
+    if (page_index < 0 || static_cast<std::size_t>(page_index) >= pages_.size()) return;
+    Page& page = pages_[static_cast<std::size_t>(page_index)];
+    page.hydrating = false;
+    ++page.failed_reads;
+    // 1 s, 2 s, 4 s … capped: a failing source is not hammered from every repaint.
+    const int delay =
+        std::min(kMaximumRetryMilliseconds, kMinimumRetryMilliseconds << std::min(page.failed_reads - 1, 5));
+    page.retry_after = QDeadlineTimer(delay);
+    const std::uint64_t generation = generation_;
+    QTimer::singleShot(delay, this, [this, generation, page_index] {
+        if (generation != generation_ || static_cast<std::size_t>(page_index) >= pages_.size()) return;
+        const Page& retried = pages_[static_cast<std::size_t>(page_index)];
+        if (retried.row_count > 0)
+            emit dataChanged(index(retried.first_row, 0),
+                             index(retried.first_row + retried.row_count - 1, kColumnCount - 1));
+    });
+    if (page.failed_reads == 1) report_failure(error);  // say it once, not on every retry
 }
 
 void SampleTableModel::on_page_hydrated(int page_index, search::SearchPage page) {
     if (page_index < 0 || static_cast<std::size_t>(page_index) >= pages_.size()) return;
     Page& target = pages_[static_cast<std::size_t>(page_index)];
     target.hydrating = false;
+    target.failed_reads = 0;
     const bool result_changed = static_cast<int>(page.rows.size()) != target.row_count;
     if (static_cast<int>(page.rows.size()) > target.row_count)
         page.rows.resize(static_cast<std::size_t>(target.row_count));
@@ -569,7 +759,6 @@ void SampleTableModel::on_page_hydrated(int page_index, search::SearchPage page)
         emit dataChanged(index(target.first_row, 0), index(target.first_row + target.row_count - 1, kColumnCount - 1));
     evict_least_recently_used();
     // Rows were added or removed before this page since it was first read: re-read the window.
-    if (result_changed) emit queryFailed(tr("The results changed while scrolling; refreshing."));
     if (result_changed) refresh(target.first_row);
 }
 
@@ -592,18 +781,18 @@ void SampleTableModel::request_count() {
     const std::uint64_t generation = generation_;
     emit countUpdating();
     set_pending(+1);
-    source_.request_count(make_request(std::nullopt), scope_.library, this,
-                          [this, generation](Result<search::CountResult> result) {
-                              if (generation != generation_) return;
-                              set_pending(-1);
-                              if (!result) {
-                                  report_failure(result.error());
-                                  return;
-                              }
-                              const bool complete = std::all_of(result->coverage.begin(), result->coverage.end(),
-                                                                [](const auto& library) { return library.complete; });
-                              emit countChanged(result->total, complete);
-                          });
+    source_.request_count(
+        make_request(std::nullopt), scope_.library, this, [this, generation](Result<search::CountResult> result) {
+            if (generation != generation_) return;
+            set_pending(-1);
+            if (!result) {
+                report_failure(result.error());
+                return;
+            }
+            const bool complete =
+                std::ranges::all_of(result->coverage, [](const auto& library) { return library.complete; });
+            emit countChanged(result->total, complete);
+        });
 }
 
 void SampleTableModel::report_failure(const Error& error) {
@@ -618,9 +807,9 @@ void SampleTableModel::report_coverage(const std::vector<search::LibraryCoverage
     QStringList missing;
     for (const auto& library : coverage) {
         if (library.complete) continue;
-        QString entry = DisplayFormat::from_utf8(library.name);
-        if (library.error) entry += tr(" (%1)").arg(DisplayFormat::error(*library.error));
-        missing << entry;
+        missing << (library.error ? tr("%1 (%2)").arg(DisplayFormat::from_utf8(library.name),
+                                                      DisplayFormat::error(*library.error))
+                                  : DisplayFormat::from_utf8(library.name));
     }
     emit coverageChanged(missing.isEmpty()
                              ? QString()
@@ -632,6 +821,10 @@ void SampleTableModel::set_pending(int delta) {
     pending_requests_ = std::max(0, pending_requests_ + delta);
     const bool loading = pending_requests_ > 0;
     if (was_loading != loading) emit loadingChanged(loading);
+}
+
+void SampleTableModel::reset_pending() {
+    set_pending(-pending_requests_);
 }
 
 }  // namespace mso::ui

@@ -1,9 +1,9 @@
-#include "mso/media/container_detect.hpp"
+#include "mso/media/detail/container_detect.hpp"
 
 #include <algorithm>
 
-#include "mso/media/id3.hpp"
-#include "mso/media/mpeg_audio_header.hpp"
+#include "mso/media/detail/id3.hpp"
+#include "mso/media/detail/mpeg_audio_header.hpp"
 
 namespace mso::media::detail {
 
@@ -16,6 +16,7 @@ constexpr std::uint8_t kWave64WaveGuid[16] = {0x77, 0x61, 0x76, 0x65, 0xF3, 0xAC
 constexpr std::uint8_t kAsfHeaderGuid[16] = {0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
                                              0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
 
+/// True when `head` holds the 16-byte GUID `expected` at `offset`.
 bool has_bytes(Bytes head, std::size_t offset, const std::uint8_t (&expected)[16]) {
     return head.size() >= offset + 16 && std::ranges::equal(head.subspan(offset, 16), expected);
 }

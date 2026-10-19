@@ -1,5 +1,7 @@
-// WavPack metadata probe (first block header).
-#include "mso/media/probe_formats.hpp"
+// WavPack metadata probe (first block header) and its trailing APEv2 tag.
+#include "mso/media/detail/ape_tag.hpp"
+#include "mso/media/detail/id3.hpp"
+#include "mso/media/detail/probe_formats.hpp"
 
 namespace mso::media::detail {
 
@@ -41,8 +43,21 @@ Result<void> probe_wavpack(BoundedFileReader& reader, ProbeResult& result) {
     result.float_samples = is_float;
     if (!(flags & kHybridFlag))
         result.bit_depth = is_float ? 32 : static_cast<std::int64_t>(((flags & kBytesPerSampleMask) + 1) * 8);
-    const bool total_unknown = total_samples_low == 0xFFFFFFFFu && total_samples_high == 0;
-    if (!total_unknown) result.frames = static_cast<std::int64_t>((total_samples_high << 32) | total_samples_low);
+    // WavPack 5 extends the 32-bit count with an 8-bit high part, defined (GET_TOTAL_SAMPLES in
+    // wavpack.h) as low + (high << 32) - high; a low part of all ones means "unknown".
+    if (total_samples_low != 0xFFFFFFFFu) {
+        result.frames = static_cast<std::int64_t>(total_samples_low + (total_samples_high << 32) - total_samples_high);
+    }
+
+    // Tags: APEv2 at the end of the file, possibly followed by an ID3v1 tag.
+    std::uint64_t tag_end = reader.file_size();
+    if (reader.file_size() > kBlockHeaderSize + kId3v1TagSize) {
+        auto tail = reader.read_within_budget(reader.file_size() - kId3v1TagSize, kId3v1TagSize);
+        if (!tail) return std::unexpected(tail.error());
+        if (has_magic(*tail, 0, "TAG")) tag_end -= kId3v1TagSize;
+    }
+    auto ape = read_ape_tag(reader, tag_end, result.tags);
+    if (!ape) return std::unexpected(ape.error());
     return {};
 }
 

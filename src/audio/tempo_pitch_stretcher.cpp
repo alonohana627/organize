@@ -1,12 +1,12 @@
-#include "mso/audio/tempo_pitch_stretcher.hpp"
+#include "mso/audio/detail/tempo_pitch_stretcher.hpp"
 
 #include <cmath>
 
 #include <signalsmith-stretch/signalsmith-stretch.h>
 
-#include "mso/audio/pcm_ring.hpp"
+#include "mso/audio/detail/pcm_ring.hpp"
 
-namespace mso::audio {
+namespace mso::audio::detail {
 namespace {
 
 /// Fixed seed: identical input and settings always give identical output (reproducible previews/tests).
@@ -15,20 +15,24 @@ constexpr long kStretchRandomSeed = 0x5EED;
 /// signalsmith reads and writes `buffer[channel][frame]`; this adapts interleaved stereo to that.
 template <class Sample>
 struct InterleavedStereo {
-    Sample* frames;
+    Sample* frames;  ///< first sample of the interleaved buffer
 
+    /// One channel of the buffer, indexed by frame.
     struct Channel {
-        Sample* frames;
-        int channel;
+        Sample* frames;  ///< first sample of the interleaved buffer
+        int channel;     ///< 0 = left, 1 = right
+        /// Sample of `frame` in this channel.
         Sample& operator[](int frame) const { return frames[frame * static_cast<int>(kOutputChannels) + channel]; }
     };
+    /// View of `channel`.
     Channel operator[](int channel) const { return Channel{frames, channel}; }
 };
 
 }  // namespace
 
+/// The signalsmith stretcher, seeded for reproducible output.
 struct TempoPitchStretcher::Engine {
-    signalsmith::stretch::SignalsmithStretch<float> stretch{kStretchRandomSeed};
+    signalsmith::stretch::SignalsmithStretch<float> stretch{kStretchRandomSeed};  ///< phase vocoder
 };
 
 TempoPitchStretcher::TempoPitchStretcher(std::uint32_t sample_rate)
@@ -55,4 +59,4 @@ void TempoPitchStretcher::process(std::span<const float> stereo_input, std::span
                              static_cast<int>(stereo_output.size() / kOutputChannels));
 }
 
-}  // namespace mso::audio
+}  // namespace mso::audio::detail

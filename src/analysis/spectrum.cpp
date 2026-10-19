@@ -6,14 +6,31 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <numbers>
 
 namespace mso::analysis {
 
+/// A reusable real-input FFT plan. pocketfft's convenience functions (r2c, c2r) build a fresh plan
+/// for every call unless POCKETFFT_CACHE_SIZE is set; holding the plan object directly computes the
+/// factorization and twiddle factors once per MagnitudeSpectrum. `pocketfft_r` lives in pocketfft's
+/// `detail` namespace but is the documented plan class those functions use themselves.
+class MagnitudeSpectrum::Plan {
+public:
+    explicit Plan(std::size_t length) : transform_(length) {}
+
+    /// In-place forward transform of `buffer` into FFTPACK half-complex order:
+    /// r0, r1, i1, r2, i2, ..., and for an even length the Nyquist real part last.
+    void forward(std::span<float> buffer) const { transform_.exec(buffer.data(), 1.0F, /*fwd=*/true); }
+
+private:
+    pocketfft::detail::pocketfft_r<float> transform_;
+};
+
 MagnitudeSpectrum::MagnitudeSpectrum(std::size_t frame_size)
-    : window_(std::max<std::size_t>(frame_size, 2)),
-      windowed_frame_(window_.size()),
-      spectrum_(window_.size() / 2 + 1),
+    : plan_(std::make_unique<Plan>(std::max<std::size_t>(frame_size, 2))),
+      window_(std::max<std::size_t>(frame_size, 2)),
+      transform_buffer_(window_.size()),
       magnitudes_(window_.size() / 2 + 1) {
     // Periodic Hann window: the standard choice for overlapped STFT analysis.
     const double length = static_cast<double>(window_.size());
@@ -26,20 +43,32 @@ MagnitudeSpectrum::MagnitudeSpectrum(std::size_t frame_size)
     normalization_ = static_cast<float>(2.0 / window_sum);
 }
 
+MagnitudeSpectrum::~MagnitudeSpectrum() = default;
+MagnitudeSpectrum::MagnitudeSpectrum(MagnitudeSpectrum&&) noexcept = default;
+MagnitudeSpectrum& MagnitudeSpectrum::operator=(MagnitudeSpectrum&&) noexcept = default;
+
 std::span<const float> MagnitudeSpectrum::compute(std::span<const float> frame) {
-    const std::size_t count = std::min(frame.size(), window_.size());
-    for (std::size_t index = 0; index < count; ++index)
-        windowed_frame_[index] = frame[index] * window_[index];
-    std::fill(windowed_frame_.begin() + static_cast<std::ptrdiff_t>(count), windowed_frame_.end(), 0.0F);
+    return compute(frame, {});
+}
 
-    const pocketfft::shape_t shape{windowed_frame_.size()};
-    const pocketfft::stride_t input_stride{sizeof(float)};
-    const pocketfft::stride_t output_stride{sizeof(std::complex<float>)};
-    pocketfft::r2c(shape, input_stride, output_stride, 0, pocketfft::FORWARD, windowed_frame_.data(), spectrum_.data(),
-                   1.0F);
+std::span<const float> MagnitudeSpectrum::compute(std::span<const float> head, std::span<const float> tail) {
+    const std::size_t length = window_.size();
+    const std::size_t head_count = std::min(head.size(), length);
+    const std::size_t tail_count = std::min(tail.size(), length - head_count);
+    for (std::size_t index = 0; index < head_count; ++index)
+        transform_buffer_[index] = head[index] * window_[index];
+    for (std::size_t index = 0; index < tail_count; ++index)
+        transform_buffer_[head_count + index] = tail[index] * window_[head_count + index];
+    std::fill(transform_buffer_.begin() + static_cast<std::ptrdiff_t>(head_count + tail_count), transform_buffer_.end(),
+              0.0F);
 
-    for (std::size_t bin = 0; bin < spectrum_.size(); ++bin)
-        magnitudes_[bin] = std::abs(spectrum_[bin]) * normalization_;
+    plan_->forward(transform_buffer_);
+
+    // Unpack the half-complex layout: bin k > 0 is (r_k, i_k) at positions 2k-1 and 2k.
+    magnitudes_[0] = std::abs(transform_buffer_[0]) * normalization_;
+    for (std::size_t bin = 1; 2 * bin < length; ++bin)
+        magnitudes_[bin] = std::hypot(transform_buffer_[2 * bin - 1], transform_buffer_[2 * bin]) * normalization_;
+    if (length % 2 == 0) magnitudes_[length / 2] = std::abs(transform_buffer_[length - 1]) * normalization_;
     return magnitudes_;
 }
 

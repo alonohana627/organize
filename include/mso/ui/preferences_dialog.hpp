@@ -23,14 +23,18 @@ class PreferencesDialog final : public QDialog {
 public:
     PreferencesDialog(const ShortcutBindings& bindings, bool audition_on_selection, QWidget* parent = nullptr);
 
+    /// Bindings as edited.
     ShortcutBindings bindings() const;
+    /// The audition-on-selection choice.
     bool audition_on_selection() const;
 
 private:
     /// Highlights conflicting rows and enables OK only without conflicts.
     void check_conflicts();
+    /// Shows `bindings` in the editors.
     void load_bindings(const ShortcutBindings& bindings);
 
+    /// Widgets (owned through Qt's parent tree).
     QCheckBox* audition_check_ = nullptr;
     QTableWidget* shortcut_table_ = nullptr;
     std::vector<QKeySequenceEdit*> sequence_edits_;  ///< parallel to ShortcutCatalog::definitions()

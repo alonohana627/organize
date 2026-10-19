@@ -2,11 +2,12 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <limits>
 
 #include "mso/domain/core.hpp"
-#include "mso/media/probe_formats.hpp"
-#include "mso/media/tag_mapping.hpp"
-#include "mso/media/text_decoding.hpp"
+#include "mso/media/detail/probe_formats.hpp"
+#include "mso/media/detail/tag_mapping.hpp"
+#include "mso/media/detail/text_decoding.hpp"
 
 namespace mso::media::detail {
 
@@ -29,6 +30,7 @@ struct AudioDescription {
     std::uint32_t bits_per_channel = 0;
 };
 
+/// Decodes and validates a "desc" chunk payload.
 Result<AudioDescription> parse_description(Bytes payload) {
     ByteCursor cursor(payload);
     AudioDescription description;
@@ -54,6 +56,7 @@ std::optional<std::int64_t> alac_bit_depth(std::uint32_t format_flags) {
     return kDepths[format_flags - 1];
 }
 
+/// Records layout, codec and bit depth from the "desc" chunk.
 Result<void> apply_description(const AudioDescription& description, ProbeResult& result) {
     if (auto layout = set_stream_layout(result, description.channels, std::llround(description.sample_rate)); !layout) {
         return layout;
@@ -135,8 +138,8 @@ Result<void> probe_caf(BoundedFileReader& reader, ProbeResult& result) {
             const std::uint64_t frames = table.u64_be();
             if (frames <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) valid_frames = frames;
         } else if (type == "info") {
-            auto payload = reader.read_available(payload_offset,
-                                                 static_cast<std::size_t>(std::min<std::uint64_t>(size, kMaxTagBytes)));
+            auto payload = reader.read_available(
+                payload_offset, static_cast<std::size_t>(std::min<std::uint64_t>(size, kMaxTextItemBytes)));
             if (!payload) return std::unexpected(payload.error());
             parse_information(*payload, result.tags);
         }

@@ -23,6 +23,7 @@ public:
     /// Adds interleaved samples of any channel count.
     void add(std::span<const float> samples) noexcept;
 
+    /// Peak and RMS of everything added so far (silence for no samples).
     LoudnessResult result() const noexcept;
 
 private:

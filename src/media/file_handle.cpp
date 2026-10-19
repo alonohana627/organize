@@ -1,12 +1,17 @@
-#include "mso/media/file_handle.hpp"
+#include "mso/media/detail/file_handle.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <limits>
 #include <system_error>
 #include <utility>
 
+#include "mso/media/detail/native_file_support.hpp"
+
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -17,73 +22,44 @@
 
 namespace mso::media::detail {
 
+#ifdef _WIN32
+
 namespace {
 
 /// Directories cannot be opened as files; report them as "not audio" rather than access denied.
 bool path_is_directory(const std::filesystem::path& file) {
     std::error_code ignored;
-    return std::filesystem::is_directory(file, ignored);
-}
-
-}  // namespace
-
-#ifdef _WIN32
-
-namespace {
-
-/// Maps a CreateFileW failure to the media error taxonomy.
-Error open_error(DWORD win32_error, const std::filesystem::path& file) {
-    switch (win32_error) {
-        case ERROR_FILE_NOT_FOUND:
-        case ERROR_PATH_NOT_FOUND:
-        case ERROR_INVALID_NAME:
-        case ERROR_INVALID_DRIVE:
-        case ERROR_BAD_NETPATH:
-        case ERROR_BAD_NET_NAME:
-            return fail(ErrorCode::FileMissing, "file does not exist").error();
-        case ERROR_SHARING_VIOLATION:
-        case ERROR_LOCK_VIOLATION:
-            return fail(ErrorCode::AccessDenied, "file is locked by another process", true).error();
-        case ERROR_ACCESS_DENIED:
-            if (path_is_directory(file)) return fail(ErrorCode::UnsupportedCodec, "path is a directory").error();
-            return fail(ErrorCode::AccessDenied, "access to the file was denied").error();
-        default:
-            return fail(ErrorCode::AccessDenied, std::format("cannot open file (Win32 error {})", win32_error)).error();
-    }
+    return std::filesystem::is_directory(native_path(file), ignored);
 }
 
 }  // namespace
 
 Result<FileHandle> FileHandle::open_for_read(const std::filesystem::path& file) {
-    HANDLE handle = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) return std::unexpected(open_error(GetLastError(), file));
-    return FileHandle(handle);
-}
-
-void FileHandle::close() noexcept {
-    if (native_handle_ != nullptr) CloseHandle(native_handle_);
-    native_handle_ = nullptr;
-}
-
-FileHandle::FileHandle(FileHandle&& other) noexcept : native_handle_(std::exchange(other.native_handle_, nullptr)) {}
-
-FileHandle& FileHandle::operator=(FileHandle&& other) noexcept {
-    if (this != &other) {
-        close();
-        native_handle_ = std::exchange(other.native_handle_, nullptr);
+    UniqueWin32Handle handle(CreateFileW(native_path(file).c_str(), GENERIC_READ,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                         FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!handle.valid()) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_ACCESS_DENIED && path_is_directory(file)) {
+            return fail(ErrorCode::UnsupportedCodec, "path is a directory");
+        }
+        return std::unexpected(error_from_win32(error, "opening the file"));
     }
-    return *this;
+    // Pipes and character devices (\\.\pipe\..., CON) open fine but are not files to probe.
+    if (GetFileType(handle.get()) != FILE_TYPE_DISK) return fail(ErrorCode::UnsupportedCodec, "not a regular file");
+    return FileHandle(std::move(handle));
 }
 
-FileHandle::~FileHandle() {
-    close();
-}
+FileHandle::FileHandle(FileHandle&& other) noexcept = default;
+
+FileHandle& FileHandle::operator=(FileHandle&& other) noexcept = default;
+
+FileHandle::~FileHandle() = default;
 
 Result<std::uint64_t> FileHandle::size() const {
     LARGE_INTEGER length{};
-    if (!GetFileSizeEx(native_handle_, &length)) {
-        return fail(ErrorCode::AccessDenied, std::format("cannot read file size (Win32 error {})", GetLastError()));
+    if (!GetFileSizeEx(handle_.get(), &length)) {
+        return std::unexpected(error_from_win32(GetLastError(), "reading the file size"));
     }
     return static_cast<std::uint64_t>(length.QuadPart);
 }
@@ -98,7 +74,7 @@ Result<std::size_t> FileHandle::read_at(std::uint64_t offset, std::span<std::uin
         const auto request = static_cast<DWORD>(
             std::min<std::size_t>(destination.size() - total, std::numeric_limits<DWORD>::max() / 2));
         DWORD received = 0;
-        if (!ReadFile(native_handle_, destination.data() + total, request, &received, &overlapped)) {
+        if (!ReadFile(handle_.get(), destination.data() + total, request, &received, &overlapped)) {
             const DWORD error = GetLastError();
             if (error == ERROR_HANDLE_EOF) break;
             return fail(ErrorCode::AccessDenied, std::format("read failed (Win32 error {})", error), true);
@@ -109,19 +85,43 @@ Result<std::size_t> FileHandle::read_at(std::uint64_t offset, std::span<std::uin
     return total;
 }
 
+Result<std::FILE*> FileHandle::release_to_stdio() {
+    void* const native = handle_.release();
+    if (native == nullptr) return fail(ErrorCode::Internal, "file handle is empty");
+    const int descriptor = _open_osfhandle(reinterpret_cast<std::intptr_t>(native), _O_RDONLY | _O_BINARY);
+    if (descriptor < 0) {
+        CloseHandle(native);  // not adopted by the C runtime, so still ours to close
+        return fail(ErrorCode::ResourceLimit, "cannot wrap the file handle in a C runtime descriptor");
+    }
+    std::FILE* stream = _fdopen(descriptor, "rb");
+    if (stream == nullptr) {
+        _close(descriptor);  // also closes the Win32 handle
+        return fail(ErrorCode::ResourceLimit, "cannot open a C stdio stream over the file");
+    }
+    std::rewind(stream);  // positional reads moved the shared file pointer
+    return stream;
+}
+
 #else
 
 Result<FileHandle> FileHandle::open_for_read(const std::filesystem::path& file) {
-    const int descriptor = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+    // O_NONBLOCK: opening a FIFO for reading would otherwise wait forever for a writer. It is
+    // cleared again once fstat() shows a regular file (checked on the descriptor, not the path).
+    const int descriptor = ::open(file.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
     if (descriptor < 0) {
-        if (errno == ENOENT || errno == ENOTDIR) return fail(ErrorCode::FileMissing, "file does not exist");
-        return fail(ErrorCode::AccessDenied, std::format("cannot open file (errno {})", errno));
+        if (errno == EISDIR) return fail(ErrorCode::UnsupportedCodec, "path is a directory");
+        return std::unexpected(error_from_errno(errno, "opening the file"));
     }
-    if (path_is_directory(file)) {
-        ::close(descriptor);
-        return fail(ErrorCode::UnsupportedCodec, "path is a directory");
+    FileHandle handle(descriptor);
+    struct stat status{};
+    if (::fstat(descriptor, &status) != 0) return std::unexpected(error_from_errno(errno, "inspecting the file"));
+    if (S_ISDIR(status.st_mode)) return fail(ErrorCode::UnsupportedCodec, "path is a directory");
+    if (!S_ISREG(status.st_mode)) return fail(ErrorCode::UnsupportedCodec, "not a regular file");
+    const int flags = ::fcntl(descriptor, F_GETFL);
+    if (flags < 0 || ::fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+        return std::unexpected(error_from_errno(errno, "configuring the file"));
     }
-    return FileHandle(descriptor);
+    return handle;
 }
 
 void FileHandle::close() noexcept {
@@ -145,7 +145,7 @@ FileHandle::~FileHandle() {
 
 Result<std::uint64_t> FileHandle::size() const {
     struct stat status{};
-    if (::fstat(descriptor_, &status) != 0) return fail(ErrorCode::AccessDenied, "cannot read file size");
+    if (::fstat(descriptor_, &status) != 0) return std::unexpected(error_from_errno(errno, "reading the file size"));
     return static_cast<std::uint64_t>(status.st_size);
 }
 
@@ -162,6 +162,18 @@ Result<std::size_t> FileHandle::read_at(std::uint64_t offset, std::span<std::uin
         total += static_cast<std::size_t>(received);
     }
     return total;
+}
+
+Result<std::FILE*> FileHandle::release_to_stdio() {
+    const int descriptor = std::exchange(descriptor_, -1);
+    if (descriptor < 0) return fail(ErrorCode::Internal, "file handle is empty");
+    std::FILE* stream = ::fdopen(descriptor, "rb");
+    if (stream == nullptr) {
+        ::close(descriptor);  // fdopen did not adopt it
+        return fail(ErrorCode::ResourceLimit, "cannot open a C stdio stream over the file");
+    }
+    std::rewind(stream);
+    return stream;
 }
 
 #endif

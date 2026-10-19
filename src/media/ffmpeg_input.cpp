@@ -1,7 +1,9 @@
+// Locked-down FFmpeg demuxer input over a byte callback (only built with MSO_HAVE_FFMPEG).
 #ifdef MSO_HAVE_FFMPEG
 
-#include "mso/media/ffmpeg_input.hpp"
+#include "mso/media/detail/ffmpeg_input.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <format>
 #include <limits>
@@ -34,6 +36,7 @@ int refuse_nested_open(AVFormatContext* /*context*/, AVIOContext** /*io*/, const
 
 }  // namespace
 
+/// Text for an FFmpeg error code (av_strerror).
 std::string ffmpeg_error_text(int status) {
     char text[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(status, text, sizeof(text));
@@ -109,7 +112,19 @@ Result<std::unique_ptr<FfmpegInput>> FfmpegInput::open(ReadAtFunction read_at, s
         return fail(ErrorCode::CorruptAudio,
                     std::format("FFmpeg could not open the file: {}", ffmpeg_error_text(status)));
     }
+    // A demuxer may succeed on a header cut short by a failing callback; that is not a complete read.
+    if (input->read_error_) return std::unexpected(*input->read_error_);
     return input;
+}
+
+Result<void> FfmpegInput::find_stream_info() {
+    const int status = avformat_find_stream_info(format_, nullptr);
+    if (read_error_) return std::unexpected(*read_error_);
+    if (status < 0) {
+        return fail(ErrorCode::CorruptAudio,
+                    std::format("FFmpeg could not analyse the streams: {}", ffmpeg_error_text(status)));
+    }
+    return {};
 }
 
 FfmpegInput::~FfmpegInput() {

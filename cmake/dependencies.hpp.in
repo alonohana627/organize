@@ -1,0 +1,30 @@
+#pragma once
+/// @file
+/// Third-party notices for the About box and `mso --version`. GENERATED at configure time by
+/// cmake/DependencyNotices.cmake from deps/manifest.json; do not edit (edit the manifest instead).
+#include <string_view>
+
+namespace mso::generated {
+
+/// One third-party component that ships with (or is linked into) this build.
+struct DependencyNotice {
+    std::string_view name;          ///< component name as listed in deps/manifest.json
+    std::string_view version;       ///< pinned version (vendored) or the version found at configure time (system)
+    std::string_view license;       ///< SPDX-style license summary
+    std::string_view purpose;       ///< what the application uses it for
+    std::string_view url;           ///< project home page
+    std::string_view license_text;  ///< full license/copyright notice to display; empty for public domain and system libraries
+    bool system_library = false;    ///< true for libraries found on the system (Qt, FFmpeg) instead of vendored in deps/
+};
+
+/// Every vendored dependency in manifest order, then the system libraries this build links.
+inline constexpr DependencyNotice kDependencies[] = {
+@MSO_DEPENDENCY_ENTRIES@};
+
+/// The application version (CMake project version).
+inline constexpr std::string_view kProjectVersion = "@MSO_PROJECT_VERSION@";
+
+/// The application's own license.
+inline constexpr std::string_view kProjectLicense = "GPL-3.0";
+
+}  // namespace mso::generated

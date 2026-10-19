@@ -1,20 +1,57 @@
-# Builds and tests on Windows (MSYS2 CLANG64: clang + libc++) and Linux (LLVM clang + libc++).
-# Dependencies under deps/ are vendored; Qt 6 and FFmpeg come from the system package manager.
+# Builds and tests on Windows (MSYS2 CLANG64: clang + libc++) and Linux (LLVM clang + libc++), plus a
+# Linux Debug + AddressSanitizer/UndefinedBehaviorSanitizer run and a lint job. Dependencies under
+# deps/ are vendored and verified offline; Qt 6 and FFmpeg come from the system (on Linux, Qt is built
+# from source with libc++ and cached: .github/scripts/build-qt-libcxx.sh explains why).
+#
+# Every build uses the ci / ci-sanitize presets (MSO_REQUIRE_GUI and MSO_REQUIRE_FFMPEG ON), so a
+# missing Qt or FFmpeg fails the job instead of silently skipping the desktop app or the FFmpeg tests.
+# Actions are pinned by commit SHA (the release tag is in the trailing comment).
 name: ci
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: "23"
+  QT_VERSION: "6.11.2"
+  CLANG_FORMAT_VERSION: "23.1.3"
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CCACHE_MAXSIZE: 500M
+
 jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify vendored dependencies (pins, post-patch digests, stray files)
+        run: python3 deps/update_deps.py --check
+      - name: Check formatting (clang-format pinned to the Windows toolchain's version)
+        run: |
+          python3 -m pip install --user "clang-format==${CLANG_FORMAT_VERSION}"
+          git ls-files -z -- 'include/*.hpp' 'src/*.cpp' 'tests/*.cpp' 'tests/*.hpp' \
+            | xargs -0 "$HOME/.local/bin/clang-format" --dry-run -Werror
+
   windows:
     runs-on: windows-latest
+    timeout-minutes: 90
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # MSYS2 is a rolling distribution whose packages cannot be pinned; the next step prints the
+      # versions used. A toolchain bump that adds warnings fails here as it would on a developer PC.
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: CLANG64
           update: true
@@ -23,32 +60,94 @@ jobs:
             mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-ninja
             mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-ccache
             mingw-w64-clang-x86_64-qt6-base
             mingw-w64-clang-x86_64-ffmpeg
-      - name: Verify vendored dependencies
-        run: python3 deps/update_deps.py --check || python deps/update_deps.py --check
+      - name: Toolchain versions
+        run: clang++ --version && cmake --version && python --version && ffmpeg -hide_banner -version | head -1
+      - name: Restore compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-windows-${{ github.sha }}
+          restore-keys: ccache-windows-
       - name: Configure
-        run: cmake --preset release
+        run: CCACHE_DIR="$PWD/.ccache" cmake --preset ci
       - name: Build
-        run: cmake --build --preset release
+        run: CCACHE_DIR="$PWD/.ccache" cmake --build --preset ci
       - name: Test
-        run: ctest --preset release
+        run: ctest --preset ci
+      - name: Install
+        run: cmake --install build/ci --prefix "$PWD/install"
+      # The installed application must start with no MSYS2 directory on PATH (the double-click case).
+      - name: Smoke-test the installed application without MSYS2 on PATH
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $env:MSO_AUDIO_BACKEND = "null"
+          $gui = Start-Process -FilePath install\bin\MusicSampleOrganizer.exe `
+                   -ArgumentList "--exit-when-ready", "--workspace", "$env:RUNNER_TEMP\mso-workspace" -Wait -PassThru
+          if ($gui.ExitCode -ne 0) { throw "MusicSampleOrganizer.exe exited with $($gui.ExitCode)" }
+          & install\bin\mso.exe capabilities
+          if ($LASTEXITCODE -ne 0) { throw "mso.exe exited with $LASTEXITCODE" }
+
+  qt-linux:
+    # Qt built with clang + libc++, cached per Qt version, LLVM version and build script.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore Qt
+        id: qt-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/qt-libcxx
+          key: qt-${{ env.QT_VERSION }}-llvm${{ env.LLVM_VERSION }}-${{ hashFiles('.github/scripts/build-qt-libcxx.sh', '.github/scripts/install-llvm.sh') }}
+      - name: Install LLVM and the Qt build dependencies
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          bash .github/scripts/install-llvm.sh "$LLVM_VERSION"
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config \
+            libfontconfig1-dev libfreetype-dev libxkbcommon-dev
+      - name: Build Qt
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: bash .github/scripts/build-qt-libcxx.sh "$HOME/qt-libcxx"
 
   linux:
+    needs: qt-linux
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [ci, ci-sanitize]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchain and system libraries
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install LLVM (pinned apt repository) and system libraries
         run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y libc++-20-dev libc++abi-20-dev cmake ninja-build pkg-config \
-            qt6-base-dev libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
-            libpulse-dev libasound2-dev ffmpeg
-      - name: Verify vendored dependencies
-        run: python3 deps/update_deps.py --check
+          bash .github/scripts/install-llvm.sh "$LLVM_VERSION"
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config ccache ffmpeg \
+            libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libpulse-dev libasound2-dev \
+            libfontconfig1-dev libfreetype-dev libxkbcommon-dev
+      - name: Restore Qt
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/qt-libcxx
+          key: qt-${{ env.QT_VERSION }}-llvm${{ env.LLVM_VERSION }}-${{ hashFiles('.github/scripts/build-qt-libcxx.sh', '.github/scripts/install-llvm.sh') }}
+          fail-on-cache-miss: true
+      - name: Restore compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.ccache
+          key: ccache-linux-${{ matrix.preset }}-${{ github.sha }}
+          restore-keys: ccache-linux-${{ matrix.preset }}-
       - name: Configure
-        run: cmake --preset release -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20
+        run: |
+          CCACHE_DIR="$HOME/.ccache" cmake --preset ${{ matrix.preset }} \
+            -DCMAKE_C_COMPILER=clang-$LLVM_VERSION -DCMAKE_CXX_COMPILER=clang++-$LLVM_VERSION \
+            -DCMAKE_PREFIX_PATH="$HOME/qt-libcxx"
       - name: Build
-        run: cmake --build --preset release
+        run: CCACHE_DIR="$HOME/.ccache" cmake --build --preset ${{ matrix.preset }}
       - name: Test
-        run: QT_QPA_PLATFORM=offscreen ctest --preset release
+        run: ctest --preset ${{ matrix.preset }}

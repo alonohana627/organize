@@ -41,10 +41,11 @@ enum NodeKind {
 
 enum ItemRole {
     KindRole = Qt::UserRole + 1,
-    LibraryRole,  ///< QString UUID
-    IdRole,       ///< qlonglong: tag/category/collection/folder id
-    RootRole,     ///< qlonglong root id (roots and folders)
-    PathRole,     ///< QString: folder relative path, or tag/category display path
+    LibraryRole,   ///< QString UUID
+    IdRole,        ///< qlonglong: tag/category/collection/folder id
+    RootRole,      ///< qlonglong root id (roots and folders)
+    PathRole,      ///< QString: folder relative path, or tag/category display path
+    RootNameRole,  ///< QString: a root's name without the availability suffix
 };
 
 int kind_of(const QTreeWidgetItem* item) {
@@ -58,11 +59,17 @@ QTreeWidgetItem* make_item(QTreeWidgetItem* parent, const QString& text, int kin
     return item;
 }
 
-QString root_text(const catalog::RootRecord& root) {
-    QString text = DisplayFormat::from_utf8(root.name);
-    if (root.availability != catalog::Availability::Online)
-        text += NavigatorPanel::tr(" — %1").arg(DisplayFormat::root_availability(root.availability));
-    return text;
+/// Root label: its name, plus its availability when it is not online.
+QString root_text(const QString& name, catalog::Availability availability) {
+    if (availability == catalog::Availability::Online) return name;
+    return NavigatorPanel::tr("%1 — %2").arg(name, DisplayFormat::root_availability(availability));
+}
+
+/// True when `candidate` is `ancestor` or lies below it.
+bool is_same_or_descendant(const QTreeWidgetItem* candidate, const QTreeWidgetItem* ancestor) {
+    for (const QTreeWidgetItem* node = candidate; node; node = node->parent())
+        if (node == ancestor) return true;
+    return false;
 }
 
 }  // namespace
@@ -88,6 +95,39 @@ NavigatorPanel::NavigatorPanel(ApplicationSession& session, QWidget* parent) : Q
     connect(tree_, &QTreeWidget::customContextMenuRequested, this, &NavigatorPanel::show_context_menu);
 }
 
+NavigatorPanel::LibraryOutline NavigatorPanel::read_outline(app::Application& application,
+                                                            const app::OpenLibraryInfo& info) {
+    LibraryOutline outline;
+    outline.library = info.uuid;
+    outline.name = DisplayFormat::from_utf8(info.name);
+    outline.read_only = info.read_only;
+    auto read = application.with_library(info.uuid, [&outline](catalog::Library& library) -> Result<void> {
+        auto roots = library.list_roots();
+        if (!roots) return std::unexpected(roots.error());
+        // The whole folder tree is read here, so expanding a root or folder never waits.
+        for (const auto& root : *roots) {
+            auto folders = library.list_folders(root.id);
+            if (folders)
+                outline.folders.emplace(root.id, std::move(*folders));
+            else
+                outline.error = DisplayFormat::error(folders.error());
+        }
+        outline.roots = std::move(*roots);
+        auto tags = library.list_tags();
+        auto categories = library.list_categories();
+        auto collections = library.list_collections();
+        if (tags) outline.tags = std::move(*tags);
+        if (categories) outline.categories = std::move(*categories);
+        if (collections) outline.collections = std::move(*collections);
+        for (const Error* error : {tags ? nullptr : &tags.error(), categories ? nullptr : &categories.error(),
+                                   collections ? nullptr : &collections.error()})
+            if (error) outline.error = DisplayFormat::error(*error);
+        return {};
+    });
+    if (!read) outline.error = DisplayFormat::error(read.error());
+    return outline;
+}
+
 void NavigatorPanel::reload() {
     if (!session_.is_ready()) return;
     const std::uint64_t generation = ++reload_generation_;
@@ -95,42 +135,29 @@ void NavigatorPanel::reload() {
         this,
         [](app::Application& application) {
             std::vector<LibraryOutline> outlines;
-            for (const auto& info : application.libraries()) {
-                LibraryOutline outline;
-                outline.library = info.uuid;
-                outline.name = DisplayFormat::from_utf8(info.name);
-                outline.read_only = info.read_only;
-                catalog::Library* library = application.library(info.uuid);
-                if (!library) continue;
-                auto roots = library->list_roots();
-                // The whole folder tree is read here, so expanding a root or folder never waits.
-                if (roots) {
-                    for (const auto& root : *roots) {
-                        auto folders = library->list_folders(root.id);
-                        if (folders)
-                            outline.folders.emplace(root.id, std::move(*folders));
-                        else
-                            outline.error = DisplayFormat::error(folders.error());
-                    }
-                }
-                auto tags = library->list_tags();
-                auto categories = library->list_categories();
-                auto collections = library->list_collections();
-                if (roots) outline.roots = std::move(*roots);
-                if (tags) outline.tags = std::move(*tags);
-                if (categories) outline.categories = std::move(*categories);
-                if (collections) outline.collections = std::move(*collections);
-                for (const Error* error :
-                     {roots ? nullptr : &roots.error(), tags ? nullptr : &tags.error(),
-                      categories ? nullptr : &categories.error(), collections ? nullptr : &collections.error()})
-                    if (error) outline.error = DisplayFormat::error(*error);
-                outlines.push_back(std::move(outline));
-            }
+            for (const auto& info : application.libraries())
+                outlines.push_back(read_outline(application, info));
             return outlines;
         },
         [this, generation](std::vector<LibraryOutline> outlines) {
             if (generation != reload_generation_) return;
             populate(outlines);
+        });
+}
+
+void NavigatorPanel::reload_library(const uuids::uuid& library) {
+    if (!session_.is_ready()) return;
+    const std::uint64_t generation = reload_generation_;  // a full reload supersedes this one
+    session_.run(
+        this,
+        [library](app::Application& application) -> std::optional<LibraryOutline> {
+            for (const auto& info : application.libraries())
+                if (info.uuid == library) return read_outline(application, info);
+            return std::nullopt;
+        },
+        [this, generation](std::optional<LibraryOutline> outline) {
+            if (generation != reload_generation_ || !outline) return;
+            replace_library(*outline);
         });
 }
 
@@ -145,48 +172,74 @@ void NavigatorPanel::populate(const std::vector<LibraryOutline>& outlines) {
     auto* all = new QTreeWidgetItem(tree_, QStringList{tr("All libraries")});
     all->setData(0, KindRole, AllLibrariesNode);
     for (const LibraryOutline& outline : outlines) {
-        QString name = outline.name;
-        if (outline.read_only) name += tr(" (read-only)");
-        auto* library_item = new QTreeWidgetItem(tree_, QStringList{name});
-        library_item->setData(0, KindRole, LibraryNode);
-        library_item->setData(0, LibraryRole, DisplayFormat::from_uuid(outline.library));
-        if (!outline.error.isEmpty()) library_item->setToolTip(0, tr("Partly unreadable: %1").arg(outline.error));
-
-        auto* roots_group = make_item(library_item, tr("Folders"), RootsGroupNode, outline.library);
-        for (const auto& root : outline.roots) {
-            auto* root_item = make_item(roots_group, root_text(root), RootNode, outline.library);
-            root_item->setData(0, RootRole, static_cast<qlonglong>(root.id));
-            root_item->setData(0, PathRole, QString());
-            root_item->setToolTip(0, tr("%1 samples").arg(DisplayFormat::count(root.sample_count)));
-            if (const auto folders = outline.folders.find(root.id); folders != outline.folders.end())
-                add_folders(root_item, outline.library, root.id, folders->second);
-        }
-        add_taxonomy(make_item(library_item, tr("Tags"), TagsGroupNode, outline.library), outline, outline.tags,
-                     TagNode);
-        auto* categories_group = make_item(library_item, tr("Categories"), CategoriesGroupNode, outline.library);
-        add_taxonomy(categories_group, outline, outline.categories, CategoryNode);
-        make_item(categories_group, tr("Uncategorized"), UncategorizedNode, outline.library);
-
-        auto* collections_group = make_item(library_item, tr("Collections"), CollectionsGroupNode, outline.library);
-        for (const auto& collection : outline.collections) {
-            const QString text = collection.smart ? tr("%1 (smart)").arg(DisplayFormat::from_utf8(collection.name))
-                                                  : tr("%1 (%2)").arg(DisplayFormat::from_utf8(collection.name),
-                                                                      DisplayFormat::count(collection.sample_count));
-            auto* item = make_item(collections_group, text, CollectionNode, outline.library);
-            item->setData(0, IdRole, static_cast<qlonglong>(collection.id));
-            item->setData(0, PathRole, DisplayFormat::from_utf8(collection.name));
-            if (collection.query) item->setToolTip(0, tr("Query: %1").arg(DisplayFormat::from_utf8(*collection.query)));
-        }
+        auto* library_item = new QTreeWidgetItem(tree_);
+        fill_library(library_item, outline);
         if (expanded_.empty()) library_item->setExpanded(true);  // first run: show the library's groups
     }
+    restore_tree_state(previous_identity, scroll_position, all);
+}
 
+void NavigatorPanel::replace_library(const LibraryOutline& outline) {
+    QTreeWidgetItem* library_item = nullptr;
+    for (int index = 0; index < tree_->topLevelItemCount() && !library_item; ++index) {
+        QTreeWidgetItem* candidate = tree_->topLevelItem(index);
+        if (kind_of(candidate) == LibraryNode &&
+            candidate->data(0, LibraryRole).toString() == DisplayFormat::from_uuid(outline.library))
+            library_item = candidate;
+    }
+    if (!library_item) return;  // closed meanwhile; the library list change reloads everything
+    populating_ = true;
+    const QString previous_identity = current_identity_;
+    const int scroll_position = tree_->verticalScrollBar()->value();
+    tree_->setUpdatesEnabled(false);
+    qDeleteAll(library_item->takeChildren());
+    fill_library(library_item, outline);
+    restore_tree_state(previous_identity, scroll_position, tree_->topLevelItem(0));
+}
+
+void NavigatorPanel::fill_library(QTreeWidgetItem* library_item, const LibraryOutline& outline) {
+    library_item->setText(0, outline.read_only ? tr("%1 (read-only)").arg(outline.name) : outline.name);
+    library_item->setData(0, KindRole, LibraryNode);
+    library_item->setData(0, LibraryRole, DisplayFormat::from_uuid(outline.library));
+    library_item->setToolTip(0, outline.error.isEmpty() ? QString() : tr("Partly unreadable: %1").arg(outline.error));
+
+    auto* roots_group = make_item(library_item, tr("Folders"), RootsGroupNode, outline.library);
+    for (const auto& root : outline.roots) {
+        auto* root_item = make_item(roots_group, root_text(DisplayFormat::from_utf8(root.name), root.availability),
+                                    RootNode, outline.library);
+        root_item->setData(0, RootRole, static_cast<qlonglong>(root.id));
+        root_item->setData(0, RootNameRole, DisplayFormat::from_utf8(root.name));
+        root_item->setData(0, PathRole, QString());
+        root_item->setToolTip(0, tr("%n sample(s)", nullptr, static_cast<int>(root.sample_count)));
+        if (const auto folders = outline.folders.find(root.id); folders != outline.folders.end())
+            add_folders(root_item, outline.library, root.id, folders->second);
+    }
+    add_taxonomy(make_item(library_item, tr("Tags"), TagsGroupNode, outline.library), outline, outline.tags, TagNode);
+    auto* categories_group = make_item(library_item, tr("Categories"), CategoriesGroupNode, outline.library);
+    add_taxonomy(categories_group, outline, outline.categories, CategoryNode);
+    make_item(categories_group, tr("Uncategorized"), UncategorizedNode, outline.library);
+
+    auto* collections_group = make_item(library_item, tr("Collections"), CollectionsGroupNode, outline.library);
+    for (const auto& collection : outline.collections) {
+        const QString name = DisplayFormat::from_utf8(collection.name);
+        const QString text = collection.smart ? tr("%1 (smart)").arg(name)
+                                              : tr("%1 (%2)").arg(name, DisplayFormat::count(collection.sample_count));
+        auto* item = make_item(collections_group, text, CollectionNode, outline.library);
+        item->setData(0, IdRole, static_cast<qlonglong>(collection.id));
+        item->setData(0, PathRole, name);
+        if (collection.query) item->setToolTip(0, tr("Query: %1").arg(DisplayFormat::from_utf8(*collection.query)));
+    }
+}
+
+void NavigatorPanel::restore_tree_state(const QString& previous_identity, int scroll_position,
+                                        QTreeWidgetItem* fallback) {
     QTreeWidgetItem* restored_current = nullptr;
     for (QTreeWidgetItemIterator iterator(tree_); *iterator; ++iterator) {
         const QString identity = identity_of(*iterator);
         if (expanded_.contains(identity)) (*iterator)->setExpanded(true);
         if (identity == previous_identity) restored_current = *iterator;
     }
-    tree_->setCurrentItem(restored_current ? restored_current : all);
+    tree_->setCurrentItem(restored_current ? restored_current : fallback);
     tree_->verticalScrollBar()->setValue(scroll_position);
     tree_->setUpdatesEnabled(true);
     populating_ = false;
@@ -245,9 +298,8 @@ void NavigatorPanel::show_folder_in_file_manager(const uuids::uuid& library, std
         this,
         [library, root_id, relative = DisplayFormat::to_utf8(relative_path)](
             app::Application& application) -> Result<std::filesystem::path> {
-            catalog::Library* opened = application.library(library);
-            if (!opened) return fail(ErrorCode::NotFound, "the library is no longer open");
-            auto roots = opened->list_roots();
+            auto roots =
+                application.with_library(library, [](catalog::Library& opened) { return opened.list_roots(); });
             if (!roots) return std::unexpected(roots.error());
             for (const auto& root : *roots) {
                 if (root.id != root_id) continue;
@@ -292,10 +344,7 @@ void NavigatorPanel::set_root_availability(const uuids::uuid& library, std::int6
         if (kind_of(item) != RootNode || item->data(0, LibraryRole).toString() != library_text ||
             item->data(0, RootRole).toLongLong() != root_id)
             continue;
-        QString name = item->text(0).section(QStringLiteral(" — "), 0, 0);
-        if (availability != catalog::Availability::Online)
-            name += tr(" — %1").arg(DisplayFormat::root_availability(availability));
-        item->setText(0, name);
+        item->setText(0, root_text(item->data(0, RootNameRole).toString(), availability));
     }
 }
 
@@ -353,12 +402,16 @@ void NavigatorPanel::emit_current_scope() {
 
 QString NavigatorPanel::identity_of(const QTreeWidgetItem* item) {
     if (!item) return {};
+    const int kind = kind_of(item);
+    // Tags, categories and collections are identified by id alone, so a rename keeps the node's
+    // expansion and selection; folders by path (their ids are scan-local).
+    const bool identified_by_id = kind == TagNode || kind == CategoryNode || kind == CollectionNode;
     return QStringLiteral("%1|%2|%3|%4|%5")
-        .arg(item->data(0, KindRole).toInt())
+        .arg(kind)
         .arg(item->data(0, LibraryRole).toString())
         .arg(item->data(0, IdRole).toLongLong())
         .arg(item->data(0, RootRole).toLongLong())
-        .arg(item->data(0, PathRole).toString());
+        .arg(identified_by_id ? QString() : item->data(0, PathRole).toString());
 }
 
 void NavigatorPanel::show_context_menu(const QPoint& position) {
@@ -380,8 +433,9 @@ void NavigatorPanel::show_context_menu(const QPoint& position) {
         if (!accepted || name.isEmpty()) return std::nullopt;
         return name;
     };
-    /// Display paths of the library's tags other than `excluded` (for merge and move targets).
-    const auto other_tags = [item, id] {
+    // Display paths of the library's tags that can receive this tag (merge or move target): not
+    // the tag itself and not one of its descendants (that would create a cycle).
+    const auto other_tags = [item] {
         std::vector<std::pair<QString, std::int64_t>> tags;
         QTreeWidgetItem* group = item;
         while (group && kind_of(group) != TagsGroupNode)
@@ -390,9 +444,9 @@ void NavigatorPanel::show_context_menu(const QPoint& position) {
         for (QTreeWidgetItemIterator iterator(group); *iterator; ++iterator) {
             if (*iterator == group) continue;
             if ((*iterator)->parent() == group->parent()) break;  // left the tags subtree
-            if (kind_of(*iterator) != TagNode) continue;
+            if (kind_of(*iterator) != TagNode || is_same_or_descendant(*iterator, item)) continue;
             const auto tag_id = static_cast<std::int64_t>((*iterator)->data(0, IdRole).toLongLong());
-            if (tag_id != id) tags.emplace_back((*iterator)->data(0, PathRole).toString(), tag_id);
+            tags.emplace_back((*iterator)->data(0, PathRole).toString(), tag_id);
         }
         return tags;
     };
@@ -412,7 +466,7 @@ void NavigatorPanel::show_context_menu(const QPoint& position) {
             const std::int64_t root_id = item->data(0, RootRole).toLongLong();
             menu.addAction(tr("Rescan"), this,
                            [this, library = *library, root_id] { emit rescanRequested(library, root_id); });
-            menu.addAction(tr("Show in Explorer"), this,
+            menu.addAction(FileManager::reveal_action_text(), this,
                            [this, library = *library, root_id] { show_folder_in_file_manager(library, root_id, {}); });
             menu.addAction(tr("Locate moved folder…"), this,
                            [this, library = *library, root_id] { emit rebindRequested(library, root_id); });
@@ -420,7 +474,7 @@ void NavigatorPanel::show_context_menu(const QPoint& position) {
         }
         case FolderNode: {
             const std::int64_t root_id = item->data(0, RootRole).toLongLong();
-            menu.addAction(tr("Show in Explorer"), this, [this, library = *library, root_id, path] {
+            menu.addAction(FileManager::reveal_action_text(), this, [this, library = *library, root_id, path] {
                 show_folder_in_file_manager(library, root_id, path);
             });
             break;

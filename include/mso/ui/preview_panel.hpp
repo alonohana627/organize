@@ -62,24 +62,49 @@ signals:
 private:
     /// Resolves the selected sample's path on a worker, then opens it in the engine.
     void open_selected(bool autoplay);
+    /// Opens a resolved file in the engine (or queues it until the engine exists).
     void on_path_resolved(const SampleKey& key, const std::filesystem::path& path, bool autoplay);
-    /// Creates the engine on first use; false (with a visible message) when audio is unavailable.
-    bool ensure_engine();
+    /// Starts creating the engine on the engine pool (once); the device opens off the UI thread.
+    void request_engine();
+    /// Sends a transport command and starts polling.
     void post(audio::TransportCommand command);
     /// Reads a snapshot and updates every transport widget (driven by poll_timer_).
     void poll_engine();
+    /// Decodes the selected sample's waveform on the waveform pool (cancellable).
     void start_waveform(const SampleKey& key, const std::filesystem::path& path);
+    /// Cancels the running waveform decode.
     void cancel_waveform();
+    /// Shows the selected sample's cached waveform, or its state.
     void show_cached_waveform_or_placeholder();
+    /// Loops the whole sample, or stops looping.
     void apply_loop();
+    /// Enables the transport controls that make sense now.
     void update_controls_enabled();
 
+    /// Resolves paths through the Application.
     ApplicationSession& session_;
+    /// A preview requested while the engine was still being created.
+    struct PendingOpen {
+        /// Sample to open.
+        SampleKey key;
+        /// Its resolved file.
+        std::filesystem::path path;
+        /// Start playing once opened.
+        bool autoplay = false;
+    };
+
+    /// Null until created on engine_pool_.
     std::unique_ptr<audio::PreviewEngine> engine_;
-    bool engine_unavailable_ = false;
+    bool engine_requested_ = false;            ///< creation is running on engine_pool_
+    bool engine_unavailable_ = false;          ///< creation failed; previews are disabled
+    std::optional<PendingOpen> pending_open_;  ///< opened when the engine arrives
+    bool showing_pause_ = false;               ///< the play button currently shows "Pause"
+    QThreadPool engine_pool_;                  ///< one thread: engine creation
     QTimer poll_timer_;
 
+    /// The table's current sample.
     std::optional<SampleKey> selected_key_;
+    /// Its display name.
     QString selected_name_;
     std::optional<SampleKey> loaded_key_;                 ///< sample currently opened in the engine
     std::uint64_t loaded_generation_ = 0;                 ///< engine snapshot generation of loaded_key_
@@ -88,13 +113,16 @@ private:
     std::optional<std::int64_t> total_frames_;
     std::optional<std::uint64_t> loop_generation_;  ///< engine generation the loop region was set for
 
+    /// One thread: waveform decodes.
     QThreadPool waveform_pool_;
+    /// Cancels the running waveform decode.
     std::stop_source waveform_stop_;
     std::optional<SampleKey> waveform_key_;  ///< sample whose waveform is being generated
     std::uint64_t waveform_request_ = 0;
     /// Small most-recently-used cache so re-selecting a sample does not decode it again.
     std::list<std::pair<SampleKey, WaveformBins>> waveform_cache_;
 
+    /// Widgets (owned through Qt's parent tree).
     QLabel* title_label_ = nullptr;
     QToolButton* play_button_ = nullptr;
     QToolButton* stop_button_ = nullptr;
@@ -104,6 +132,8 @@ private:
     QPushButton* generate_button_ = nullptr;
     QSlider* volume_slider_ = nullptr;
     QCheckBox* loop_check_ = nullptr;
+    QCheckBox* seam_fades_check_ = nullptr;  ///< opt-in seam fades (they alter audition)
+    QLabel* loop_label_ = nullptr;           ///< the loop region the engine reports
     QDoubleSpinBox* speed_spin_ = nullptr;
     QLabel* status_label_ = nullptr;
 };

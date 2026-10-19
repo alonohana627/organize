@@ -1,13 +1,34 @@
-#include "mso/audio/stereo_converter.hpp"
+#include "mso/audio/detail/stereo_converter.hpp"
 
 #include <limits>
 #include <new>
 #include <string>
 
-#include "mso/audio/pcm_ring.hpp"
-#include "mso/audio/stereo_downmix.hpp"
+#include <miniaudio.h>
 
-namespace mso::audio {
+#include "mso/audio/detail/pcm_ring.hpp"
+#include "mso/audio/detail/stereo_downmix.hpp"
+
+namespace mso::audio::detail {
+
+/// miniaudio's converter state. It holds pointers into itself, so it lives at a fixed heap address.
+struct StereoConverter::Engine {
+    ma_data_converter converter{};  ///< valid once `initialized`
+    bool initialized = false;       ///< ma_data_converter_init succeeded
+
+    Engine() = default;
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+    ~Engine() {
+        if (initialized) {
+            ma_data_converter_uninit(&converter, nullptr);
+        }
+    }
+};
+
+StereoConverter::StereoConverter() = default;
+
+StereoConverter::~StereoConverter() = default;
 
 Result<std::unique_ptr<StereoConverter>> StereoConverter::create(std::size_t input_channels, std::int64_t source_units,
                                                                  std::int64_t output_units) {
@@ -23,6 +44,10 @@ Result<std::unique_ptr<StereoConverter>> StereoConverter::create(std::size_t inp
     if (!converter) {
         return fail(ErrorCode::ResourceLimit, "out of memory for the preview converter");
     }
+    converter->engine_.reset(new (std::nothrow) Engine());
+    if (!converter->engine_) {
+        return fail(ErrorCode::ResourceLimit, "out of memory for the preview converter");
+    }
 
     // miniaudio copies the gains into its own heap during init, so `downmix` may die afterwards.
     StereoDownmix downmix(input_channels);
@@ -34,27 +59,22 @@ Result<std::unique_ptr<StereoConverter>> StereoConverter::create(std::size_t inp
     config.resampling.algorithm = ma_resample_algorithm_linear;
     config.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;
 
-    if (ma_data_converter_init(&config, nullptr, &converter->converter_) != MA_SUCCESS) {
+    if (ma_data_converter_init(&config, nullptr, &converter->engine_->converter) != MA_SUCCESS) {
         return fail(ErrorCode::ResourceLimit, "cannot initialize the preview converter");
     }
+    converter->engine_->initialized = true;
     converter->input_channels_ = input_channels;
     return converter;
-}
-
-StereoConverter::~StereoConverter() {
-    if (input_channels_ != 0) {
-        ma_data_converter_uninit(&converter_, nullptr);
-    }
 }
 
 ConversionProgress StereoConverter::process(std::span<const float> input, std::span<float> stereo_output) noexcept {
     ma_uint64 input_frames = input.size() / input_channels_;
     ma_uint64 output_frames = stereo_output.size() / kOutputChannels;
-    if (ma_data_converter_process_pcm_frames(&converter_, input.data(), &input_frames, stereo_output.data(),
+    if (ma_data_converter_process_pcm_frames(&engine_->converter, input.data(), &input_frames, stereo_output.data(),
                                              &output_frames) != MA_SUCCESS) {
         return {};
     }
     return {static_cast<std::size_t>(input_frames), static_cast<std::size_t>(output_frames)};
 }
 
-}  // namespace mso::audio
+}  // namespace mso::audio::detail

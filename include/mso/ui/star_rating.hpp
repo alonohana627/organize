@@ -16,6 +16,7 @@ namespace mso::ui {
 /// area; star `n` (1-based) occupies one square slot of `star_size` pixels plus spacing.
 class StarRating {
 public:
+    /// Highest rating (number of stars).
     static constexpr int kMaximumRating = 5;
 
     /// Pixel gap between two stars, proportional to the star size.

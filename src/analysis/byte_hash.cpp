@@ -13,6 +13,7 @@
 namespace mso::analysis {
 namespace {
 
+/// Bytes read and hashed per step: bounds memory and cancellation latency; one unit of work.
 constexpr std::size_t kChunkBytes = 1 << 20;
 
 }  // namespace
@@ -36,6 +37,7 @@ Result<std::string> hash_file_bytes(const std::filesystem::path& file, std::int6
         if (count > 0) {
             hasher.process(chunk.begin(), chunk.begin() + count);
             bytes_read += count;
+            progress.record_work();
             if (expected_size > 0)
                 progress.report(static_cast<double>(bytes_read) / static_cast<double>(expected_size));
         }

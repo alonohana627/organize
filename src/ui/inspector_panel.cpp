@@ -22,6 +22,7 @@
 
 #include "mso/ui/application_session.hpp"
 #include "mso/ui/display_format.hpp"
+#include "mso/ui/sample_key.hpp"
 #include "mso/ui/star_rating_widget.hpp"
 
 namespace mso::ui {
@@ -34,10 +35,46 @@ enum OverrideChoice { AutomaticChoice = 0, UnknownChoice = 1, ValueChoice = 2 };
 constexpr double kMinimumBpm = 20.0;
 constexpr double kMaximumBpm = 400.0;
 
-/// Splits SampleRow::tags (display paths joined with ", ") back into paths.
-QStringList split_tags(const std::string& joined) {
-    if (joined.empty()) return {};
-    return DisplayFormat::from_utf8(joined).split(QStringLiteral(", "), Qt::SkipEmptyParts);
+/// Keys of `rows`.
+std::set<SampleKey> keys_of(const std::vector<search::SampleRow>& rows) {
+    std::set<SampleKey> keys;
+    for (const auto& row : rows)
+        keys.insert(SampleKey{row.library, row.sample_id});
+    return keys;
+}
+
+/// Libraries of `rows`.
+std::set<uuids::uuid> libraries_of(const std::vector<search::SampleRow>& rows) {
+    std::set<uuids::uuid> libraries;
+    for (const auto& row : rows)
+        libraries.insert(row.library);
+    return libraries;
+}
+
+/// Sets a line edit's text unless the user is editing it (focused or modified), and without
+/// touching it when the text is already right: refreshes never clobber a rename in progress.
+void set_text_unless_edited(QLineEdit* edit, const QString& text) {
+    if (edit->hasFocus() || edit->isModified() || edit->text() == text) return;
+    const QSignalBlocker blocker(edit);
+    edit->setText(text);
+}
+
+/// Rebuilds a list only when its entries (display text + value) differ, keeping the current item.
+void set_list_entries(QListWidget* list, const std::vector<std::pair<QString, QString>>& entries) {
+    bool same = list->count() == static_cast<int>(entries.size());
+    for (int index = 0; same && index < list->count(); ++index) {
+        const QListWidgetItem* item = list->item(index);
+        same = item->text() == entries[static_cast<std::size_t>(index)].first &&
+               item->data(Qt::UserRole).toString() == entries[static_cast<std::size_t>(index)].second;
+    }
+    if (same) return;
+    const QString current = list->currentItem() ? list->currentItem()->data(Qt::UserRole).toString() : QString();
+    list->clear();
+    for (const auto& [display, value] : entries) {
+        auto* item = new QListWidgetItem(display, list);
+        item->setData(Qt::UserRole, value);
+        if (!current.isEmpty() && value == current) list->setCurrentItem(item);
+    }
 }
 
 /// The common value of `extract` over all rows, or nullopt when the rows disagree.
@@ -91,6 +128,7 @@ void InspectorPanel::build_ui() {
         if (name.isEmpty()) return;
         catalog::EditCommand command;
         command.display_name = DisplayFormat::to_utf8(name);
+        name_edit_->setModified(false);  // applied: later refreshes may update the field again
         request(std::move(command));
     };
     connect(rename_button_, &QPushButton::clicked, this, rename);
@@ -378,28 +416,47 @@ void InspectorPanel::build_ui() {
 }
 
 void InspectorPanel::show_selection(std::vector<search::SampleRow> rows, std::size_t total_selected) {
-    const bool same_single = rows.size() == 1 && rows_.size() == 1 &&
-                             rows.front().sample_id == rows_.front().sample_id &&
-                             rows.front().library == rows_.front().library;
-    const bool same_library_set = !rows.empty() && !rows_.empty() && rows.front().library == rows_.front().library;
+    const std::set<SampleKey> keys = keys_of(rows);
+    const bool same_samples = keys == selected_keys_;
+    const std::set<uuids::uuid> libraries = libraries_of(rows);
+    const bool same_libraries = libraries == selected_libraries_;
     rows_ = std::move(rows);
     total_selected_ = total_selected;
-    if (!same_single) {
+    selected_keys_ = keys;
+    selected_libraries_ = libraries;
+    if (!same_samples) {
+        // Another selection: drafts of the previous one are discarded, details re-read.
         detail_.reset();
         ++detail_request_;
         notes_dirty_ = false;
+        name_edit_->setModified(false);
     }
     update_summary();
+    if (rows_.size() == 1 && !same_samples) load_detail(rows_.front());
+    if (!same_libraries) reload_library_choices();
+    update_enabled();
+}
+
+void InspectorPanel::reload_detail() {
     if (rows_.size() == 1) load_detail(rows_.front());
-    const bool single_library =
-        !rows_.empty() && common_value(rows_, [](const auto& row) { return row.library; }).has_value();
-    if (single_library && !same_library_set) load_library_choices(rows_.front().library);
-    if (!single_library) {
-        ++choices_request_;
-        category_combo_->clear();
-        collection_combo_->clear();
-        manual_collection_ids_.clear();
+}
+
+void InspectorPanel::reload_library_choices() {
+    ++choices_request_;
+    if (selected_libraries_.size() == 1) {
+        load_library_choices(*selected_libraries_.begin());
+        return;
     }
+    // Categories and collections belong to one library; a selection spanning several (or none)
+    // cannot offer a common list.
+    category_combo_->clear();
+    collection_combo_->clear();
+    manual_collection_ids_.clear();
+    const QString reason = selected_libraries_.size() > 1
+                               ? tr("Select samples of a single library to set a category or collection")
+                               : QString();
+    category_combo_->setToolTip(reason);
+    collection_combo_->setToolTip(reason);
     update_enabled();
 }
 
@@ -409,20 +466,16 @@ void InspectorPanel::set_read_only(bool read_only) {
 }
 
 void InspectorPanel::load_detail(const search::SampleRow& row) {
+    if (!session_.is_ready()) return;
     const std::uint64_t request = ++detail_request_;
-    const uuids::uuid library = row.library;
     const std::int64_t sample_id = row.sample_id;
-    session_.run(
-        this,
-        [library, sample_id](app::Application& application) -> Result<catalog::SampleDetail> {
-            catalog::Library* opened = application.library(library);
-            if (!opened) return fail(ErrorCode::NotFound, "the library is no longer open");
-            return opened->sample_detail(sample_id);
-        },
+    session_.run_with_library(
+        this, row.library, [sample_id](catalog::Library& library) { return library.sample_detail(sample_id); },
         [this, request](Result<catalog::SampleDetail> detail) {
             if (request != detail_request_) return;
             if (!detail) {
                 partial_label_->setText(tr("Details unavailable: %1").arg(DisplayFormat::error(detail.error())));
+                partial_label_->setVisible(true);
                 return;
             }
             show_detail(*detail);
@@ -442,15 +495,15 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
         if (!part.isEmpty()) format << part;
     format_label_->setText(format.join(QStringLiteral(" · ")));
 
-    if (!notes_dirty_) {
+    const QString notes = DisplayFormat::from_utf8(detail.notes);
+    if (!notes_dirty_ && !notes_edit_->hasFocus() && notes_edit_->toPlainText() != notes) {
         const QSignalBlocker blocker(notes_edit_);
-        notes_edit_->setPlainText(DisplayFormat::from_utf8(detail.notes));
+        notes_edit_->setPlainText(notes);
     }
-    tags_list_->clear();
-    for (const auto& tag : detail.tags) {
-        auto* item = new QListWidgetItem(DisplayFormat::from_utf8(tag.path), tags_list_);
-        item->setData(Qt::UserRole, DisplayFormat::from_utf8(tag.path));
-    }
+    std::vector<std::pair<QString, QString>> tags;
+    for (const auto& tag : detail.tags)
+        tags.emplace_back(DisplayFormat::from_utf8(tag.path), DisplayFormat::from_utf8(tag.path));
+    set_list_entries(tags_list_, tags);
 
     const auto describe_override = [](catalog::OverrideState state) {
         switch (state) {
@@ -473,6 +526,9 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
                                               DisplayFormat::provenance(detail.key_source, detail.key_confidence),
                                               describe_override(detail.key_override))
                                    : tr("Unknown; override: %1").arg(describe_override(detail.key_override)));
+    // Override controls the user is working with keep their (unapplied) values.
+    const bool bpm_in_use = bpm_mode_combo_->hasFocus() || bpm_spin_->hasFocus();
+    const bool key_in_use = key_mode_combo_->hasFocus() || key_combo_->hasFocus();
     {
         const QSignalBlocker bpm_blocker(bpm_mode_combo_);
         const QSignalBlocker key_blocker(key_mode_combo_);
@@ -481,14 +537,16 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
                    : state == catalog::OverrideState::Unknown ? UnknownChoice
                                                               : AutomaticChoice;
         };
-        bpm_mode_combo_->setCurrentIndex(choice(detail.bpm_override));
-        key_mode_combo_->setCurrentIndex(choice(detail.key_override));
-        if (detail.bpm_override_milli)
-            bpm_spin_->setValue(static_cast<double>(*detail.bpm_override_milli) / 1000.0);
-        else if (detail.bpm_milli)
-            bpm_spin_->setValue(static_cast<double>(*detail.bpm_milli) / 1000.0);
+        if (!bpm_in_use) {
+            bpm_mode_combo_->setCurrentIndex(choice(detail.bpm_override));
+            if (detail.bpm_override_milli)
+                bpm_spin_->setValue(static_cast<double>(*detail.bpm_override_milli) / 1000.0);
+            else if (detail.bpm_milli)
+                bpm_spin_->setValue(static_cast<double>(*detail.bpm_milli) / 1000.0);
+        }
+        if (!key_in_use) key_mode_combo_->setCurrentIndex(choice(detail.key_override));
         const auto key = detail.key_override_value ? detail.key_override_value : detail.key;
-        if (key && key->mode != KeyMode::Unknown)
+        if (!key_in_use && key && key->mode != KeyMode::Unknown)
             key_combo_->setCurrentIndex(
                 key_combo_->findData(key->pitch_class + (key->mode == KeyMode::Minor ? 12 : 0)));
     }
@@ -509,34 +567,52 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
 }
 
 void InspectorPanel::load_library_choices(const uuids::uuid& library) {
-    const std::uint64_t request = ++choices_request_;
+    if (!session_.is_ready()) return;
+    const std::uint64_t request = choices_request_;
+    /// The category and manual-collection lists of one library.
     struct Choices {
         std::vector<catalog::TaxonomyNode> categories;
         std::vector<catalog::CollectionRecord> collections;
     };
-    session_.run(
-        this,
-        [library](app::Application& application) {
+    session_.run_with_library(
+        this, library,
+        [](catalog::Library& opened) -> Result<Choices> {
             Choices choices;
-            if (catalog::Library* opened = application.library(library)) {
-                if (auto categories = opened->list_categories()) choices.categories = std::move(*categories);
-                if (auto collections = opened->list_collections()) choices.collections = std::move(*collections);
-            }
+            auto categories = opened.list_categories();
+            if (!categories) return std::unexpected(categories.error());
+            auto collections = opened.list_collections();
+            if (!collections) return std::unexpected(collections.error());
+            choices.categories = std::move(*categories);
+            choices.collections = std::move(*collections);
             return choices;
         },
-        [this, request](Choices choices) {
+        [this, request](Result<Choices> choices) {
             if (request != choices_request_) return;
-            const QString typed = category_combo_->currentText();
-            category_combo_->clear();
-            for (const auto& category : choices.categories)
-                category_combo_->addItem(DisplayFormat::from_utf8(category.path));
-            category_combo_->setEditText(typed);
-            collection_combo_->clear();
-            manual_collection_ids_.clear();
-            for (const auto& collection : choices.collections) {
-                if (collection.smart) continue;  // smart membership follows their query
-                collection_combo_->addItem(DisplayFormat::from_utf8(collection.name));
-                manual_collection_ids_.push_back(collection.id);
+            if (!choices) {
+                category_combo_->setToolTip(
+                    tr("Categories unavailable: %1").arg(DisplayFormat::error(choices.error())));
+                return;
+            }
+            category_combo_->setToolTip({});
+            collection_combo_->setToolTip({});
+            if (!category_combo_->hasFocus()) {  // never replace what the user is typing
+                const QString typed = category_combo_->currentText();
+                category_combo_->clear();
+                for (const auto& category : choices->categories)
+                    category_combo_->addItem(DisplayFormat::from_utf8(category.path));
+                category_combo_->setEditText(typed);
+            }
+            if (!collection_combo_->hasFocus()) {
+                const QVariant chosen = collection_combo_->currentData();
+                collection_combo_->clear();
+                manual_collection_ids_.clear();
+                for (const auto& collection : choices->collections) {
+                    if (collection.smart) continue;  // smart membership follows their query
+                    collection_combo_->addItem(DisplayFormat::from_utf8(collection.name),
+                                               static_cast<qlonglong>(collection.id));
+                    manual_collection_ids_.push_back(collection.id);
+                }
+                if (chosen.isValid()) collection_combo_->setCurrentIndex(collection_combo_->findData(chosen));
             }
             update_enabled();
         });
@@ -558,14 +634,11 @@ void InspectorPanel::update_summary() {
         const auto& row = rows_.front();
         heading_label_->setText(DisplayFormat::from_utf8(row.display_name.empty() ? row.file_name : row.display_name));
     } else {
-        heading_label_->setText(tr("%1 samples selected").arg(DisplayFormat::count(static_cast<std::int64_t>(count))));
+        heading_label_->setText(tr("%n sample(s) selected", nullptr, static_cast<int>(count)));
     }
 
-    {
-        const QSignalBlocker blocker(name_edit_);
-        name_edit_->setText(count == 1 ? heading_label_->text() : QString());
-        name_edit_->setPlaceholderText(count > 1 ? tr("Select one sample to rename") : QString());
-    }
+    set_text_unless_edited(name_edit_, count == 1 ? heading_label_->text() : QString());
+    name_edit_->setPlaceholderText(count > 1 ? tr("Select one sample to rename") : QString());
     original_name_label_->setText(count == 1  ? DisplayFormat::from_utf8(rows_.front().file_name)
                                   : count > 1 ? mixed
                                               : QString());
@@ -583,26 +656,28 @@ void InspectorPanel::update_summary() {
     favorite_label_->setText(count == 0 ? QString() : favorite ? (*favorite ? tr("Yes") : tr("No")) : mixed);
 
     if (count != 1 || !detail_) {
-        if (!notes_dirty_) {
+        if (!notes_dirty_ && !notes_edit_->hasFocus() && !notes_edit_->toPlainText().isEmpty()) {
             const QSignalBlocker blocker(notes_edit_);
             notes_edit_->clear();
         }
-        notes_edit_->setPlaceholderText(count > 1 ? tr("Mixed — Save notes replaces the notes of all %1 samples")
-                                                        .arg(DisplayFormat::count(static_cast<std::int64_t>(count)))
+        notes_edit_->setPlaceholderText(count > 1 ? tr("Mixed — Save notes replaces the notes of all %n sample(s)",
+                                                       nullptr, static_cast<int>(count))
                                                   : QString());
-        // Tag union with counts, from the rows (details are loaded for single selections only).
-        tags_list_->clear();
-        std::map<QString, int> tag_counts;
+        // Tag union with counts, from the rows' tag path lists (details exist for single
+        // selections only). Paths come from the catalog as a list: never split display text.
+        std::map<std::string, int> tag_counts;
         for (const auto& row : rows_)
-            for (const QString& tag : split_tags(row.tags))
-                ++tag_counts[tag];
-        for (const auto& [tag, tag_count] : tag_counts) {
-            const QString text = count > 1 && static_cast<std::size_t>(tag_count) < count
-                                     ? tr("%1 (%2 of %3)").arg(tag).arg(tag_count).arg(count)
-                                     : tag;
-            auto* item = new QListWidgetItem(text, tags_list_);
-            item->setData(Qt::UserRole, tag);
+            for (const std::string& path : row.tag_paths)
+                ++tag_counts[path];
+        std::vector<std::pair<QString, QString>> tags;
+        for (const auto& [path, tag_count] : tag_counts) {
+            const QString tag = DisplayFormat::from_utf8(path);
+            tags.emplace_back(count > 1 && static_cast<std::size_t>(tag_count) < count
+                                  ? tr("%1 (%2 of %3)").arg(tag).arg(tag_count).arg(count)
+                                  : tag,
+                              tag);
         }
+        set_list_entries(tags_list_, tags);
         collections_list_->clear();
         if (count > 1) collections_list_->addItem(tr("Select one sample to see its collections"));
         locations_list_->clear();
@@ -640,8 +715,10 @@ void InspectorPanel::update_enabled() {
     tag_edit_->setEnabled(editable);
     tag_add_button_->setEnabled(editable);
     tag_remove_button_->setEnabled(editable && tags_list_->currentItem() != nullptr);
-    category_combo_->setEnabled(editable);
-    category_set_button_->setEnabled(editable);
+    // Categories and collections are library-scoped: one library at a time.
+    const bool single_library = selected_libraries_.size() == 1;
+    category_combo_->setEnabled(editable && single_library);
+    category_set_button_->setEnabled(editable && single_library);
     category_clear_button_->setEnabled(editable);
     bpm_mode_combo_->setEnabled(editable);
     bpm_spin_->setEnabled(editable && bpm_mode_combo_->currentIndex() == ValueChoice);
@@ -649,7 +726,7 @@ void InspectorPanel::update_enabled() {
     key_mode_combo_->setEnabled(editable);
     key_combo_->setEnabled(editable && key_mode_combo_->currentIndex() == ValueChoice);
     key_apply_button_->setEnabled(editable);
-    const bool collections_available = editable && !manual_collection_ids_.empty();
+    const bool collections_available = editable && single_library && !manual_collection_ids_.empty();
     collection_combo_->setEnabled(collections_available);
     collection_add_button_->setEnabled(collections_available);
     collection_remove_button_->setEnabled(collections_available);

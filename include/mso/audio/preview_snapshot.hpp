@@ -23,28 +23,36 @@ struct PreviewSnapshot {
     /// Increments with every open(); identifies which source the other source fields describe.
     std::uint64_t generation = 0;
 
-    /// Audible position in source frames (what the listener hears now, folded into the loop region).
+    /// Audible position in source frames: what the listener hears now, folded into the loop region
+    /// and compensated for the device's output latency.
     std::int64_t position_frames = 0;
     /// Source length in frames when the decoder knows it.
     std::optional<std::int64_t> total_frames;
     /// False when total_frames is an estimate (VBR, bitrate-derived).
     bool total_frames_exact = false;
-    int source_sample_rate = 0;
-    int source_channels = 0;
+    int source_sample_rate = 0;  ///< source frames per second
+    int source_channels = 0;     ///< channels of the source before the fold to stereo
+    /// Loop actually in effect: the requested region after clamping to the source and lengthening
+    /// to kMinimumLoopMilliseconds; nullopt when not looping.
+    std::optional<LoopRegion> loop;
+    /// True while loop-seam fades are on (they alter audition; see transport::SetSeamFades).
+    bool seam_fades = false;
 
-    OutputDeviceName output_device_name;
-    bool output_device_available = false;
+    OutputDeviceName output_device_name;   ///< UTF-8 name of the open endpoint
+    bool output_device_available = false;  ///< false before a device opens and after DEVICE_LOST
     /// Rate of the stereo float stream handed to the device (the device's native rate by default).
     std::uint32_t output_sample_rate = 0;
     /// Actual period negotiated with the endpoint, in device frames and in microseconds.
     std::uint32_t output_period_frames = 0;
-    std::uint32_t output_period_microseconds = 0;
+    std::uint32_t output_period_microseconds = 0;  ///< the same period in microseconds
+    /// Output latency the playhead is compensated for (the device buffer), in microseconds.
+    std::uint32_t output_latency_microseconds = 0;
 
     /// Preview volume target as linear gain 0..1 (the callback glides toward it).
     float volume = 1.0f;
     /// Active speed/pitch relationship and the settings in effect (V2).
     PlaybackMode playback_mode = PlaybackMode::Varispeed;
-    double speed_ratio = 1.0;
+    double speed_ratio = 1.0;  ///< speed in effect, 0.25..4
     /// Pitch setting; audible only in IndependentTempoPitch mode.
     double pitch_semitones = 0.0;
 

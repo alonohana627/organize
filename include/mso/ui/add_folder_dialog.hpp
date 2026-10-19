@@ -28,7 +28,9 @@ public:
     std::optional<uuids::uuid> library() const;
 
 private:
+    /// Library of each combo entry, by position (names may repeat).
     std::vector<uuids::uuid> library_ids_;
+    /// The target library choice.
     QComboBox* library_combo_ = nullptr;
 };
 

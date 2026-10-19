@@ -55,22 +55,18 @@ void HistoryPanel::show_library(const std::optional<uuids::uuid>& library) {
 
 void HistoryPanel::reload() {
     const std::uint64_t request = ++request_;
-    list_->clear();
     const bool has_library = library_ && session_.is_ready();
     undo_button_->setEnabled(has_library);
     redo_button_->setEnabled(has_library);
     if (!has_library) {
+        list_->clear();
         title_label_->setText(tr("No library selected"));
         return;
     }
+    // The previous entries stay visible until the new ones arrive (no flicker on every edit).
     title_label_->setText(tr("History of %1 (kept across restarts)").arg(session_.library_name(*library_)));
-    session_.run(
-        this,
-        [library = *library_](app::Application& application) -> Result<std::vector<catalog::HistoryEntry>> {
-            catalog::Library* opened = application.library(library);
-            if (!opened) return fail(ErrorCode::NotFound, "the library is no longer open");
-            return opened->history(kVisibleEntries);
-        },
+    session_.run_with_library(
+        this, *library_, [](catalog::Library& library) { return library.history(kVisibleEntries); },
         [this, request](Result<std::vector<catalog::HistoryEntry>> entries) {
             if (request != request_) return;
             list_->clear();

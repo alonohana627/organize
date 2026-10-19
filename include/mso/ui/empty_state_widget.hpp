@@ -24,10 +24,13 @@ public:
     void show_error(const QString& message);
 
 signals:
+    /// The user wants to add a sample folder (creating a library if needed).
     void addFolderRequested();
+    /// The user wants to open an existing library.
     void openLibraryRequested();
 
 private:
+    /// Widgets (owned through Qt's parent tree).
     QLabel* title_label_ = nullptr;
     QLabel* message_label_ = nullptr;
     QPushButton* add_folder_button_ = nullptr;

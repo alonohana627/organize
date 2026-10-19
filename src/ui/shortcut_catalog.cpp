@@ -2,30 +2,46 @@
 
 #include <string>
 
+#include "mso/app/json_fields.hpp"
 #include "mso/ui/display_format.hpp"
 
 namespace mso::ui {
 
+namespace {
+
+/// The platform's binding for a standard action (Ctrl+Y for Redo on Windows, Ctrl+Shift+Z
+/// elsewhere …), or `fallback` where the platform defines none (Preferences, Quit on Windows).
+QKeySequence standard_or(QKeySequence::StandardKey key, const QKeySequence& fallback) {
+    const QKeySequence standard(key);
+    return standard.isEmpty() ? fallback : standard;
+}
+
+}  // namespace
+
 const std::vector<ShortcutDefinition>& ShortcutCatalog::definitions() {
+    using enum ShortcutScope;
     static const std::vector<ShortcutDefinition> kDefinitions = {
-        {QStringLiteral("play_pause"), tr("Play / pause preview"), QKeySequence(Qt::Key_Space)},
-        {QStringLiteral("stop"), tr("Stop preview"), QKeySequence(Qt::Key_Escape)},
-        {QStringLiteral("undo"), tr("Undo"), QKeySequence(Qt::CTRL | Qt::Key_Z)},
-        {QStringLiteral("redo"), tr("Redo"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z)},
-        {QStringLiteral("focus_search"), tr("Focus search"), QKeySequence(Qt::CTRL | Qt::Key_F)},
-        {QStringLiteral("remove_from_library"), tr("Remove from library"), QKeySequence(Qt::Key_Delete)},
-        {QStringLiteral("rating_0"), tr("Clear rating"), QKeySequence(Qt::Key_0)},
-        {QStringLiteral("rating_1"), tr("Rate 1 star"), QKeySequence(Qt::Key_1)},
-        {QStringLiteral("rating_2"), tr("Rate 2 stars"), QKeySequence(Qt::Key_2)},
-        {QStringLiteral("rating_3"), tr("Rate 3 stars"), QKeySequence(Qt::Key_3)},
-        {QStringLiteral("rating_4"), tr("Rate 4 stars"), QKeySequence(Qt::Key_4)},
-        {QStringLiteral("rating_5"), tr("Rate 5 stars"), QKeySequence(Qt::Key_5)},
-        {QStringLiteral("toggle_favorite"), tr("Toggle favorite"), QKeySequence(Qt::Key_F)},
-        {QStringLiteral("new_library"), tr("New library"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N)},
-        {QStringLiteral("open_library"), tr("Open library"), QKeySequence(Qt::CTRL | Qt::Key_O)},
-        {QStringLiteral("add_folder"), tr("Add folder"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O)},
-        {QStringLiteral("preferences"), tr("Preferences"), QKeySequence(Qt::CTRL | Qt::Key_Comma)},
-        {QStringLiteral("quit"), tr("Quit"), QKeySequence(Qt::CTRL | Qt::Key_Q)},
+        {QStringLiteral("play_pause"), tr("Play / pause preview"), QKeySequence(Qt::Key_Space), SampleTable},
+        {QStringLiteral("stop"), tr("Stop preview"), QKeySequence(Qt::Key_Escape), SampleTable},
+        {QStringLiteral("undo"), tr("Undo"), QKeySequence(QKeySequence::Undo), Window},
+        {QStringLiteral("redo"), tr("Redo"), QKeySequence(QKeySequence::Redo), Window},
+        {QStringLiteral("focus_search"), tr("Focus search"), QKeySequence(QKeySequence::Find), Window},
+        {QStringLiteral("remove_from_library"), tr("Remove from library"), QKeySequence(QKeySequence::Delete),
+         SampleTable},
+        {QStringLiteral("rating_0"), tr("Clear rating"), QKeySequence(Qt::Key_0), SampleTable},
+        {QStringLiteral("rating_1"), tr("Rate 1 star"), QKeySequence(Qt::Key_1), SampleTable},
+        {QStringLiteral("rating_2"), tr("Rate 2 stars"), QKeySequence(Qt::Key_2), SampleTable},
+        {QStringLiteral("rating_3"), tr("Rate 3 stars"), QKeySequence(Qt::Key_3), SampleTable},
+        {QStringLiteral("rating_4"), tr("Rate 4 stars"), QKeySequence(Qt::Key_4), SampleTable},
+        {QStringLiteral("rating_5"), tr("Rate 5 stars"), QKeySequence(Qt::Key_5), SampleTable},
+        {QStringLiteral("toggle_favorite"), tr("Toggle favorite"), QKeySequence(Qt::Key_F), SampleTable},
+        {QStringLiteral("new_library"), tr("New library"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), Window},
+        {QStringLiteral("open_library"), tr("Open library"), QKeySequence(QKeySequence::Open), Window},
+        {QStringLiteral("add_folder"), tr("Add folder"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), Window},
+        {QStringLiteral("preferences"), tr("Preferences"),
+         standard_or(QKeySequence::Preferences, QKeySequence(Qt::CTRL | Qt::Key_Comma)), Window},
+        {QStringLiteral("quit"), tr("Quit"), standard_or(QKeySequence::Quit, QKeySequence(Qt::CTRL | Qt::Key_Q)),
+         Window},
     };
     return kDefinitions;
 }
@@ -39,9 +55,9 @@ ShortcutBindings ShortcutCatalog::defaults() {
 
 ShortcutBindings ShortcutCatalog::from_json(const nlohmann::json& stored) {
     ShortcutBindings bindings = defaults();
-    if (!stored.is_object() || stored.value("version", 0) != kSchemaVersion) return bindings;
-    const auto entries = stored.find("bindings");
-    if (entries == stored.end() || !entries->is_object()) return bindings;
+    if (app::integer_field(stored, "version") != kSchemaVersion) return bindings;
+    const nlohmann::json* entries = app::object_field(stored, "bindings");
+    if (!entries) return bindings;
     for (const auto& [id, value] : entries->items()) {
         const QString action = DisplayFormat::from_utf8(id);
         if (!bindings.contains(action) || !value.is_string()) continue;
@@ -69,6 +85,12 @@ std::vector<std::vector<QString>> ShortcutCatalog::conflicts(const ShortcutBindi
     for (auto& [sequence, actions] : actions_by_sequence)
         if (actions.size() > 1) groups.push_back(std::move(actions));
     return groups;
+}
+
+ShortcutScope ShortcutCatalog::scope(const QString& id) {
+    for (const auto& definition : definitions())
+        if (definition.id == id) return definition.scope;
+    return ShortcutScope::Window;
 }
 
 QString ShortcutCatalog::label(const QString& id) {

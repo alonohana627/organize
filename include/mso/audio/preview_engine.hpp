@@ -34,22 +34,23 @@ enum class OutputBackend : std::uint8_t {
 /// Persistable endpoint identifier, "<backend>:<native id>" (e.g. the WASAPI endpoint ID or the
 /// PulseAudio sink name). Empty means "the system default endpoint, following changes".
 struct OutputDeviceId {
-    std::string value;
+    std::string value;  ///< "<backend>:<native id>", or empty for the system default
 
+    /// True for the "follow the system default" id.
     bool is_system_default() const noexcept { return value.empty(); }
     bool operator==(const OutputDeviceId&) const = default;
 };
 
 /// One playback endpoint as listed by list_output_devices().
 struct OutputDeviceInfo {
-    OutputDeviceId id;
-    std::string name;  ///< UTF-8 display name
-    bool is_system_default = false;
+    OutputDeviceId id;               ///< id to pass to select_output_device() or to persist
+    std::string name;                ///< UTF-8 display name
+    bool is_system_default = false;  ///< the endpoint the system currently uses by default
 };
 
 /// Engine configuration. Out-of-range values are clamped to the documented limits.
 struct PreviewOptions {
-    OutputBackend backend = OutputBackend::System;
+    OutputBackend backend = OutputBackend::System;  ///< where audio goes
     /// Endpoint to open; empty follows the system default.
     OutputDeviceId device;
     /// Requested device period, clamped to 20..60 ms. The actual period is reported in snapshots.
@@ -79,8 +80,9 @@ public:
     virtual Result<std::vector<OutputDeviceInfo>> list_output_devices() = 0;
 
     /// Switches to another endpoint and keeps the transport position (never restarts from the
-    /// beginning). After a DEVICE_LOST error a loaded source comes back Paused where it was.
-    /// On failure the previously open endpoint, if any, stays in use.
+    /// beginning). The current endpoint is only stopped once the new one has opened, and is
+    /// restarted if the new one then fails to start. After DEVICE_LOST, a source that was playing
+    /// comes back Paused where it was; other states come back unchanged.
     virtual Result<void> select_output_device(const OutputDeviceId& device) = 0;
 
     /// Starts a new source generation for `file`: the decoder thread opens it and prebuffers from

@@ -28,16 +28,24 @@ M="build/debug/mso --workspace $S/ws"; L=$S/lib
 $M create $L --name Test && $M add-root $L "$F" && $M import $L
 $M search -l $L "kick bpm:120..130" --count
 $M edit $L 1 --rating 4 --tag Drums/Kick && $M undo $L && $M redo $L && $M history $L
-$M analyze $L --profile Full          # explicit analysis through mso-worker
+$M analyze $L --profile Full --timeout 600   # explicit analysis through mso-worker
 $M show $L 1                          # observations with provenance
 $M export $L $S/out.csv && $M check $L
+$M play "$F/Drums/Kick 01.wav" --backend null   # decode and play without an audio device
 ```
 
 The CLI is explicit: it analyzes only on `analyze`. The desktop app runs the same pipeline
-automatically (default library, rescans, the `Full` profile after each import).
+automatically (default library, rescans, the `Full` profile after each import). `--worker <path>`
+selects a specific `mso-worker` (default: the one next to `mso`). `analyze` cannot hang: it stops on
+a paused queue, a missing worker, `--timeout`, 15 minutes without a finished job, or Ctrl+C.
 
-For scale, `mso bench <new-lib> --rows 100000` measures catalog inserts and search latency on
-synthetic metadata (no audio); use a release build and record results in `IMPLEMENTATION_STATUS.md`.
+Check exit codes, not only output: 0 ok, 1 error, 2 usage, 3 partial result, 130 interrupted. While the
+desktop app has a library open, the CLI opens it read-only (`library.lock`) and commands that write
+fail; use a scratch library.
+
+For scale, `mso bench <new-lib> --rows 100000 --repetitions 30` measures catalog inserts and search
+latency on synthetic metadata (no audio), through SQLite and through the in-memory index; use a release
+build and record results in `IMPLEMENTATION_STATUS.md`.
 
 ## 3. Things to look for
 

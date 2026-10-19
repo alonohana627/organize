@@ -35,11 +35,14 @@ signals:
     void ratingClicked(const QModelIndex& index, int rating);
 
 private:
+    /// Selection band or hover tint across the whole cell (cells join into one row band).
     void paint_background(QPainter& painter, const QStyleOptionViewItem& option, const QModelIndex& index,
                           QPalette::ColorGroup group) const;
+    /// This cell's part of the single focus outline around the current row.
     void paint_focus_outline(QPainter& painter, const QStyleOptionViewItem& option, const QModelIndex& index,
                              QPalette::ColorGroup group) const;
 
+    /// The view whose hover and focus state the delegate paints.
     SampleTableView& view_;
 };
 

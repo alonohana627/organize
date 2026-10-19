@@ -77,6 +77,12 @@ Compile plain text to escaped FTS5 terms and explicit prefix terms only when use
 
 Search index content excludes deleted samples by removing their search projection. Known unknown values use `IS NULL`; zero duration is not unknown. Tag subtree predicates use bounded descendant IDs/temporary tables, not gigantic interpolated IN lists. Folder filters use folder-tree membership and location EXISTS. Combine matches using EXISTS to avoid duplicate rows from multi-tag or multi-location joins.
 
+> **Amendment (implementation, 2026-10-19).** The implemented query semantics refine this section;
+> `IMPLEMENTATION_STATUS.md` ("Search semantics") is authoritative: equality at typed precision
+> (`bpm:120` = 119.5 ≤ x < 120.5), two-valued `NOT` (X and NOT X partition the library), primary-location
+> semantics for `folder:` and root/folder scopes, `analyzed:none`/`false`, a 1,024-node cap on
+> smart-collection expansion, and relevance ranking that keeps non-text OR matches after the text hits.
+
 ## 7. Query plans, sorting and bounded pagination
 
 Page size defaults to 200, maximum 500. Sort whitelist: name, duration, size, rate, BPM, key, rating, added date, format, availability and relevance (where applicable). Stable total ordering includes library UUID and sample UUID as final tie-breakers. Nulls sort last in both directions using a two-part cursor (non-null partition, then null partition), or a matching expression index; do not add an unindexed CASE sort and assume an existing simple index remains sufficient. Sort strings use pinned normalized keys; original text remains for display.

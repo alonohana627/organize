@@ -1,12 +1,14 @@
 // probe_file(): container identification and dispatch to the per-format parsers.
 #include <algorithm>
+#include <string>
+#include <string_view>
 
 #include "mso/domain/core.hpp"
-#include "mso/media/bounded_reader.hpp"
-#include "mso/media/container_detect.hpp"
-#include "mso/media/id3.hpp"
+#include "mso/media/detail/bounded_reader.hpp"
+#include "mso/media/detail/container_detect.hpp"
+#include "mso/media/detail/id3.hpp"
+#include "mso/media/detail/probe_formats.hpp"
 #include "mso/media/media.hpp"
-#include "mso/media/probe_formats.hpp"
 
 namespace mso::media {
 
@@ -67,10 +69,7 @@ Result<void> probe_unrecognised(BoundedFileReader& reader, std::string_view exte
 /// A leading ID3v2 tag: read its frames, then identify the stream that follows it.
 Result<void> probe_after_id3(BoundedFileReader& reader, detail::Bytes head, ProbeResult& result) {
     const std::uint64_t tag_size = *detail::id3v2_tag_size(head);
-    const auto tag_bytes = static_cast<std::size_t>(std::min<std::uint64_t>(tag_size, detail::kMaxTagBytes));
-    auto tag = reader.read_within_budget(0, tag_bytes);
-    if (!tag) return std::unexpected(tag.error());
-    detail::parse_id3v2(*tag, result.tags);
+    if (auto tags = detail::read_id3v2(reader, 0, tag_size, result.tags); !tags) return tags;
     if (tag_size >= reader.file_size()) return fail(ErrorCode::CorruptAudio, "file holds an ID3 tag but no audio");
 
     auto stream_head = reader.read_available(tag_size, detail::kSignatureBytes);

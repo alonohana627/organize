@@ -11,7 +11,8 @@
 
 namespace mso::analysis {
 
-/// Hashes the file in 1 MiB chunks and returns the lowercase hex digest.
+/// Hashes the file in 1 MiB chunks and returns the lowercase hex digest. Records one unit of work
+/// per chunk.
 ///
 /// `expected_size` only scales progress. Errors: FILE_MISSING, ACCESS_DENIED (cannot open),
 /// SOURCE_OFFLINE (retryable read failure) and CANCELLED (checked before every chunk).
