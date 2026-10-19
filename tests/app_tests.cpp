@@ -1,7 +1,8 @@
 // The application layer: library lifetime and locking (closing, reopening, read-only upgrades),
 // workspace persistence and merging, the in-memory SampleIndex (checked against SearchService on the
-// same data, keyset paging while values change, its row budget), incremental index updates,
-// coalesced events and automatic analysis.
+// same data, keyset paging while values change, its row budget, sort orders patched in place),
+// incremental index updates, coalesced reloads and events, automatic analysis, and the analysis
+// supervisor (deadlines, abandoned libraries, worker start backoff) against a --self-test worker.
 #include <doctest.h>
 
 #include <algorithm>
@@ -15,7 +16,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include "mso/app/analysis_supervisor.hpp"
 #include "mso/app/application.hpp"
+#include "mso/app/detail/index_load_schedule.hpp"
+#include "mso/app/detail/open_progress_relay.hpp"
 #include "mso/app/file_lock.hpp"
 #include "mso/app/sample_index.hpp"
 #include "mso/app/workspace.hpp"
@@ -321,6 +325,102 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<std::pair<std::chrono::steady_clock::time_point, app::ApplicationEvent>> events_;
+};
+
+/// Supervisor time limits for tests: fast polling, production-sized leases and deadlines.
+app::AnalysisSupervisor::Timing fast_timing() {
+    app::AnalysisSupervisor::Timing timing;
+    timing.idle_wait = 20ms;
+    timing.event_poll = 20ms;
+    return timing;
+}
+
+/// A --self-test worker of this build: it never opens the input and simulates two minutes of work
+/// per task (it honors cancellation), so a job stays running until the supervisor ends it.
+worker::WorkerOptions self_test_worker() {
+    return worker::WorkerOptions{.executable = test::worker_executable(), .self_test = true};
+}
+
+/// A library with one sample and one queued analysis job, plus the hooks an AnalysisSupervisor
+/// needs to serve it. Records the worker statuses and errors the supervisor reports. Declare the
+/// supervisor after it, so the supervisor stops first.
+class SupervisedLibrary {
+public:
+    SupervisedLibrary() {
+        auto populated = test::make_library(scratch_ / "lib", {test::synthetic_file("tone.wav", 100, 100'000)});
+        library_ = std::shared_ptr<catalog::Library>(std::move(populated.library));
+        REQUIRE(library_->set_root_availability(populated.root_id, catalog::Availability::Online).has_value());
+        test::write_sine_wav(audio_file(), 0.1);
+        auto run = library_->create_analysis_run({"Musical", {"loudness"}, {sample_id()}, false});
+        REQUIRE(run.has_value());
+        REQUIRE(run->queued == 1);
+    }
+
+    /// Hooks serving this library; the sample always resolves to a real file.
+    app::AnalysisSupervisor::Hooks hooks() {
+        return app::AnalysisSupervisor::Hooks{
+            [this] { return std::vector<std::shared_ptr<catalog::Library>>{library_}; },
+            [this](catalog::Library&, const catalog::SampleDetail&) -> Result<std::filesystem::path> {
+                return audio_file();
+            },
+            [this](catalog::Library&, const std::string& status) {
+                std::lock_guard lock(mutex_);
+                statuses_.push_back(status);
+            },
+            [this](catalog::Library*, const std::string& context, const Error& error) {
+                std::lock_guard lock(mutex_);
+                errors_.push_back(context + ": " + error.message());
+            }};
+    }
+
+    /// One column of the job, as text ("" for NULL).
+    std::string job_column(std::string_view column) {
+        auto reader = library_->acquire_reader();
+        REQUIRE(reader.has_value());
+        auto statement = reader->connection().prepare(std::format("SELECT {} FROM jobs ORDER BY id LIMIT 1", column));
+        REQUIRE(statement.has_value());
+        auto has_row = statement->next_row();
+        REQUIRE(has_row.has_value());
+        REQUIRE(*has_row);
+        return statement->column_is_null(0) ? std::string() : statement->column_text(0);
+    }
+
+    /// How often the supervisor reported the worker as unavailable.
+    int unavailable_reports() const {
+        std::lock_guard lock(mutex_);
+        return static_cast<int>(std::ranges::count_if(
+            statuses_, [](const std::string& status) { return status.starts_with("worker unavailable"); }));
+    }
+    /// Every error the supervisor reported.
+    std::vector<std::string> errors() const {
+        std::lock_guard lock(mutex_);
+        return errors_;
+    }
+    /// Options of a "worker" that exists but cannot be started: a transient start failure.
+    worker::WorkerOptions unstartable_worker() const {
+        const auto file = scratch_ / "not-a-program.exe";
+        test::write_file(file, "this is not an executable");
+        return worker::WorkerOptions{.executable = file};
+    }
+
+    catalog::Library& library() { return *library_; }
+    const std::filesystem::path& scratch() const { return scratch_.path(); }
+
+private:
+    std::filesystem::path audio_file() const { return scratch_ / "pack/tone.wav"; }
+    std::int64_t sample_id() {
+        auto reader = library_->acquire_reader();
+        REQUIRE(reader.has_value());
+        auto id = reader->connection().query_int64("SELECT min(id) FROM samples");
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    ScratchDirectory scratch_{"supervisor"};
+    std::shared_ptr<catalog::Library> library_;
+    mutable std::mutex mutex_;
+    std::vector<std::string> statuses_;
+    std::vector<std::string> errors_;
 };
 
 }  // namespace
@@ -769,6 +869,22 @@ TEST_SUITE("app") {
         CHECK(paged.size() >= 203 - edited.size());
     }
 
+    TEST_CASE("SampleIndex::load stops when its token fires and keeps its previous state") {
+        ScratchDirectory scratch;
+        auto varied = make_varied_library(scratch / "lib", 60);
+        auto& library = *varied.populated.library;
+        app::SampleIndex index(library.uuid());
+        std::stop_source stop;
+        stop.request_stop();
+        auto loaded = index.load(library, stop.get_token());
+        REQUIRE_FALSE(loaded.has_value());
+        CHECK(loaded.error().code == ErrorCode::Cancelled);
+        CHECK_FALSE(index.ready());
+        // The cancelled stream gave its reader back: the next load reads every row.
+        REQUIRE(index.load(library).has_value());
+        CHECK(index.size() == 63);
+    }
+
     TEST_CASE("a library over the index budget is answered from SQLite with the same results") {
         ScratchDirectory scratch;
         SUBCASE("SampleIndex::load refuses more rows than its limit and keeps its previous state") {
@@ -1149,6 +1265,350 @@ TEST_SUITE("app") {
         auto missing = app::FileLock::try_acquire(scratch / "missing/dir/test.lock");
         REQUIRE_FALSE(missing.has_value());
         CHECK(missing.error().code == ErrorCode::FileMissing);
+    }
+
+    TEST_CASE("index reloads are coalesced: a burst of requests during a load becomes exactly one follow-up load") {
+        app::detail::IndexLoadSchedule schedule;
+        CHECK_FALSE(schedule.load_pending());
+        CHECK_FALSE(schedule.pending_load().has_value());
+
+        // Idle: the first request enqueues; further requests while queued are covered by it.
+        const auto first = schedule.request();
+        CHECK(first.enqueue);
+        CHECK(first.load_number == 1);
+        for (int burst = 0; burst < 10; ++burst) {
+            const auto covered = schedule.request();
+            CHECK_FALSE(covered.enqueue);
+            CHECK(covered.load_number == 1);
+        }
+        CHECK(schedule.pending_load() == 1u);
+
+        // Running: a burst of requests becomes one follow-up, numbered after the running load.
+        CHECK(schedule.begin_load() == 1);
+        CHECK(schedule.load_pending());
+        for (int burst = 0; burst < 50; ++burst) {
+            const auto follow_up = schedule.request();
+            CHECK_FALSE(follow_up.enqueue);  // the loader re-queues it when the running load ends
+            CHECK(follow_up.load_number == 2);
+        }
+        CHECK(schedule.pending_load() == 1u);
+        CHECK(schedule.finish_load());  // exactly one follow-up is due
+        CHECK(schedule.pending_load() == 2u);
+        CHECK(schedule.wait_for_load(1, {}));
+
+        // The follow-up runs; nothing arrives meanwhile, so no further load is scheduled.
+        CHECK(schedule.begin_load() == 2);
+        CHECK_FALSE(schedule.finish_load());
+        CHECK_FALSE(schedule.load_pending());
+        CHECK(schedule.loads_begun() == 2);
+        CHECK(schedule.wait_for_load(2, {}));
+
+        // A waiter for a load that will never run (nothing pending) returns at once.
+        CHECK_FALSE(schedule.wait_for_load(3, {}));
+
+        // A waiter blocked on a running load wakes when it finishes.
+        CHECK(schedule.request().enqueue);
+        CHECK(schedule.begin_load() == 3);
+        std::atomic<bool> woke{false};
+        std::jthread waiter([&] { woke = schedule.wait_for_load(3, {}); });
+        CHECK_FALSE(schedule.finish_load());
+        waiter.join();
+        CHECK(woke.load());
+    }
+
+    TEST_CASE("cached sort orders are patched in place and stay exact through edits, removals and new rows") {
+        ScratchDirectory scratch;
+        auto varied = make_varied_library(scratch / "lib", 240);
+        auto& library = *varied.populated.library;
+        auto index = loaded_index(library);
+        const app::IndexedLibrary sources[] = {{index.get(), &library, "Varied"}};
+        catalog::Library* libraries[] = {&library};
+        constexpr search::SortField kSorts[] = {
+            search::SortField::Name, search::SortField::Added,      search::SortField::Duration,
+            search::SortField::Size, search::SortField::SampleRate, search::SortField::Bpm,
+            search::SortField::Key,  search::SortField::Rating,     search::SortField::Format};
+        auto check_every_order = [&](std::string_view step) {
+            CAPTURE(step);
+            for (const auto sort : kSorts)
+                for (const bool descending : {false, true})
+                    check_same_results(sources, libraries, {.sort = sort, .descending = descending});
+            check_same_results(sources, libraries, {.text = "rating:>=2", .sort = search::SortField::Rating});
+        };
+        auto synchronize = [&] {
+            auto change = index->synchronize(library);
+            REQUIRE_MESSAGE(change.has_value(), change.error().message());
+            CHECK_FALSE(change->reload_required);
+        };
+        check_every_order("every order built before any change");
+
+        edit_samples(library, {7}, [](catalog::EditCommand& command) { command.rating = 5; });
+        synchronize();
+        check_every_order("one rating moved");
+
+        edit_samples(library, {7}, [](catalog::EditCommand& command) { command.favorite = true; });
+        synchronize();
+        check_every_order("a change that moves no order");
+
+        std::vector<std::int64_t> many;
+        for (std::int64_t id = 3; id <= 240; id += 3)
+            many.push_back(id);
+        edit_samples(library, many, [](catalog::EditCommand& command) {
+            command.bpm = catalog::BpmOverrideEdit{catalog::OverrideState::Value, 99'000};
+        });
+        synchronize();
+        check_every_order("many BPMs moved at once, with ties");
+
+        edit_samples(library, {11}, [](catalog::EditCommand& command) { command.display_name = "AAAA first by name"; });
+        edit_samples(library, {12}, [](catalog::EditCommand& command) { command.display_name = "zzzz last by name"; });
+        synchronize();
+        check_every_order("renamed rows");
+
+        // Removed rows free their slots, and rows added in the same change reuse them.
+        edit_samples(library, {20, 21, 22}, [](catalog::EditCommand& command) { command.removed = true; });
+        add_files(library, varied.populated.root_id,
+                  {test::synthetic_file("Drums/fresh 1.wav", 77, 1'000), test::synthetic_file("fresh 2.wav", 3, 9),
+                   test::synthetic_file("Loops/fresh 3.wav", 5'000'000, 50'000'000, "flac")});
+        synchronize();
+        CHECK(index->size() == 243);
+        check_every_order("rows removed and added in one change");
+
+        edit_samples(library, {20, 21, 22}, [](catalog::EditCommand& command) { command.removed = false; });
+        synchronize();
+        CHECK(index->size() == 246);
+        check_every_order("removed rows restored");
+    }
+
+    TEST_CASE("a library that is missing from one page and answers on the next makes the cursor stale") {
+        ScratchDirectory scratch;
+        auto first = make_varied_library(scratch / "first", 40, "First");
+        auto second = make_varied_library(scratch / "second", 40, "Second");
+        auto first_index = loaded_index(*first.populated.library);
+        auto second_index = loaded_index(*second.populated.library);
+        // The second library's catalog with a single reader: holding it makes the full-text id set of
+        // that library fail (RESOURCE_LIMIT after the reader wait), so it is missing from the page.
+        const auto second_directory = second.populated.library->directory();
+        second.populated.library.reset();
+        auto narrow = catalog::Library::open(second_directory, {.max_readers = 1});
+        REQUIRE(narrow.has_value());
+        auto& second_library = **narrow;
+        const app::IndexedLibrary sources[] = {{first_index.get(), first.populated.library.get(), "First"},
+                                               {second_index.get(), &second_library, "Second"}};
+        search::SearchRequest request{.text = "kick", .sort = search::SortField::Name, .page_size = 5};
+        search::SearchPage page;
+        {
+            auto held = second_library.acquire_reader();
+            REQUIRE(held.has_value());
+            auto partial = app::search_indexes(sources, request);
+            REQUIRE(partial.has_value());
+            page = std::move(*partial);
+        }
+        REQUIRE(page.coverage.size() == 2);
+        CHECK(page.coverage[0].complete != page.coverage[1].complete);
+        REQUIRE(page.next.has_value());
+        // The library answers again, with no position stored for it: resuming would restart it at
+        // its first row, so the view must re-query instead.
+        request.cursor = page.next;
+        auto resumed = app::search_indexes(sources, request);
+        REQUIRE_FALSE(resumed.has_value());
+        CHECK(resumed.error().code == ErrorCode::StaleCursor);
+    }
+
+    TEST_CASE("an edit too large for the outbox returns only after the index reflects it") {
+        ScratchDirectory scratch;
+        auto application = start_application(scratch / "workspace");
+        auto created = application->create_library(scratch / "lib", "Large");
+        REQUIRE(created.has_value());
+        // More samples than one change envelope lists (10,000): renaming their tag commits one
+        // envelope that only says "everything changed", and the index has to reload.
+        constexpr int kSamples = 10'001;
+        std::vector<catalog::ScannedFile> files;
+        files.reserve(kSamples);
+        for (int index = 0; index < kSamples; ++index)
+            files.push_back(test::synthetic_file(std::format("Pack/hit {:05}.wav", index), 10, 10'000));
+        auto populated = application->with_library(created->uuid, [&](catalog::Library& opened) -> Result<void> {
+            auto root = opened.add_root("Synthetic", catalog::RootMode::Referenced);
+            if (!root) return std::unexpected(root.error());
+            for (std::size_t offset = 0; offset < files.size(); offset += catalog::Library::kMaximumScanBatchFiles) {
+                const auto end = std::min(files.size(), offset + catalog::Library::kMaximumScanBatchFiles);
+                add_files(opened, root->id,
+                          {files.begin() + static_cast<std::ptrdiff_t>(offset),
+                           files.begin() + static_cast<std::ptrdiff_t>(end)});
+            }
+            return {};
+        });
+        REQUIRE(populated.has_value());
+        catalog::EditCommand tag_all;
+        tag_all.sample_ids.resize(kSamples);
+        std::iota(tag_all.sample_ids.begin(), tag_all.sample_ids.end(), std::int64_t{1});
+        tag_all.tags_add = {"Drums"};
+        REQUIRE(application->apply_edit(created->uuid, tag_all).has_value());
+        REQUIRE(test::wait_until([&] { return application->index_ready(created->uuid); }, kBackgroundTimeout));
+        auto tags =
+            application->with_library(created->uuid, [](catalog::Library& opened) { return opened.list_tags(); });
+        REQUIRE(tags.has_value());
+        REQUIRE(tags->size() == 1);
+
+        catalog::TaxonomyCommand rename{
+            .kind = catalog::TaxonomyCommand::Kind::RenameTag, .target_id = tags->front().id, .new_name = "Percussion"};
+        REQUIRE(application->apply_taxonomy(created->uuid, rename).has_value());
+        // No waiting here: apply_taxonomy returned after the reload it caused.
+        CHECK(application->index_ready(created->uuid));
+        const std::vector<app::SampleKey> keys = {{created->uuid, 1}, {created->uuid, kSamples}};
+        auto rows = application->rows(keys);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 2);
+        for (const auto& row : *rows)
+            CHECK(row.tag_paths == std::vector<std::string>{"Percussion"});
+        auto counted = application->count({.text = "tag:Percussion"}, created->uuid);
+        REQUIRE(counted.has_value());
+        CHECK(counted->total == kSamples);
+    }
+
+    TEST_CASE("a library over the index budget is indexed again once another library closes") {
+        ScratchDirectory scratch;
+        auto options = quiet_options(scratch / "workspace");
+        options.index_row_limit = 100;
+        auto started = app::Application::start(options);
+        REQUIRE(started.has_value());
+        auto& application = **started;
+        auto make_files = [](int count) {
+            std::vector<catalog::ScannedFile> files;
+            for (int index = 0; index < count; ++index)
+                files.push_back(test::synthetic_file(std::format("hit {:03}.wav", index), 10, 10'000));
+            return files;
+        };
+        auto big = application.create_library(scratch / "big", "Big");
+        REQUIRE(big.has_value());
+        populate_through_application(application, big->uuid, make_files(80));
+        REQUIRE(test::wait_until(
+            [&] {
+                auto counted = application.count({}, big->uuid);
+                return application.index_ready(big->uuid) && counted && counted->total == 80;
+            },
+            kBackgroundTimeout));
+        auto small = application.create_library(scratch / "small", "Small");
+        REQUIRE(small.has_value());
+        populate_through_application(application, small->uuid, make_files(50));
+        // 80 + 50 rows exceed the budget of 100: the second library is answered from SQLite.
+        REQUIRE(test::wait_until(
+            [&] {
+                auto counted = application.count({}, small->uuid);
+                return !application.index_ready(small->uuid) && counted && counted->total == 50;
+            },
+            kBackgroundTimeout));
+        REQUIRE(application.close_library(big->uuid).has_value());
+        CHECK(test::wait_until([&] { return application.index_ready(small->uuid); }, kBackgroundTimeout));
+        auto counted = application.count({}, small->uuid);
+        REQUIRE(counted.has_value());
+        CHECK(counted->total == 50);
+    }
+
+    TEST_CASE("analysis supervisor: job deadlines and retry delays follow the timing") {
+        app::AnalysisSupervisor::Timing timing;
+        timing.minimum_job_deadline = 60s;
+        timing.deadline_per_audio_second = 4.0;
+        timing.maximum_job_deadline = 30min;
+        CHECK(app::AnalysisSupervisor::job_deadline(timing, std::nullopt) == 60s);
+        CHECK(app::AnalysisSupervisor::job_deadline(timing, 0) == 60s);
+        CHECK(app::AnalysisSupervisor::job_deadline(timing, -5'000'000) == 60s);   // a damaged duration adds nothing
+        CHECK(app::AnalysisSupervisor::job_deadline(timing, 10'000'000) == 100s);  // 60 s + 4 x 10 s
+        CHECK(app::AnalysisSupervisor::job_deadline(timing, std::int64_t{24} * 3600 * 1'000'000) == 30min);
+
+        timing.first_retry_delay = 1s;
+        timing.maximum_retry_delay = 60s;
+        CHECK(app::AnalysisSupervisor::retry_delay(timing, 1) == 1s);
+        CHECK(app::AnalysisSupervisor::retry_delay(timing, 2) == 2s);
+        CHECK(app::AnalysisSupervisor::retry_delay(timing, 4) == 8s);
+        CHECK(app::AnalysisSupervisor::retry_delay(timing, 7) == 60s);  // 64 s capped
+        CHECK(app::AnalysisSupervisor::retry_delay(timing, 1000) == 60s);
+    }
+
+    TEST_CASE("analysis supervisor: a job past its deadline is cancelled and failed as retryable") {
+        SupervisedLibrary supervised;
+        auto timing = fast_timing();
+        timing.minimum_job_deadline = 300ms;  // the self-test task simulates two minutes of work
+        timing.deadline_per_audio_second = 0;
+        timing.maximum_job_deadline = 300ms;
+        const auto started = std::chrono::steady_clock::now();
+        app::AnalysisSupervisor supervisor(self_test_worker(), supervised.hooks(), timing);
+        REQUIRE(test::wait_until([&] { return supervised.job_column("error_code") == "WORKER_CRASH"; },
+                                 kBackgroundTimeout));
+        CHECK(std::chrono::steady_clock::now() - started < 60s);  // the deadline ended it, not the task
+        CHECK(supervised.errors().empty());
+    }
+
+    TEST_CASE("analysis supervisor: abandoning a library returns its running job to the queue") {
+        SupervisedLibrary supervised;
+        app::AnalysisSupervisor supervisor(self_test_worker(), supervised.hooks(), fast_timing());
+        REQUIRE(test::wait_until([&] { return supervised.job_column("state") == "running"; }, kBackgroundTimeout));
+        supervisor.abandon_library(supervised.library().uuid());
+        REQUIRE(test::wait_until([&] { return supervised.job_column("state") == "queued"; }, kBackgroundTimeout));
+        CHECK(supervised.job_column("error_code").empty());  // given back, not failed
+        supervisor.serve_library(supervised.library().uuid());
+        CHECK(test::wait_until([&] { return supervised.job_column("state") == "running"; }, kBackgroundTimeout));
+        CHECK(supervised.errors().empty());
+    }
+
+    TEST_CASE("analysis supervisor: failed worker starts back off, then pause the queue; resuming retries at once") {
+        SUBCASE("repeated failures pause the queue and the job stays queued") {
+            SupervisedLibrary supervised;
+            auto timing = fast_timing();
+            timing.first_retry_delay = 5ms;
+            timing.maximum_retry_delay = 20ms;
+            timing.failures_before_pause = 3;
+            app::AnalysisSupervisor supervisor(supervised.unstartable_worker(), supervised.hooks(), timing);
+            REQUIRE(test::wait_until([&] { return supervisor.paused(); }, kBackgroundTimeout));
+            CHECK(supervisor.status().worker_unavailable);
+            CHECK(supervised.unavailable_reports() == 3);
+            CHECK(supervised.job_column("state") == "queued");
+        }
+        SUBCASE("a missing executable pauses at the first failure") {
+            SupervisedLibrary supervised;
+            app::AnalysisSupervisor supervisor(
+                worker::WorkerOptions{.executable = supervised.scratch() / "missing.exe"}, supervised.hooks(),
+                fast_timing());
+            REQUIRE(test::wait_until([&] { return supervisor.paused(); }, kBackgroundTimeout));
+            CHECK(supervised.unavailable_reports() == 1);
+        }
+        SUBCASE("resuming ends a long backoff wait") {
+            SupervisedLibrary supervised;
+            auto timing = fast_timing();
+            timing.first_retry_delay = 1h;  // the test would time out if only the backoff ended the wait
+            timing.maximum_retry_delay = 1h;
+            app::AnalysisSupervisor supervisor(supervised.unstartable_worker(), supervised.hooks(), timing);
+            REQUIRE(test::wait_until([&] { return supervised.unavailable_reports() == 1; }, kBackgroundTimeout));
+            supervisor.notify();           // new work does not cut a backoff short...
+            supervisor.set_paused(false);  // ...but resuming does
+            CHECK(test::wait_until([&] { return supervised.unavailable_reports() >= 2; }, kBackgroundTimeout));
+        }
+    }
+
+    TEST_CASE("open progress reaches the event handler: every step start and end, throttled in between") {
+        std::vector<app::LibraryOpenProgressEvent> events;
+        const auto library = new_uuid();
+        const auto relay = app::detail::open_progress_relay(
+            [&](const app::ApplicationEvent& event) {
+                const auto* progress = std::get_if<app::LibraryOpenProgressEvent>(&event);
+                REQUIRE(progress != nullptr);
+                events.push_back(*progress);
+            },
+            library, "lib");
+        using catalog::OpenStep;
+        relay({OpenStep::BackingUp, 0, 1});
+        relay({OpenStep::BackingUp, 1, 1});
+        relay({OpenStep::RebuildingKeys, 0, 4});
+        relay({OpenStep::RebuildingKeys, 1, 4});  // within the interval of the step start: dropped
+        relay({OpenStep::RebuildingKeys, 2, 4});
+        relay({OpenStep::RebuildingKeys, 4, 4});  // a step's end always goes out
+        REQUIRE(events.size() == 4);
+        CHECK(events[0].step == OpenStep::BackingUp);
+        CHECK(events[1].completed == 1);
+        CHECK(events[2].step == OpenStep::RebuildingKeys);
+        CHECK(events[2].completed == 0);
+        CHECK(events[3].completed == 4);
+        CHECK(events[3].total == 4);
+        CHECK(events[3].library == library);
+        CHECK(events[3].directory == std::filesystem::path("lib"));
     }
 
 }  // TEST_SUITE("app")

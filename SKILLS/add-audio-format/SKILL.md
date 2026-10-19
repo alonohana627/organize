@@ -64,12 +64,20 @@ unparseable). Every backend keeps the decoder contract:
   still held);
 - `frames_exact()` is true only when a full read delivers exactly `total_frames()` on that backend
   (FFmpeg's Vorbis decoder is 128 frames short of the granule count, so it reports an estimate; the MP3
-  probe trims at least the 529-frame decoder delay at the end, as dr_mp3 does).
+  probe trims at least the 529-frame decoder delay at the end, as dr_mp3 does);
+- a read that fails part-way (a drive that drops out) is an error, never a silent end of the stream:
+  stb_vorbis turns a failed `fread` into EOF, so its backend checks `ferror()`, and the FFmpeg backend
+  checks the read callback's error at every end of file. A seek starts afresh (`clearerr`,
+  `FfmpegInput::clear_read_error`), so the file plays again once the drive is back. The tests lock a
+  byte range of the file (`LockFileEx`) to make reads fail.
 
 A decoder library is vendored code: a fix to it is a patch in `patches/<name>/` listed in
 `deps/manifest.json` (for example `patches/miniaudio/0001-stb-vorbis-setup-allocation-overflow.patch`,
-which bounds stb_vorbis's header allocations and frees a failing codebook's temporary tables), never a
-hand edit.
+which bounds stb_vorbis's header allocations, frees a failing codebook's temporary tables, keeps all
+sixteen submaps of a mapping and never looks up a failed codebook decode), never a hand edit. To change
+a patch: reverse-apply it to a copy of the vendored file to get upstream, edit a second copy, write
+the patch with `git diff` (paths `a/deps/...`), then run `python deps/update_deps.py <name>` and
+`python deps/update_deps.py --check`.
 
 ## Tests (`tests/media_tests.cpp`)
 

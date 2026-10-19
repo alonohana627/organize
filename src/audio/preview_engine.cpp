@@ -87,6 +87,9 @@ std::invoke_result_t<Request&> guarded_device_request(Request request) {
         return fail(ErrorCode::ResourceLimit, "out of memory handing a request to the audio output thread");
     } catch (const std::exception&) {
         return fail(ErrorCode::Internal, "cannot hand the request to the audio output thread");
+    } catch (...) {
+        // Final barrier: the output thread hands back whatever its work threw; the UI must survive it.
+        return fail(ErrorCode::Internal, "the audio output thread failed the request");
     }
 }
 
@@ -139,6 +142,36 @@ public:
             return fail(ErrorCode::InvalidArgument, "the offline backend has no output device to restart");
         }
         return guarded_device_request([this] { return output_->restart(); });
+    }
+
+    void list_output_devices_async(DeviceRequestCompletion<std::vector<OutputDeviceInfo>> on_done) override {
+        if (!output_) {
+            if (on_done) {
+                on_done(std::vector<OutputDeviceInfo>{});
+            }
+            return;
+        }
+        output_->list_devices_async(std::move(on_done));
+    }
+
+    void select_output_device_async(OutputDeviceId device, DeviceRequestCompletion<void> on_done) override {
+        if (!output_) {
+            if (on_done) {
+                on_done(fail(ErrorCode::InvalidArgument, "the offline backend has no output devices"));
+            }
+            return;
+        }
+        output_->select_async(std::move(device), std::move(on_done));
+    }
+
+    void restart_output_device_async(DeviceRequestCompletion<void> on_done) override {
+        if (!output_) {
+            if (on_done) {
+                on_done(fail(ErrorCode::InvalidArgument, "the offline backend has no output device to restart"));
+            }
+            return;
+        }
+        output_->restart_async(std::move(on_done));
     }
 
     Result<void> open(const std::filesystem::path& file) override {

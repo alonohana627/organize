@@ -59,7 +59,8 @@ inline constexpr std::int64_t kOutboxSizeCheckInterval = 256;
                                                     std::span<const std::int64_t> sample_ids, bool search_text_changed);
 
 /// Set-based variant: `select_sample_ids_sql` is a SELECT whose rows carry a column named
-/// `sample_id`; `parameters` bind ?1, ?2, … inside it.
+/// `sample_id`; `parameters` bind ?1, ?2, … inside it. Repeated ids are fine (the insert is an
+/// upsert), so the SELECT needs no DISTINCT and its temporary B-tree.
 [[nodiscard]] Result<void> mark_samples_changed(sqlite::Connection& connection, std::string_view select_sample_ids_sql,
                                                 std::span<const std::int64_t> parameters, bool search_text_changed);
 

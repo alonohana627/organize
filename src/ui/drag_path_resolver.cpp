@@ -1,12 +1,19 @@
 #include "mso/ui/drag_path_resolver.hpp"
 
 #include <algorithm>
+#include <utility>
 
 #include "mso/ui/application_session.hpp"
+#include "mso/ui/background_tasks.hpp"
 
 namespace mso::ui {
 
-DragPathResolver::DragPathResolver(ApplicationSession& session, QObject* parent) : QObject(parent), session_(session) {
+DragPathResolver::DragPathResolver(ApplicationSession& session, QObject* parent)
+    : DragPathResolver(PathLookup{}, parent) {
+    session_ = &session;
+}
+
+DragPathResolver::DragPathResolver(PathLookup lookup, QObject* parent) : QObject(parent), lookup_(std::move(lookup)) {
     pool_.setMaxThreadCount(1);
     pool_.setObjectName(QStringLiteral("DragPathResolver"));
     debounce_.setSingleShot(true);
@@ -38,32 +45,54 @@ void DragPathResolver::resolve(std::vector<SampleKey> keys) {
     debounce_.start();
 }
 
+std::vector<Result<std::filesystem::path>> DragPathResolver::check_keys(const std::vector<SampleKey>& keys,
+                                                                        const PathLookup& lookup,
+                                                                        const std::stop_token& stop) {
+    std::vector<Result<std::filesystem::path>> results;
+    results.reserve(keys.size());
+    for (const SampleKey& key : keys) {
+        if (stop.stop_requested()) break;  // a newer selection: stop between two files
+        results.push_back(lookup(key));
+    }
+    return results;
+}
+
 void DragPathResolver::start_check() {
-    if (!session_.is_ready() || keys_.empty()) return;
+    if (keys_.empty() || (session_ && !session_->is_ready())) return;
     stop_ = std::stop_source();
     checking_ = true;
     const std::uint64_t generation = generation_;
-    session_.run_on(
+    const auto deliver = [this, generation](std::vector<Result<std::filesystem::path>> results) {
+        finish_check(generation, std::move(results));
+    };
+    if (session_) {
+        session_->run_on(
+            pool_, this,
+            [keys = keys_, stop = stop_.get_token()](app::Application& application) {
+                return check_keys(
+                    keys,
+                    [&application](const SampleKey& key) {
+                        return application.resolve_playable_path(key.library, key.sample_id);
+                    },
+                    stop);
+            },
+            deliver);
+        return;
+    }
+    run_in_background(
         pool_, this,
-        [keys = keys_, stop = stop_.get_token()](app::Application& application) {
-            std::vector<Result<std::filesystem::path>> results;
-            results.reserve(keys.size());
-            for (const SampleKey& key : keys) {
-                if (stop.stop_requested()) return std::vector<Result<std::filesystem::path>>{};
-                results.push_back(application.resolve_playable_path(key.library, key.sample_id));
-            }
-            return results;
-        },
-        [this, generation](std::vector<Result<std::filesystem::path>> results) {
-            if (generation != generation_) return;  // superseded by a newer selection
-            checking_ = false;
-            if (results.size() != keys_.size()) return;  // cancelled
-            results_ = std::move(results);
-            for (std::size_t index = 0; index < keys_.size(); ++index)
-                index_of_key_.emplace(keys_[index], index);
-            ready_ = true;
-            emit resolved();
-        });
+        [keys = keys_, lookup = lookup_, stop = stop_.get_token()] { return check_keys(keys, lookup, stop); }, deliver);
+}
+
+void DragPathResolver::finish_check(std::uint64_t generation, std::vector<Result<std::filesystem::path>> results) {
+    if (generation != generation_) return;  // superseded by a newer selection
+    checking_ = false;
+    if (results.size() != keys_.size()) return;  // cancelled
+    results_ = std::move(results);
+    for (std::size_t index = 0; index < keys_.size(); ++index)
+        index_of_key_.emplace(keys_[index], index);
+    ready_ = true;
+    emit resolved();
 }
 
 bool DragPathResolver::is_ready_for(const std::vector<SampleKey>& keys) const {

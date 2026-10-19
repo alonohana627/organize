@@ -427,8 +427,12 @@ private:
         const std::int64_t start = stream_->start_time == AV_NOPTS_VALUE ? 0 : stream_->start_time;
         const std::int64_t timestamp =
             start + av_rescale_q(frame + timeline_origin_, sample_time_base(output_rate_), stream_->time_base);
+        input_->clear_read_error();  // reads after the seek start afresh
         const int status = av_seek_frame(input_->context(), stream_->index, timestamp, AVSEEK_FLAG_BACKWARD);
-        if (status < 0) return fail(ErrorCode::CorruptAudio, std::format("seek failed: {}", ffmpeg_error_text(status)));
+        if (status < 0) {
+            if (input_->read_error()) return std::unexpected(*input_->read_error());
+            return fail(ErrorCode::CorruptAudio, std::format("seek failed: {}", ffmpeg_error_text(status)));
+        }
         avcodec_flush_buffers(codec_.get());
         resampler_.reset();  // drop samples buffered from before the seek
         pending_.clear();

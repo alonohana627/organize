@@ -1,8 +1,10 @@
 // The `mso` command line, driven in-process through mso::cli::run() against a scratch workspace:
-// every command, exit codes, --json output, option exclusivity, option storage lifetime, the
-// library lock shared with the desktop app, Ctrl+C handling and an analyze that cannot hang.
+// every command, exit codes, --json output (streamed rows), option exclusivity, the storage
+// lifetime of every flag and option, the library lock shared with the desktop app, Ctrl+C
+// handling and an analyze that cannot hang.
 #include <doctest.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <format>
 #include <string>
@@ -287,30 +289,93 @@ TEST_SUITE("cli") {
     TEST_CASE("every flag and option binds to storage that outlives registration") {
         // Regression: `collection --delete` bound CLI11 to a bool whose last owner died when
         // registration returned, so parse() wrote into freed memory (ASan: heap-use-after-free).
-        // Option values now live in the CommandContext; this exercises every flag of every
-        // command, so the sanitize preset fails here if any binding regresses.
+        // Option values now live in the CommandContext. This test passes every flag and every
+        // option of every command (the global --workspace, --worker and --json included) at least
+        // once, so the sanitize preset fails here if any binding regresses.
         CommandLine cli;
-        cli.prepare_library();
-        CHECK(cli.run({"collection", cli.library(), "--create", "Doomed"}).exit_code == cli::kExitSuccess);
-        CHECK(contains(cli.run({"collections", cli.library()}).output, "Doomed"));
-        CHECK(cli.run({"collection", cli.library(), "--id", "1", "--delete"}).exit_code == cli::kExitSuccess);
-        CHECK_FALSE(contains(cli.run({"collections", cli.library()}).output, "Doomed"));
-        CHECK(cli.run({"collection", cli.library(), "--delete"}).exit_code == cli::kExitUsage);  // needs --id
+        const auto& library = cli.library();
+        const auto wav = path_to_utf8(cli.scratch() / "samples/Drums/Kick 01.wav");
+        test::write_sine_wav(cli.scratch() / "more/Snare.wav", 0.1);
+        const auto more = path_to_utf8(cli.scratch() / "more");
+        auto succeeds = [&](std::vector<std::string> arguments) {
+            std::string command_line;
+            for (const auto& argument : arguments)
+                command_line += argument + ' ';
+            CAPTURE(command_line);
+            const auto outcome = cli.run(std::move(arguments));
+            CAPTURE(outcome.errors);
+            CHECK(outcome.exit_code == cli::kExitSuccess);
+            return outcome;
+        };
 
-        CHECK(cli.run({"edit", cli.library(), "1", "--tag", "Drums/Kick", "--category", "Bass"}).exit_code ==
-              cli::kExitSuccess);
-        CHECK(cli.run({"edit", cli.library(), "1", "--clear-category"}).exit_code == cli::kExitSuccess);
-        CHECK(cli.run({"edit", cli.library(), "1", "--remove"}).exit_code == cli::kExitSuccess);
-        CHECK(cli.run({"edit", cli.library(), "1", "--restore"}).exit_code == cli::kExitSuccess);
-        CHECK(cli.run({"tag", cli.library(), "2", "--move-to-top"}).exit_code == cli::kExitSuccess);
-        auto searched = cli.run({"--json", "search", "-l", cli.library(), "--desc", "--count", "--sort", "bpm"});
-        CHECK(searched.exit_code == cli::kExitSuccess);
+        // create --name, add-root --name, import --root
+        succeeds({"create", library, "--name", "Bindings"});
+        succeeds({"add-root", library, cli.samples()});
+        succeeds({"add-root", library, more, "--name", "More"});
+        succeeds({"import", library, "--root", "1"});
+        succeeds({"import", library, "--root", "2"});
+        succeeds({"info", library});
+
+        // collection --create, --smart, --id, --rename, --delete
+        succeeds({"collection", library, "--create", "Doomed"});
+        CHECK(contains(cli.run({"collections", library}).output, "Doomed"));
+        succeeds({"collection", library, "--id", "1", "--delete"});
+        CHECK_FALSE(contains(cli.run({"collections", library}).output, "Doomed"));
+        CHECK(cli.run({"collection", library, "--delete"}).exit_code == cli::kExitUsage);  // needs --id
+        succeeds({"collection", library, "--create", "Keep"});
+        succeeds({"collection", library, "--id", "2", "--rename", "Kept"});
+        succeeds({"collection", library, "--create", "Kicks", "--smart", "kick"});
+
+        // edit: every option, then every flag
+        succeeds({"edit",       library,    "1",          "--rating",    "4",
+                  "--favorite", "yes",      "--notes",    "punchy",      "--name",
+                  "Kick One",   "--tag",    "Drums/Kick", "--tag",       "Other",
+                  "--category", "Bass",     "--bpm",      "128",         "--key",
+                  "F#m",        "--add-to", "2",          "--operation", uuids::to_string(new_uuid())});
+        succeeds({"edit", library, "1", "--untag", "Other", "--remove-from", "2"});
+        succeeds({"edit", library, "1", "--clear-category"});
+        succeeds({"edit", library, "1", "--remove"});
+        succeeds({"edit", library, "1", "--restore"});
+
+        // tag --rename, --move-under, --merge-into, --move-to-top (ids: Drums 1, Kick 2, Other 3)
+        succeeds({"tag", library, "3", "--rename", "Another"});
+        succeeds({"tag", library, "3", "--move-under", "1"});
+        succeeds({"tag", library, "2", "--move-to-top"});
+        succeeds({"tag", library, "3", "--merge-into", "2"});
+        succeeds({"tags", library});
+        succeeds({"show", library, "1"});
+        succeeds({"history", library});
+        succeeds({"undo", library});
+        succeeds({"redo", library});
+
+        // search -l, --sort, --desc, --limit, --count; the global --json
+        auto searched = succeeds({"--json", "search", "-l", library, "--library", library, "--desc", "--count",
+                                  "--sort", "bpm", "--limit", "5", "kick"});
         CHECK(nlohmann::json::parse(searched.output, nullptr, false)["total"] == 1);
-        CHECK(cli.run({"export", cli.library(), path_to_utf8(cli.scratch() / "raw.csv"), "--raw", "--absolute-paths"})
-                  .exit_code == cli::kExitSuccess);
+
+        // export --raw, --absolute-paths, --format, --query; backup and check
+        succeeds({"export", library, path_to_utf8(cli.scratch() / "raw.csv"), "--raw", "--absolute-paths"});
+        succeeds({"export", library, path_to_utf8(cli.scratch() / "out.json"), "--format", "json", "--query", "kick"});
+        succeeds({"backup", library});
+        succeeds({"check", library});
+
+        // probe, capabilities, play --backend, --seconds, --volume
+        succeeds({"probe", wav});
+        succeeds({"capabilities"});
+        succeeds({"play", wav, "--backend", "null", "--seconds", "0.1", "--volume", "-12"});
+
+        // analyze with a query, --profile, --force, --timeout; the global --worker
+        auto analyzed = cli.run({"--worker", unstartable_worker(cli), "analyze", library, "kick", "--profile",
+                                 "Waveforms", "--force", "--timeout", "1"});
+        CHECK(analyzed.exit_code == cli::kExitFailure);
+        CHECK(contains(analyzed.errors, "timed out"));
+
+        // bench --rows, --repetitions, --names
+        succeeds(
+            {"bench", path_to_utf8(cli.scratch() / "bench"), "--rows", "50", "--repetitions", "1", "--names", "short"});
     }
 
-    TEST_CASE("Ctrl+C during import, export and analyze exits 130 and keeps committed work") {
+    TEST_CASE("Ctrl+C during import, export, backup and analyze exits 130 and keeps committed work") {
         CommandLine cli;
         REQUIRE(cli.run({"create", cli.library()}).exit_code == cli::kExitSuccess);
         REQUIRE(cli.run({"add-root", cli.library(), cli.samples()}).exit_code == cli::kExitSuccess);
@@ -326,6 +391,11 @@ TEST_SUITE("cli") {
         CHECK(cli.run({"export", cli.library(), path_to_utf8(cli.scratch() / "out.csv")}).exit_code ==
               cli::kExitInterrupted);
         CHECK_FALSE(std::filesystem::exists(cli.scratch() / "out.csv"));
+
+        cli::InterruptScope::simulate_interrupt();
+        CHECK(cli.run({"backup", cli.library()}).exit_code == cli::kExitInterrupted);
+        CHECK(std::ranges::none_of(std::filesystem::directory_iterator(path_from_utf8(cli.library()) / "backups"),
+                                   [](const auto& entry) { return entry.is_regular_file(); }));
 
         cli::InterruptScope::simulate_interrupt();
         auto analyze = cli.run(

@@ -13,7 +13,13 @@
 ///
 /// Memory: the indexes of all open libraries together hold at most
 /// ApplicationOptions::index_row_limit rows. A library that would exceed it (or whose growth
-/// exceeds it) is answered from SQLite instead, with the same results, only slower.
+/// exceeds it) is answered from SQLite instead, with the same results, only slower; it is indexed
+/// again once it fits with 10% to spare (checked when another library closes and every 30 s).
+///
+/// Index reloads (when the change feed cannot describe a change, e.g. a tag renamed on more than
+/// 10,000 samples) are coalesced per library: at most one queued and one running, and requests
+/// that arrive while one runs become a single follow-up. Background updates of one library are
+/// coalesced to one per 100 ms.
 ///
 /// Threading: every method is thread-safe and synchronous. Long work (import, analysis, export,
 /// index loading) runs on background threads owned by the Application. Events are delivered on
@@ -55,6 +61,11 @@ struct OpenLibraryInfo {
     /// session opened it read-only.
     bool in_use_elsewhere = false;
     std::int64_t root_count = 0;  ///< sample folders registered in the library
+    /// Samples whose rebuilt name or path key collided with another row's when this session opened
+    /// the library (an open review item lists them); 0 normally.
+    std::int64_t key_conflicts = 0;
+    /// The verified backup taken before keys were rebuilt at this open, if any.
+    std::optional<std::filesystem::path> pre_rekey_backup;
 };
 
 /// Identifies one sample across the open libraries.
@@ -127,9 +138,22 @@ struct LibraryAccessChangedEvent {
     bool in_use_elsewhere = false;  ///< another process still holds the lock
 };
 
+/// A library being opened (open_library(), or a read-only library becoming writable) is doing
+/// one-time work that can take seconds on a big catalog: a verified backup, schema migrations, a
+/// rebuild of its name and path keys, an integrity check. Emitted on the opening thread at the start
+/// of each step, at most every kOpenProgressInterval while a step runs, and when a step completes,
+/// so the UI can show that the library is being upgraded instead of looking hung.
+struct LibraryOpenProgressEvent {
+    uuids::uuid library;              ///< from the folder's library.json
+    std::filesystem::path directory;  ///< the library folder
+    catalog::OpenStep step = catalog::OpenStep::BackingUp;
+    int completed = 0;  ///< parts of `step` done (a migration, a rebuilt table, the whole backup or check)
+    int total = 1;      ///< parts of `step`
+};
+
 using ApplicationEvent =
     std::variant<ImportProgressEvent, CatalogChangedEvent, RootAvailabilityEvent, AnalysisProgressEvent,
-                 OperationFinishedEvent, BackgroundErrorEvent, LibraryAccessChangedEvent>;
+                 OperationFinishedEvent, BackgroundErrorEvent, LibraryAccessChangedEvent, LibraryOpenProgressEvent>;
 using EventHandler = std::function<void(const ApplicationEvent&)>;
 
 // ---------------------------------------------------------------- export
@@ -179,6 +203,10 @@ struct ApplicationOptions {
     /// folder at start-up and whenever it reconnects, and analyze what an import adds (see
     /// automatic_analysis_profile). The CLI and tests leave this off and stay fully explicit.
     bool automatic_mode = false;
+    /// Event handler installed before start() opens any library, so events of the start-up itself
+    /// (LibraryOpenProgressEvent while a reopened library upgrades) are delivered. Replace it later
+    /// with set_event_handler(). Empty: no handler until set_event_handler() is called.
+    EventHandler event_handler;
 };
 
 /// State of the background analysis queue.
@@ -196,6 +224,8 @@ public:
 
     /// Minimum spacing of CatalogChangedEvent and AnalysisProgressEvent per library.
     static constexpr std::chrono::milliseconds kEventInterval{150};
+    /// Minimum spacing of LibraryOpenProgressEvent within one step (step starts and ends always go out).
+    static constexpr std::chrono::milliseconds kOpenProgressInterval{100};
 
     /// Loads the workspace, starts the background services and (per options) reopens libraries.
     [[nodiscard]] static Result<std::unique_ptr<Application>> start(const ApplicationOptions& options = {});
@@ -294,8 +324,9 @@ public:
     /// True once the library's in-memory index has loaded.
     bool index_ready(const uuids::uuid& library) const;
     /// Applies an edit and patches the in-memory index before returning (so rows() already shows
-    /// it); the coalesced CatalogChangedEvent follows. A receipt with `partial` set means only part
-    /// of a chunked edit was applied; callers must tell the user.
+    /// it); the coalesced CatalogChangedEvent follows. An edit the change feed cannot describe waits
+    /// for the index reload it causes. A receipt with `partial` set means only part of a chunked
+    /// edit was applied; callers must tell the user.
     [[nodiscard]] Result<catalog::MutationReceipt> apply_edit(const uuids::uuid& library,
                                                               const catalog::EditCommand& command);
     /// Applies a taxonomy change (tags, categories, collections) and patches the index.
@@ -350,7 +381,6 @@ public:
 
 private:
     struct State;
-    struct LibraryEntry;
     explicit Application(std::unique_ptr<State> state);
 
     /// The open library (kept alive by the returned pointer, which shares ownership of its entry).

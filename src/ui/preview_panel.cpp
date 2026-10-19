@@ -6,6 +6,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMenu>
+#include <QPointer>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -53,7 +54,10 @@ audio::OutputBackend backend_from_environment() {
 
 }  // namespace
 
-PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent) : QWidget(parent), session_(session) {
+PreviewPanel::PreviewPanel(ApplicationSession& session, QWidget* parent, EngineFactory factory)
+    : QWidget(parent),
+      session_(session),
+      engine_factory_(factory ? std::move(factory) : EngineFactory(&audio::PreviewEngine::create)) {
     waveform_pool_.setMaxThreadCount(1);
     engine_pool_.setMaxThreadCount(1);
     engine_pool_.setObjectName(QStringLiteral("PreviewEngine"));
@@ -219,7 +223,8 @@ PreviewPanel::~PreviewPanel() {
     waveform_pool_.waitForDone();
     engine_pool_.waitForDone();  // a creation still running finishes first
     // The engine keeps COM on its own output thread, so destroying it here is safe; it closes the
-    // device and joins its threads.
+    // device and joins its threads. Device requests still waiting answer CANCELLED meanwhile, while
+    // this panel is whole: their queued deliveries are dropped with it.
     engine_.reset();
 }
 
@@ -246,8 +251,12 @@ void PreviewPanel::select_sample(const std::optional<SampleKey>& key, const QStr
 
 void PreviewPanel::toggle_play_pause() {
     if (engine_ && loaded_key_ && loaded_key_ == selected_key_) {
-        if (engine_->snapshot().state != audio::PreviewState::Playing) recover_device_before_play();
-        post(audio::transport::TogglePlayPause{});
+        // An explicit Pause or Play, never a toggle: after a device loss the restore already plays,
+        // and a queued toggle would pause it again at once.
+        if (engine_->snapshot().state == audio::PreviewState::Playing)
+            post(audio::transport::Pause{});
+        else
+            play_loaded();
         return;
     }
     resolve_selected(PathUse::Play);
@@ -255,11 +264,18 @@ void PreviewPanel::toggle_play_pause() {
 
 void PreviewPanel::play_selected() {
     if (engine_ && loaded_key_ && loaded_key_ == selected_key_) {
-        recover_device_before_play();
-        post(audio::transport::Play{});
+        play_loaded();
         return;
     }
     resolve_selected(PathUse::Play);
+}
+
+void PreviewPanel::play_loaded() {
+    if (engine_ && engine_->snapshot().output_device_lost) {
+        restart_output_device(true, false);  // plays once the device is back
+        return;
+    }
+    post(audio::transport::Play{});
 }
 
 void PreviewPanel::stop() {
@@ -307,10 +323,9 @@ void PreviewPanel::on_path_resolved(const SampleKey& key, const std::filesystem:
     }
     loaded_key_ = key;
     loaded_generation_ = engine_->snapshot().generation;
-    if (autoplay) recover_device_before_play();
     status_label_->clear();
     post(audio::transport::SetSpeed{speed_spin_->value()});
-    if (autoplay) post(audio::transport::Play{});
+    if (autoplay) play_loaded();
     update_controls_enabled();
 }
 
@@ -325,7 +340,7 @@ void PreviewPanel::request_engine() {
     if (!engine_failure_.isEmpty()) status_label_->setText(tr("Opening the audio output again…"));
     // Opening the output device can take hundreds of milliseconds: never on the UI thread.
     run_in_background(
-        engine_pool_, this, [options]() -> Creation { return audio::PreviewEngine::create(options); },
+        engine_pool_, this, [options, factory = engine_factory_]() -> Creation { return factory(options); },
         [this](Creation created) {
             engine_requested_ = false;
             if (!created) {
@@ -434,31 +449,79 @@ void PreviewPanel::retry_output_device() {
         request_engine();  // no engine yet (creation failed): create it again
         return;
     }
-    if (auto restarted = engine_->restart_output_device(); !restarted) {
-        status_label_->setText(
-            tr("The audio device is still unavailable: %1").arg(DisplayFormat::error(restarted.error())));
-        emit statusMessage(status_label_->text());
-    } else {
-        status_label_->clear();
-    }
-    update_device_notice(engine_->snapshot());
-    if (!poll_timer_.isActive()) poll_timer_.start();  // a resumed preview shows its progress
+    restart_output_device(false, true);
 }
 
-void PreviewPanel::recover_device_before_play() {
-    if (!engine_ || !engine_->snapshot().output_device_lost) return;
-    // Play is a good moment to try the device again (the user may just have plugged it in).
-    if (auto restarted = engine_->restart_output_device(); !restarted)
-        status_label_->setText(
-            tr("The audio device is still unavailable: %1").arg(DisplayFormat::error(restarted.error())));
-    update_device_notice(engine_->snapshot());
+template <class Value, class Deliver>
+audio::DeviceRequestCompletion<Value> PreviewPanel::on_ui_thread(Deliver deliver) {
+    ++device_requests_running_;
+    // Called once, on the engine's output thread (or at once on this thread for a refused request):
+    // only a queued call to the UI thread happens there. The guard is never null while it runs (the
+    // destructor destroys the engine, which answers every waiting request, before anything else);
+    // it keeps a late answer from reaching a destroyed panel all the same.
+    const QPointer<PreviewPanel> guard(this);
+    return [guard, deliver = std::move(deliver)](Result<Value> result) {
+        PreviewPanel* panel = guard.data();
+        if (!panel) return;
+        QMetaObject::invokeMethod(
+            panel,
+            [panel, deliver, result = std::move(result)] {
+                --panel->device_requests_running_;
+                deliver(result);
+            },
+            Qt::QueuedConnection);
+    };
+}
+
+void PreviewPanel::restart_output_device(bool then_play, bool announce_failure) {
+    if (!engine_) return;
+    play_after_restart_ = play_after_restart_ || then_play;
+    announce_restart_failure_ = announce_restart_failure_ || announce_failure;
+    if (restart_in_flight_) return;  // the restart already on its way answers this request too
+    restart_in_flight_ = true;
+    status_label_->setText(tr("Reconnecting the audio device…"));
+    engine_->restart_output_device_async(on_ui_thread<void>([this](const Result<void>& restarted) {
+        restart_in_flight_ = false;
+        const bool play = std::exchange(play_after_restart_, false);
+        const bool announce = std::exchange(announce_restart_failure_, false);
+        if (!restarted) {
+            // The engine keeps retrying by itself; the notice stays up.
+            status_label_->setText(
+                tr("The audio device is still unavailable: %1").arg(DisplayFormat::error(restarted.error())));
+            if (announce) emit statusMessage(status_label_->text());
+        } else {
+            status_label_->clear();
+            // The restart resumes what was playing when the device went; Play asked
+            // for playback in any case (Play is idempotent while playing).
+            if (play && loaded_key_ && loaded_key_ == selected_key_) post(audio::transport::Play{});
+        }
+        update_device_notice(engine_->snapshot());
+        if (!poll_timer_.isActive()) poll_timer_.start();  // a resumed preview shows its progress
+    }));
 }
 
 bool PreviewPanel::device_notice_visible() const {
     return !device_notice_->isHidden();
 }
 
+QString PreviewPanel::status_text() const {
+    return status_label_->text();
+}
+
 void PreviewPanel::fill_device_menu() {
+    populate_device_menu();  // the last list at once: opening the menu never waits for the device
+    if (!engine_ || listing_devices_) return;
+    listing_devices_ = true;
+    engine_->list_output_devices_async(on_ui_thread<std::vector<audio::OutputDeviceInfo>>(
+        [this](const Result<std::vector<audio::OutputDeviceInfo>>& devices) {
+            listing_devices_ = false;
+            device_list_ = devices;
+            // Only an open menu is rebuilt (a closed one is filled when it opens).
+            if (device_menu_->isVisible()) populate_device_menu();
+        }));
+}
+
+void PreviewPanel::populate_device_menu() {
     device_menu_->clear();
     if (!engine_) {
         device_menu_->addAction(tr("(audio output not open yet)"))->setEnabled(false);
@@ -471,30 +534,39 @@ void PreviewPanel::fill_device_menu() {
     follow_default->setCheckable(true);
     follow_default->setChecked(chosen.is_system_default());
     device_menu_->addSeparator();
-    auto devices = engine_->list_output_devices();
-    if (!devices) {
-        device_menu_->addAction(tr("Devices unavailable: %1").arg(DisplayFormat::error(devices.error())))
-            ->setEnabled(false);
+    if (!device_list_) {
+        device_menu_->addAction(tr("Looking for devices…"))->setEnabled(false);
         return;
     }
-    for (const auto& device : *devices) {
-        QAction* action = device_menu_->addAction(DisplayFormat::from_utf8(device.name), this,
-                                                  [this, id = device.id] { choose_output_device(id); });
-        action->setCheckable(true);
-        action->setChecked(!chosen.is_system_default() && device.id == chosen);
+    if (!*device_list_) {
+        device_menu_->addAction(tr("Devices unavailable: %1").arg(DisplayFormat::error(device_list_->error())))
+            ->setEnabled(false);
+    } else {
+        for (const auto& device : **device_list_) {
+            QAction* action = device_menu_->addAction(DisplayFormat::from_utf8(device.name), this,
+                                                      [this, id = device.id] { choose_output_device(id); });
+            action->setCheckable(true);
+            action->setChecked(!chosen.is_system_default() && device.id == chosen);
+        }
     }
+    if (listing_devices_) device_menu_->addAction(tr("Updating the list…"))->setEnabled(false);
 }
 
 void PreviewPanel::choose_output_device(const audio::OutputDeviceId& device) {
     if (!engine_) return;
-    if (auto selected = engine_->select_output_device(device); !selected) {
-        status_label_->setText(tr("Could not switch the audio device: %1").arg(DisplayFormat::error(selected.error())));
-        emit statusMessage(status_label_->text());
-        return;
-    }
-    session_.set_preference(UiPreferenceKeys::kPreviewOutputDevice, device.value);
-    status_label_->clear();
-    update_device_notice(engine_->snapshot());
+    status_label_->setText(tr("Switching the audio device…"));
+    engine_->select_output_device_async(
+        device, on_ui_thread<void>([this, device](const Result<void>& selected) {
+            if (!selected) {
+                status_label_->setText(
+                    tr("Could not switch the audio device: %1").arg(DisplayFormat::error(selected.error())));
+                emit statusMessage(status_label_->text());
+                return;
+            }
+            session_.set_preference(UiPreferenceKeys::kPreviewOutputDevice, device.value);
+            status_label_->clear();
+            update_device_notice(engine_->snapshot());
+        }));
 }
 
 void PreviewPanel::apply_loop() {

@@ -583,6 +583,88 @@ TEST_SUITE("import") {
         fs::remove_all(media::native_path(fixture.source / "Deep"), error);
     }
 
+    TEST_CASE("reparse tags: links, cloud entries, deduplicated and WOF-compressed files") {
+        using files::detail::classify_reparse_tag;
+        using files::detail::LinkKind;
+        constexpr std::uint32_t kOffline = 0x00001000;
+        constexpr std::uint32_t kRecallOnDataAccess = 0x00400000;
+        constexpr std::uint32_t kRecallOnOpen = 0x00040000;
+        CHECK(classify_reparse_tag(0xA000000C, 0, false) == LinkKind::SymbolicLink);
+        CHECK(classify_reparse_tag(0xA0000003, 0, true) == LinkKind::Junction);
+        // Data deduplication and the Windows Overlay Filter (compact /EXE, CompactGUI) keep the
+        // data on the volume: both are ordinary files to import.
+        CHECK(classify_reparse_tag(0x80000013, 0, false) == LinkKind::Deduplicated);
+        CHECK(classify_reparse_tag(0x80000017, 0, false) == LinkKind::Compressed);
+        // OneDrive: available locally, or only in the cloud (reading would download it).
+        CHECK(classify_reparse_tag(0x9000001A, 0, false) == LinkKind::CloudPlaceholder);
+        CHECK(classify_reparse_tag(0x9000601A, kRecallOnDataAccess, false) == LinkKind::CloudOnly);
+        CHECK(classify_reparse_tag(0x80000015, kOffline, false) == LinkKind::CloudOnly);
+        CHECK(classify_reparse_tag(0x9000001A, kRecallOnOpen, true) == LinkKind::CloudOnly);
+        CHECK(classify_reparse_tag(0x9000001A, kRecallOnDataAccess, true) == LinkKind::CloudPlaceholder);
+        CHECK(classify_reparse_tag(0x8000001B, 0, false) == LinkKind::OtherReparsePoint);  // app execution alias
+    }
+
+    TEST_CASE("files around a deep subtree keep their stored stats: a rescan probes nothing") {
+        // The stored-stat cache drops a directory once it is finished, never while it is still open
+        // on the enumeration stack, however many subdirectories come between two of its files.
+        ImportFixture fixture;
+        test::write_sine_wav(fixture.source / "Pack/a first.wav", 0.02, 300);
+        fs::path nested = fixture.source / "Pack/m nested";
+        for (int level = 0; level < 12; ++level) {
+            test::write_sine_wav(nested / ("level " + std::to_string(level) + ".wav"), 0.02, 300);
+            nested /= "deeper";
+        }
+        test::write_sine_wav(fixture.source / "Pack/z last.wav", 0.02, 300);
+        files::ImportOptions options;
+        options.batch_size = 2;  // batches end inside the subtree
+        CHECK(fixture.import(options).progress.added == 17);
+        const auto rescan = fixture.import(options);
+        CHECK(rescan.progress.files_committed == 17);
+        CHECK(rescan.progress.files_probed == 0);
+        CHECK(rescan.finish.marked_missing == 0);
+    }
+
+#ifdef _WIN32
+    TEST_CASE("a skipped file without an audio extension costs the catalog nothing") {
+        ImportFixture fixture;
+        fixture.import();
+        const fs::path kick = fixture.source / "Drums/Kick 01.wav";
+        const fs::path readme = fixture.source / "FX/readme.txt";
+        for (const fs::path& file : {kick, readme})
+            REQUIRE(SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_OFFLINE));
+        struct RestoreAttributes {
+            std::vector<fs::path> files;
+            ~RestoreAttributes() {
+                for (const fs::path& file : files)
+                    SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_ARCHIVE);
+            }
+        } restore{{kick, readme}};
+        const auto rescan = fixture.import();
+        CHECK(rescan.progress.cloud_only_skipped == 1);  // the sample only; the text file is not looked at
+        CHECK(rescan.finish.marked_missing == 0);
+        CHECK(fixture.missing_count() == 0);
+    }
+
+    TEST_CASE("a WOF-compressed sample folder (compact /EXE) imports like any other") {
+        ImportFixture fixture;
+        const fs::path compressed = fixture.source / "Compressed/Pad.wav";
+        test::write_sine_wav(compressed, 2.0, 220);
+        const std::wstring command =
+            L"compact /c /exe:xpress4k \"" + fs::absolute(compressed).make_preferred().native() + L"\" >NUL 2>NUL";
+        if (_wsystem(command.c_str()) != 0) {
+            MESSAGE("compact.exe could not compress the file (not NTFS?); importing it uncompressed");
+        }
+        // While the WOF driver is attached it hides its reparse point, so the file classifies as
+        // ordinary; where the tag shows, it is Compressed. Either way it is read like a plain file.
+        const files::detail::LinkKind kind = files::detail::classify_link(compressed);
+        CHECK((kind == files::detail::LinkKind::None || kind == files::detail::LinkKind::Compressed));
+        const auto summary = fixture.import();
+        CHECK(summary.progress.added == 4);
+        CHECK(summary.progress.unsupported_entries_skipped == 0);
+        CHECK(summary.progress.probe_failures == 0);
+    }
+#endif
+
 #ifdef _WIN32
     TEST_CASE("a file name with an unpaired surrogate is skipped as a path the catalog cannot store") {
         ImportFixture fixture;
@@ -599,6 +681,30 @@ TEST_SUITE("import") {
         const auto summary = fixture.import();
         CHECK(summary.progress.unsafe_paths_skipped == 1);
         CHECK(summary.progress.added == 3);
+    }
+
+    TEST_CASE("benchmark: rescanning a root whose documents are online-only" * doctest::skip()) {
+        // Run by hand in a release build (mso_tests --test-case="benchmark: rescanning*" --no-skip).
+        // A OneDrive root holds far more documents, project files and artwork than samples; marking
+        // every online-only one seen cost a catalog statement per file.
+        ImportFixture fixture;
+        constexpr int kDocuments = 10'000;
+        std::vector<fs::path> documents;
+        documents.reserve(kDocuments);
+        for (int index = 0; index < kDocuments; ++index) {
+            documents.push_back(fixture.source / ("Projects/Session " + std::to_string(index / 500)) /
+                                ("notes " + std::to_string(index) + ".txt"));
+            test::write_file(documents.back(), std::string_view("not audio"));
+        }
+        fixture.import();
+        for (const fs::path& document : documents)
+            REQUIRE(SetFileAttributesW(document.c_str(), FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_OFFLINE));
+        const auto started = std::chrono::steady_clock::now();
+        const auto rescan = fixture.import();
+        const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started);
+        MESSAGE("rescan with ", kDocuments, " online-only documents: ", elapsed.count(), " ms, ",
+                rescan.progress.cloud_only_skipped, " reported as skipped");
+        CHECK(rescan.progress.files_committed == 3);
     }
 #endif
 

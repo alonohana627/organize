@@ -57,7 +57,14 @@ public:
     [[nodiscard]] Result<void> find_stream_info();
     /// The error the read callback last reported, if any. A callback failure is not always fatal
     /// to FFmpeg (it may report a short stream instead), so callers check this after every step.
+    /// It stays set until clear_read_error(): after a failed read FFmpeg's I/O context reports the
+    /// end of the file until the next seek, so every later step really is affected by it.
     const std::optional<Error>& read_error() const noexcept { return read_error_; }
+    /// Forgets the last read error, here and in FFmpeg's I/O context (which otherwise keeps failing
+    /// every read after one failure, seek or not). The decoder calls it when it repositions the
+    /// demuxer, so the file reads again once a drive is back, and a failure that is over is not
+    /// reported at the next end of the stream.
+    void clear_read_error() noexcept;
 
 private:
     FfmpegInput(ReadAtFunction read_at, std::uint64_t size) : read_at_(std::move(read_at)), size_(size) {}

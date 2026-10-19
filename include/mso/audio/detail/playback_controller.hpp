@@ -29,8 +29,11 @@ using SourceOrigin = std::variant<std::filesystem::path, std::unique_ptr<media::
 /// Every change that makes buffered audio wrong (open, seek, stop, loop/speed/pitch/mode change,
 /// device change, error) starts a new PCM epoch; the renderer drops blocks of older epochs unheard.
 /// Shape changes (loop, speed, pitch, mode, seam fades) re-anchor at the consumed position, right
-/// after the audio already handed to the device, so nothing is heard twice; a device loss or switch
-/// re-anchors at the audible position, because the old device's buffer is never heard.
+/// after the audio already handed to the device, and publish the new epoch only once its first block
+/// is in the ring, so the callback never runs dry in between. A callback that runs while that first
+/// block is rendered (well under a millisecond of work) is heard again: at most one device period
+/// repeats, and usually nothing. A device loss or switch re-anchors at the audible position, because
+/// the old device's buffer is never heard.
 /// The thread body is an exception barrier: anything thrown by a decoder or library fails the
 /// current source (INTERNAL / RESOURCE_LIMIT in the snapshot) instead of terminating the process.
 class PlaybackController {
@@ -93,12 +96,20 @@ private:
     /// Writes at most one pass of blocks; true when more could be written right away.
     bool produce();
 
+    /// When a new epoch's gate reaches the callback.
+    enum class GatePublication : std::uint8_t {
+        Immediate,        ///< at once: the callback drops the old epoch's blocks right away
+        AfterFirstBlock,  ///< once its first block is in the ring (or at the end of the pass)
+    };
+
     /// Re-anchors the source at `source_frame` and starts a new epoch there.
-    void restart_at(std::int64_t source_frame);
+    void restart_at(std::int64_t source_frame, GatePublication publication = GatePublication::Immediate);
     /// Re-anchors after a shape change, at the consumed position (see consumed_frame()).
     void reshape();
     /// Starts a new epoch beginning at `start_frame` (flushes everything buffered).
-    void begin_epoch(std::int64_t start_frame) noexcept;
+    void begin_epoch(std::int64_t start_frame, GatePublication publication = GatePublication::Immediate) noexcept;
+    /// Publishes gate_ (epoch and output switch) to the callback.
+    void publish_gate() noexcept;
     /// Switches the callback's output on or off (published with the epoch, see TransportGate).
     void set_output_enabled(bool enabled) noexcept;
     /// Drops the source, flushes, and reports `code`; replay needs a new open().
@@ -128,7 +139,8 @@ private:
     std::unique_ptr<SourceStream> stream_;         ///< current source; null when empty or failed
     PlaybackShape shape_;                          ///< loop/speed/pitch/mode/seam settings
     PreviewState state_ = PreviewState::Empty;     ///< transport state
-    TransportGate gate_;                           ///< epoch and output switch last published
+    TransportGate gate_;                           ///< current epoch and output switch
+    bool gate_publication_pending_ = false;        ///< gate_ is newer than the published gate
     std::int64_t produced_frames_ = 0;             ///< frames written for the current epoch
     bool end_of_stream_written_ = false;           ///< the current epoch's last block is in the ring
     std::uint32_t output_rate_ = 48000;            ///< production rate until a device reports its own

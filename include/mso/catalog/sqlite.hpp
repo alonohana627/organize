@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -53,6 +54,11 @@ public:
     void clear() noexcept;
     /// Number of idle statements currently cached (for tests and diagnostics).
     [[nodiscard]] std::size_t idle_count() const noexcept { return idle_.size(); }
+    /// SQL text of every idle cached statement, one entry per cached compilation (for query-plan
+    /// tests and diagnostics).
+    [[nodiscard]] std::vector<std::string> idle_sql() const;
+    /// Most idle statements one connection keeps; later returns are finalized instead.
+    static constexpr std::size_t kMaximumIdleStatements = 256;
 
 private:
     /// Resets a returned statement; false (and finalized) when it must not be cached.
@@ -60,7 +66,6 @@ private:
 
     IdleStatements idle_;
     bool closed_ = false;
-    static constexpr std::size_t kMaximumIdleStatements = 256;
 };
 
 /// A compiled SQL statement. Parameters are 1-based, result columns are 0-based (SQLite convention).
@@ -212,14 +217,27 @@ public:
     /// True while a transaction is open on this connection.
     [[nodiscard]] bool in_transaction() const;
 
-    /// PRAGMA integrity_check joined into one line: "ok" when healthy.
-    [[nodiscard]] Result<std::string> integrity_check();
-    /// PRAGMA foreign_key_check rows, formatted for diagnostics.
-    [[nodiscard]] Result<std::vector<std::string>> foreign_key_violations();
+    /// SQL text of the compiled statements idle in this connection's cache (query-plan tests and
+    /// diagnostics: what this connection actually ran). At most StatementCache::kMaximumIdleStatements.
+    [[nodiscard]] std::vector<std::string> cached_statement_sql() const;
+    /// Number of compiled statements idle in this connection's cache.
+    [[nodiscard]] std::size_t cached_statement_count() const noexcept { return cache_ ? cache_->idle_count() : 0; }
+
+    /// PRAGMA integrity_check joined into one line: "ok" when healthy. A stop request interrupts the
+    /// check within a few thousand virtual-machine steps (CANCELLED).
+    [[nodiscard]] Result<std::string> integrity_check(std::stop_token stop = {});
+    /// PRAGMA foreign_key_check rows, formatted for diagnostics. A stop request interrupts it as it
+    /// does integrity_check (CANCELLED).
+    [[nodiscard]] Result<std::vector<std::string>> foreign_key_violations(std::stop_token stop = {});
     /// Online backup API: copies a consistent snapshot into a standalone (non-WAL) file. Gives up
-    /// with DB_BUSY when the source stays locked for longer than `busy_deadline`.
+    /// with DB_BUSY when the source stays locked for longer than `busy_deadline`, and with CANCELLED
+    /// when `stop` is requested (checked between steps of `pages_per_step` pages). On any failure the
+    /// destination is left incomplete; the caller removes it. When this connection holds an open read
+    /// transaction, every step copies that one snapshot, so writers on other connections never
+    /// restart the copy.
     [[nodiscard]] Result<void> backup_to(const std::filesystem::path& destination, int pages_per_step = 256,
-                                         std::chrono::milliseconds busy_deadline = std::chrono::seconds(30));
+                                         std::chrono::milliseconds busy_deadline = std::chrono::seconds(30),
+                                         std::stop_token stop = {});
 
 private:
     sqlite3* handle_ = nullptr;
@@ -265,7 +283,8 @@ private:
 };
 
 /// Maps an SQLite result code to the project's error taxonomy (busy → DB_BUSY retryable, corrupt →
-/// DB_CORRUPT, full → DISK_FULL, permission → ACCESS_DENIED, constraint → INVALID_ARGUMENT).
+/// DB_CORRUPT, full → DISK_FULL, permission → ACCESS_DENIED, constraint → INVALID_ARGUMENT,
+/// interrupt → CANCELLED).
 Error make_sqlite_error(sqlite3* connection, int result_code, std::string_view operation);
 /// Version string of the linked SQLite library.
 std::string library_version();

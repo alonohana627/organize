@@ -422,10 +422,11 @@ private:
             case Field::Folder:
                 // Folders are addressed from a root down: "/Drums" means "Drums", and so does "\Drums"
                 // on Windows, where path_key treats '\' as a separator (elsewhere it is a name byte).
+                // Spaces around those separators go too ("/ Drums" is "Drums"), as around the value.
                 predicate.text = trim(value);
                 while (predicate.text.starts_with('/') || (kBackslashIsSeparator && predicate.text.starts_with('\\')))
-                    predicate.text.erase(0, 1);
-                if (trim(predicate.text).empty()) return error_at(offset, "expected a folder name");
+                    predicate.text = trim(std::string_view(predicate.text).substr(1));
+                if (predicate.text.empty()) return error_at(offset, "expected a folder name");
                 return {};
             case Field::Tag:
             case Field::Category:

@@ -26,8 +26,8 @@ namespace mso::search {
 
 /// A query prepared for evaluating many rows of one or more libraries. User values are normalized
 /// once; per library, `folder:` rules are resolved once per root and `tag:`/`category:` decisions
-/// once per taxonomy id, so a row costs a few integer lookups and `starts_with` on its stored
-/// `SampleRow::path_key`.
+/// once per taxonomy id (once per path for a tag or category without an id yet), so a row costs a few
+/// integer lookups and `starts_with` on its stored `SampleRow::path_key`.
 ///
 /// Thread safety: `operator()` is logically const but fills those caches, so one matcher must not
 /// be used by two threads at once; use one matcher per thread (they are cheap to build). A

@@ -177,7 +177,7 @@ Result<void> mark_sample_list_changed(sqlite::Connection& connection, std::span<
 Result<void> mark_samples_changed(sqlite::Connection& connection, std::string_view select_sample_ids_sql,
                                   std::span<const std::int64_t> parameters, bool search_text_changed) {
     auto mark = connection.prepare(
-        std::format("INSERT INTO temp.changed_samples(sample_id, search_text) SELECT DISTINCT candidate.sample_id, {} "
+        std::format("INSERT INTO temp.changed_samples(sample_id, search_text) SELECT candidate.sample_id, {} "
                     "FROM ({}) AS candidate WHERE candidate.sample_id IS NOT NULL "
                     "ON CONFLICT(sample_id) DO UPDATE SET search_text=max(search_text, excluded.search_text)",
                     search_text_changed ? 1 : 0, select_sample_ids_sql));

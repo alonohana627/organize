@@ -72,16 +72,20 @@ Use these instead of per-file copies:
 
 ## Fuzzing (crash-proofing against damaged input)
 
+**Deferred by the owner to priority P10 (2026-10-19).** The CI fuzz job is off, and no new targets or
+seeds are added for now. The existing targets still build and run by hand:
+
 ```sh
 cmake --preset fuzz -B build/<you>-fuzz && cmake --build build/<you>-fuzz --target fuzzers
-python tools/run_fuzzers.py --build-dir build/<you>-fuzz --seconds 60     # every target, as CI
+python tools/run_fuzzers.py --build-dir build/<you>-fuzz --seconds 60     # every target
 ```
 
 Targets and seeds are in `tests/fuzz/` (see `docs/BUILDING.md`, "Fuzzing"). A finding saves its input in
 `<build>/fuzz-artifacts/<target>/`; replay it with `<build>/tests/fuzz/fuzz_<target>.exe <file>`. After
 the fix, copy the input into `tests/fuzz/corpus/<target>/` as `regression_<what>.<ext>` so every later
-run checks it. When you add code that reads files, pipes, query text or tokens, add a target (one
-`mso_add_fuzzer` line in `tests/fuzz/CMakeLists.txt` plus a seed directory).
+run checks it. Once fuzzing is back on the plan: when you add code that reads files, pipes, query text
+or tokens, add a target (one `mso_add_fuzzer` line in `tests/fuzz/CMakeLists.txt` plus a seed
+directory). LeakSanitizer does not exist on Windows: a leak shows up only through the memory limit.
 
 ## Running the app after a build
 

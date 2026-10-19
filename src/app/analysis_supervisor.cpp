@@ -68,17 +68,24 @@ void discard_segment(const std::filesystem::path& file) {
     std::filesystem::remove(file, ignored);
 }
 
-/// Wall-clock budget of one job: a minimum plus a multiple of the audio duration, capped.
-std::chrono::milliseconds job_deadline(const AnalysisSupervisor::Timing& timing,
-                                       std::optional<std::int64_t> duration_us) {
-    const double audio_seconds = duration_us ? static_cast<double>(*duration_us) / 1e6 : 0.0;
+}  // namespace
+
+std::chrono::milliseconds AnalysisSupervisor::job_deadline(const Timing& timing,
+                                                           std::optional<std::int64_t> duration_us) {
+    const double audio_seconds = duration_us ? std::max(0.0, static_cast<double>(*duration_us) / 1e6) : 0.0;
     const auto scaled = std::chrono::milliseconds(
         static_cast<std::int64_t>(std::min(audio_seconds * timing.deadline_per_audio_second * 1000.0,
                                            static_cast<double>(timing.maximum_job_deadline.count()))));
-    return std::clamp(timing.minimum_job_deadline + scaled, timing.minimum_job_deadline, timing.maximum_job_deadline);
+    return std::clamp(timing.minimum_job_deadline + scaled, timing.minimum_job_deadline,
+                      std::max(timing.minimum_job_deadline, timing.maximum_job_deadline));
 }
 
-}  // namespace
+std::chrono::milliseconds AnalysisSupervisor::retry_delay(const Timing& timing, int failures) {
+    auto delay = timing.first_retry_delay;
+    for (int doubling = 1; doubling < failures && delay < timing.maximum_retry_delay; ++doubling)
+        delay *= 2;
+    return std::min(delay, timing.maximum_retry_delay);
+}
 
 /// The lazily started worker process, restarted after a crash.
 struct AnalysisSupervisor::WorkerSlot {
@@ -89,7 +96,10 @@ AnalysisSupervisor::AnalysisSupervisor(std::filesystem::path worker_executable, 
     : AnalysisSupervisor(std::move(worker_executable), std::move(hooks), Timing{}) {}
 
 AnalysisSupervisor::AnalysisSupervisor(std::filesystem::path worker_executable, Hooks hooks, Timing timing)
-    : worker_executable_(std::move(worker_executable)),
+    : AnalysisSupervisor(worker::WorkerOptions{.executable = std::move(worker_executable)}, std::move(hooks), timing) {}
+
+AnalysisSupervisor::AnalysisSupervisor(worker::WorkerOptions worker_options, Hooks hooks, Timing timing)
+    : worker_options_(std::move(worker_options)),
       hooks_(std::move(hooks)),
       timing_(timing),
       worker_(std::make_unique<WorkerSlot>()) {
@@ -222,10 +232,7 @@ void AnalysisSupervisor::record_worker_failure(catalog::Library& library, const 
     }
     // Exponential backoff before the next attempt (ended early by shutdown or by resuming; a plain
     // notify() for new work does not end it, or repeated new runs would defeat the backoff).
-    auto delay = timing_.first_retry_delay;
-    for (int doubling = 1; doubling < failures && delay < timing_.maximum_retry_delay; ++doubling)
-        delay *= 2;
-    delay = std::min(delay, timing_.maximum_retry_delay);
+    const auto delay = retry_delay(timing_, failures);
     std::unique_lock lock(wake_mutex_);
     retry_requested_ = false;
     wake_.wait_for(lock, stop, delay, [&] { return retry_requested_; });
@@ -254,8 +261,10 @@ void AnalysisSupervisor::process(catalog::Library& library, const catalog::Libra
     }
     if (!worker_->process || !worker_->process->is_running()) {
         std::error_code missing_check;
-        const bool executable_missing = !std::filesystem::is_regular_file(worker_executable_, missing_check);
-        auto started = worker::WorkerProcess::start({.executable = worker_executable_});
+        const auto executable =
+            worker_options_.executable.empty() ? worker::default_worker_executable() : worker_options_.executable;
+        const bool executable_missing = !std::filesystem::is_regular_file(executable, missing_check);
+        auto started = worker::WorkerProcess::start(worker_options_);
         if (!started) {
             report(&library, "returning a job after the worker failed to start", library.release_job(lease));
             record_worker_failure(library, started.error().message(), executable_missing, stop);

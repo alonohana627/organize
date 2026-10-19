@@ -8,6 +8,7 @@
 
 #include "mso/domain/taxonomy.hpp"
 #include "mso/search/detail/predicate_support.hpp"
+#include "mso/search/detail/row_statements.hpp"
 
 namespace mso::search {
 
@@ -156,12 +157,13 @@ public:
     }
 
 private:
+    /// One tag or category row: enough to walk up to the top and spell the path.
     struct Node {
-        std::optional<std::int64_t> parent_id;
-        std::string name;
+        std::optional<std::int64_t> parent_id;  ///< parent node, none at the top
+        std::string name;                       ///< display name of this segment
     };
-    std::unordered_map<std::int64_t, Node> nodes_;
-    std::unordered_map<std::int64_t, std::string> paths_;
+    std::unordered_map<std::int64_t, Node> nodes_;         ///< the nodes read, by id
+    std::unordered_map<std::int64_t, std::string> paths_;  ///< memoized display paths, by id
 };
 
 /// Fills the primary-location fields of a row from its first-ranked live location.
@@ -245,26 +247,17 @@ private:
 
 /// Streams base rows (with primary location and tag ids, but no taxonomy paths yet) in ascending
 /// id order: three ordered statements merged in memory. `id_filter` restricts all three to the
-/// ids of a JSON array.
+/// ids of a JSON array. Checks `stop` before every row and fails with CANCELLED once it fires.
 Result<void> stream_rows(sqlite::Connection& connection, const uuids::uuid& library,
                          const std::optional<std::string>& id_filter,
-                         const std::unordered_map<std::int64_t, RootFacts>& roots,
+                         const std::unordered_map<std::int64_t, RootFacts>& roots, const std::stop_token& stop,
                          const std::function<void(SampleRow&&)>& emit) {
-    const std::string filter_samples = id_filter ? std::format(" AND s.id {}", kIdFilter) : std::string();
-    const std::string filter_locations = id_filter ? std::format(" AND l.sample_id {}", kIdFilter) : std::string();
-    const std::string filter_tags = id_filter ? std::format(" WHERE st.sample_id {}", kIdFilter) : std::string();
-    auto samples =
-        connection.prepare(std::format("SELECT {} FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
-                                       "WHERE s.deleted=0{} ORDER BY s.id",
-                                       kRowColumns, filter_samples));
+    const auto sql = detail::row_statements(id_filter.has_value());
+    auto samples = connection.prepare(sql.samples);
     if (!samples) return std::unexpected(samples.error());
-    auto locations = connection.prepare(
-        std::format("SELECT l.sample_id, l.root_id, l.relative_path, l.path_key, l.state FROM locations l "
-                    "JOIN roots r ON r.id=l.root_id WHERE l.state<>'retired'{} ORDER BY l.sample_id, {}",
-                    filter_locations, detail::kPrimaryLocationOrder));
+    auto locations = connection.prepare(sql.locations);
     if (!locations) return std::unexpected(locations.error());
-    auto tags = connection.prepare(std::format(
-        "SELECT st.sample_id, st.tag_id FROM sample_tags st{} ORDER BY st.sample_id, st.tag_id", filter_tags));
+    auto tags = connection.prepare(sql.tags);
     if (!tags) return std::unexpected(tags.error());
     if (id_filter) {
         samples->bind(1, *id_filter);
@@ -275,6 +268,7 @@ Result<void> stream_rows(sqlite::Connection& connection, const uuids::uuid& libr
     OrderedCursor location_cursor(*locations);
     OrderedCursor tag_cursor(*tags);
     while (true) {
+        if (stop.stop_requested()) return fail(ErrorCode::Cancelled, "reading the sample rows was cancelled");
         auto has_row = samples->next_row();
         if (!has_row) return std::unexpected(has_row.error());
         if (!*has_row) break;
@@ -297,6 +291,26 @@ Result<void> stream_rows(sqlite::Connection& connection, const uuids::uuid& libr
 
 }  // namespace
 
+detail::RowStatements detail::row_statements(bool filtered_by_ids) {
+    const std::string filter_samples = filtered_by_ids ? std::format(" AND s.id {}", kIdFilter) : std::string();
+    const std::string filter_locations =
+        filtered_by_ids ? std::format(" AND l.sample_id {}", kIdFilter) : std::string();
+    const std::string filter_tags = filtered_by_ids ? std::format(" WHERE st.sample_id {}", kIdFilter) : std::string();
+    // `+s.deleted` keeps the (deleted, ...) sort indexes out of the plan: on them SQLite would read
+    // every live sample and sort them all, even for one id. Without them it walks the rowid, either
+    // through the sorted id list or across the table in id order.
+    return RowStatements{
+        .samples = std::format("SELECT {} FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
+                               "WHERE +s.deleted=0{} ORDER BY s.id",
+                               kRowColumns, filter_samples),
+        .locations = std::format("SELECT l.sample_id, l.root_id, l.relative_path, l.path_key, l.state FROM locations l "
+                                 "JOIN roots r ON r.id=l.root_id WHERE l.state<>'retired'{} ORDER BY l.sample_id, {}",
+                                 filter_locations, kPrimaryLocationOrder),
+        .tags = std::format("SELECT st.sample_id, st.tag_id FROM sample_tags st{} ORDER BY st.sample_id, st.tag_id",
+                            filter_tags),
+    };
+}
+
 Result<std::vector<SampleRow>> load_rows(catalog::Library& library, std::span<const std::int64_t> sample_ids) {
     std::vector<std::int64_t> unique_ids;
     unique_ids.reserve(sample_ids.size());
@@ -315,7 +329,7 @@ Result<std::vector<SampleRow>> load_rows(catalog::Library& library, std::span<co
 
     std::vector<SampleRow> loaded;
     loaded.reserve(unique_ids.size());
-    auto streamed = stream_rows(connection, library_uuid, detail::id_array_json(unique_ids), *roots,
+    auto streamed = stream_rows(connection, library_uuid, detail::id_array_json(unique_ids), *roots, {},
                                 [&](SampleRow&& row) { loaded.push_back(std::move(row)); });
     if (!streamed) return std::unexpected(streamed.error());
 
@@ -349,6 +363,11 @@ Result<std::vector<SampleRow>> load_rows(catalog::Library& library, std::span<co
 }
 
 Result<void> for_each_row(catalog::Library& library, const std::function<void(SampleRow&&)>& visit) {
+    return for_each_row(library, std::stop_token(), visit);
+}
+
+Result<void> for_each_row(catalog::Library& library, std::stop_token stop,
+                          const std::function<void(SampleRow&&)>& visit) {
     const uuids::uuid library_uuid = library.uuid();
     auto reader = library.acquire_reader();
     if (!reader) return std::unexpected(reader.error());
@@ -362,7 +381,8 @@ Result<void> for_each_row(catalog::Library& library, const std::function<void(Sa
     if (auto read = tag_paths.load(connection, "tags", std::nullopt); !read) return std::unexpected(read.error());
     if (auto read = category_paths.load(connection, "categories", std::nullopt); !read)
         return std::unexpected(read.error());
-    return stream_rows(connection, library_uuid, std::nullopt, *roots, [&](SampleRow&& row) {
+    // Returning ends the snapshot: the lease's destructor rolls the read transaction back.
+    return stream_rows(connection, library_uuid, std::nullopt, *roots, stop, [&](SampleRow&& row) {
         apply_taxonomy(row, tag_paths, category_paths);
         visit(std::move(row));
     });

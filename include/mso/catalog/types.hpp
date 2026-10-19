@@ -43,6 +43,13 @@ struct LibraryIdentity {
 
 /// A source directory registered in the library. Its absolute path is a machine-local binding
 /// kept by the workspace, never in the portable catalog.
+/// What Library::list_roots computes besides the root rows themselves.
+enum class RootListing {
+    WithSampleCounts,     ///< fills RootRecord::sample_count, reading every location of each root
+    WithoutSampleCounts,  ///< leaves sample_count at 0: only the roots table is read
+};
+
+/// One live root of a library.
 struct RootRecord {
     std::int64_t id = 0;
     uuids::uuid uuid;
@@ -51,6 +58,7 @@ struct RootRecord {
     Availability availability = Availability::Unknown;
     std::int64_t scan_generation = 0;
     std::optional<std::int64_t> last_seen_at;
+    /// Live samples with a location on this root; 0 when listed with RootListing::WithoutSampleCounts.
     std::int64_t sample_count = 0;
     /// File names on this root differ by case ("Kick.wav" ≠ "kick.wav"); location keys are then exact
     /// paths instead of case-folded ones (see root_paths.hpp).
@@ -117,6 +125,12 @@ struct ScannedFile {
     std::optional<ObservedMetadata> metadata;
     std::optional<ErrorCode> probe_error;  ///< probe failed: recorded as a `probe_error` observation;
                                            ///< the record stays searchable by name/path
+};
+
+/// A directory a scan could not enumerate: its subtree is unknown, not empty.
+struct ScanGap {
+    std::string relative_directory;  ///< root-relative, '/'-separated ("" for the root itself)
+    bool denied = false;             ///< access was refused (otherwise enumeration failed)
 };
 
 /// Handle for a running scan of one root.
@@ -247,7 +261,7 @@ struct HistoryEntry {
 struct ReviewItem {
     std::int64_t id = 0;
     uuids::uuid uuid;
-    std::string kind;  ///< history_conflict, ambiguous_relink, possible_move, content_changed
+    std::string kind;  ///< history_conflict, ambiguous_relink, possible_move, content_changed, normalization_conflict
     std::optional<std::int64_t> sample_id;
     std::string evidence_json;  ///< kind-specific JSON evidence
     std::string state;          ///< open, accepted, rejected, resolved

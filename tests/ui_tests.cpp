@@ -33,9 +33,13 @@
 #include <QTreeWidget>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -50,6 +54,7 @@
 #include "mso/ui/add_folder_dialog.hpp"
 #include "mso/ui/application_session.hpp"
 #include "mso/ui/background_tasks.hpp"
+#include "mso/ui/detail/parent_cycles.hpp"
 #include "mso/ui/display_format.hpp"
 #include "mso/ui/drag_path_resolver.hpp"
 #include "mso/ui/edit_controller.hpp"
@@ -126,10 +131,43 @@ public:
         for (auto& delivery : pending)
             delivery();
     }
+    /// Delivers only the most recently held delivery (out of order, as a busy pool may).
+    void release_newest() {
+        if (held_.empty()) return;
+        auto delivery = std::move(held_.back());
+        held_.pop_back();
+        delivery();
+    }
     std::size_t held_count() const { return held_.size(); }
 
 private:
     std::vector<std::function<void()>> held_;
+};
+
+/// A one-shot signal between a worker thread and the test: open() once, wait (bounded) elsewhere.
+class Gate {
+public:
+    void open() {
+        {
+            const std::scoped_lock lock(mutex_);
+            open_ = true;
+        }
+        changed_.notify_all();
+    }
+    bool is_open() {
+        const std::scoped_lock lock(mutex_);
+        return open_;
+    }
+    /// Waits until open() (at most ten seconds, so a failing test never hangs).
+    void wait() {
+        std::unique_lock lock(mutex_);
+        changed_.wait_for(lock, std::chrono::seconds(10), [this] { return open_; });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool open_ = false;
 };
 
 /// In-memory search backend: each query text maps to a sorted row list; cursors are offsets
@@ -145,6 +183,7 @@ public:
     int skipped_obsolete = 0;              ///< requests whose stop token was set before they ran
     int structure_generation = 0;          ///< cursors of older generations are stale
     std::optional<mso::Error> rows_error;  ///< when set, request_rows() fails with it
+    std::function<void()> after_page;      ///< runs after every page delivery (a stream of change events)
     DeliveryQueue deliveries;
 
     void request_page(const mso::search::SearchRequest& request, std::optional<uuids::uuid>, std::stop_token obsolete,
@@ -155,6 +194,7 @@ public:
         deliveries.schedule(context, [this, request, deliver, obsolete] {
             if (obsolete.stop_requested()) ++skipped_obsolete;
             deliver(page_for(request));
+            if (after_page) after_page();
         });
     }
 
@@ -1272,26 +1312,58 @@ TEST_SUITE("ui") {
 
     // ---------------------------------------------------------------- inspector drafts and partial selections
 
-    TEST_CASE("inspector refuses edits when part of the selection is not loaded") {
+    TEST_CASE("inspector edits a partly loaded selection as a whole and says what it summarizes") {
         application();
         mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
         mso::ui::InspectorPanel inspector(idle_session);
         int requests = 0;
         QObject::connect(&inspector, &mso::ui::InspectorPanel::editRequested, [&] { ++requests; });
         const auto rows = make_rows(2, "row ");
-        inspector.show_selection(rows, 5);
+        // Five selected, two loaded: the window resolves all five keys, so editing stays on.
+        inspector.show_selection(rows, 5, std::set<uuids::uuid>{rows.front().library});
         auto* stars = inspector.findChild<mso::ui::StarRatingWidget*>();
         REQUIRE(stars != nullptr);
-        CHECK_FALSE(stars->isEnabled());
+        CHECK(stars->isEnabled());
         bool explained = false;
         for (auto* label : inspector.findChildren<QLabel*>())
-            explained =
-                explained || (label->isVisibleTo(&inspector) && label->text().contains(QStringLiteral("2 of the 5")));
+            explained = explained || (label->isVisibleTo(&inspector) &&
+                                      label->text().contains(QStringLiteral("2 loaded of the 5 selected")));
         CHECK(explained);
         child_named<QPushButton>(inspector, QStringLiteral("Unmark favorite"))->click();
-        CHECK(requests == 0);
+        CHECK(requests == 1);
+        // One loaded row of a larger selection is not a single selection: no rename.
+        inspector.show_selection({rows.front()}, 3, std::set<uuids::uuid>{rows.front().library});
+        CHECK_FALSE(child_named<QPushButton>(inspector, QStringLiteral("Apply display name"))->isEnabled());
+        // Libraries of the whole selection decide about categories: a second library outside the
+        // loaded rows switches them off.
+        inspector.show_selection(rows, 5, std::set<uuids::uuid>{rows.front().library, mso::new_uuid()});
+        CHECK_FALSE(child_named<QComboBox>(inspector, QStringLiteral("Category to set"))->isEnabled());
+    }
+
+    TEST_CASE("inspector shows differing manual BPMs and keys as mixed, never one sample's value") {
+        application();
+        mso::ui::ApplicationSession idle_session(mso::app::ApplicationOptions{});
+        mso::ui::InspectorPanel inspector(idle_session);
+        auto rows = make_rows(2, "row ");
+        rows[0].bpm_source = rows[1].bpm_source = "user";
+        rows[0].bpm_milli = 120'000;
+        rows[1].bpm_milli = 128'000;
+        rows[0].key_source = rows[1].key_source = "user";
+        rows[0].key = mso::MusicalKey{0, mso::KeyMode::Major};
+        rows[1].key = mso::MusicalKey{9, mso::KeyMode::Minor};
         inspector.show_selection(rows, 2);
-        CHECK(stars->isEnabled());
+        auto* bpm_mode = child_named<QComboBox>(inspector, QStringLiteral("BPM override mode"));
+        auto* key_mode = child_named<QComboBox>(inspector, QStringLiteral("Key override mode"));
+        CHECK(bpm_mode->currentIndex() == -1);
+        CHECK(key_mode->currentIndex() == -1);
+        CHECK_FALSE(child_named<QPushButton>(inspector, QStringLiteral("Apply BPM"))->isEnabled());
+        CHECK_FALSE(child_named<QPushButton>(inspector, QStringLiteral("Apply key"))->isEnabled());
+        // The same manual value everywhere is a value.
+        rows[1].bpm_milli = 120'000;
+        inspector.show_selection({rows[0], rows[1]}, 2);
+        inspector.show_selection(make_rows(1, "other "), 1);  // a new selection resets the drafts
+        inspector.show_selection(rows, 2);
+        CHECK(bpm_mode->currentIndex() == 2);
     }
 
     TEST_CASE("inspector drafts survive refreshes and are discarded with the selection") {
@@ -1463,7 +1535,8 @@ TEST_SUITE("ui") {
         bar.set_text(QStringLiteral("bpm:\U0001F941"));  // a drum emoji: one code point, two UTF-16 units
         const QString html = child_named<QLabel>(bar, QStringLiteral("Search error"))->text();
         const auto high_surrogate = html.indexOf(QChar(0xD83E));
-        if (high_surrogate >= 0) CHECK(html.mid(high_surrogate, 2) == QStringLiteral("\U0001F941"));
+        REQUIRE(high_surrogate >= 0);  // the error quotes the offending text
+        CHECK(html.mid(high_surrogate, 2) == QStringLiteral("\U0001F941"));
 
         const QLocale previous;
         QLocale::setDefault(QLocale(QLocale::German, QLocale::Germany));
@@ -1482,6 +1555,435 @@ TEST_SUITE("ui") {
         CHECK(open.native_arguments == QStringLiteral("\"C:\\Samples, old\""));
     }
 #endif
+
+    // ---------------------------------------------------------------- one refresh at a time
+
+    TEST_CASE("one refresh at a time: changes during a long refresh owe one more, and paging goes on") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(8000, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 10; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+
+        // A refresh walks ten pages, one delivery per event-loop pass; changes arriving meanwhile
+        // (an analysis run reporting results) never restart it, they owe exactly one more.
+        const auto requests_before = source.page_requests.size();
+        model.refresh(0);
+        for (int change = 0; change < 50; ++change)
+            model.refresh(0);
+        CHECK(model.refresh_owed());
+        CHECK(source.page_requests.size() == requests_before + 1);  // one walk started, not fifty-one
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        // Between the commit and the owed refresh, the table pages again.
+        CHECK(model.refresh_owed());
+        REQUIRE(model.canFetchMore({}));
+        model.fetchMore({});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 11 * SampleTableModel::kPageSize; }));
+        REQUIRE(process_events_until([&] { return refreshed == 2; }));
+        CHECK_FALSE(model.refresh_owed());
+
+        // A source that reports a change with every page it delivers (a long analysis run) while
+        // the view keeps scrolling to the end: every refresh still commits, and paging reaches the
+        // end of the result (before, each change restarted the walk and paging waited forever).
+        source.after_page = [&] { model.refresh(std::max(0, model.rowCount() - 1)); };
+        REQUIRE(process_events_until(
+            [&] {
+                if (model.canFetchMore({})) model.fetchMore({});
+                return model.rowCount() == 8000;
+            },
+            60000));
+        source.after_page = nullptr;
+        REQUIRE(process_events_until([&] { return !model.is_refreshing() && !model.refresh_owed(); }));
+        CHECK(refreshed >= 3);
+        CHECK(model.rowCount() == 8000);
+        CHECK(model.key_at(7999) == key_of(source.results[""][7999]));
+        CHECK_FALSE(model.canFetchMore({}));
+    }
+
+    TEST_CASE("changes to evicted rows are known rows: no window re-read, no row read") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(SampleTableModel::kPageSize * 12, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 12; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        const int evicted_row = SampleTableModel::kPageSize;  // page 1 was evicted
+        REQUIRE(model.loaded_row(evicted_row) == nullptr);
+        const SampleKey evicted = *model.key_at(evicted_row);
+        CHECK(evicted == key_of(source.results[""][static_cast<std::size_t>(evicted_row)]));
+        const SampleKey loaded = key_of(*model.loaded_row(model.rowCount() - 1));
+        const SampleKey unknown{evicted.library, 999'999};
+        const int rows_requests = source.rows_requests;
+        CHECK(model.refresh_rows({evicted}) == 1);  // known, but nothing in memory to re-read
+        CHECK(source.rows_requests == rows_requests);
+        CHECK(model.refresh_rows({evicted, loaded, unknown}) == 2);
+        CHECK(source.rows_requests == rows_requests + 1);
+    }
+
+    TEST_CASE("row reads that arrive during or after a refresh are never lost to its older pages") {
+        application();
+        FakePageSource source;
+        auto& rows = source.results[""];
+        rows = make_rows(3 * SampleTableModel::kPageSize, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 3; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+        const int row = SampleTableModel::kPageSize + 1;  // on the walk's second page
+        const SampleKey key = key_of(rows[static_cast<std::size_t>(row)]);
+
+        // During the walk: its page with the sample is read, then the sample changes and its read
+        // (this generation) arrives before the walk commits; the commit installs the older page.
+        source.deliveries.hold = true;
+        model.refresh(0);
+        source.deliveries.release();  // page 1 arrives; page 2 is requested
+        source.deliveries.release();  // page 2 (the old value) arrives; page 3 is requested
+        rows[static_cast<std::size_t>(row)].rating = 4;
+        CHECK(model.refresh_rows({key}) == 1);  // the analysis result's row read
+        source.deliveries.release_newest();     // the read arrives first …
+        CHECK(model.loaded_row(row)->rating == 4);
+        source.deliveries.release();  // … then page 3: the walk commits with page 2's older value
+        REQUIRE(refreshed == 1);
+        source.deliveries.hold = false;
+        source.deliveries.release();  // the read owed after the commit
+        REQUIRE(process_events_until([&] { return model.loaded_row(row)->rating == 4; }));
+
+        // After the walk: a read requested before the refresh arrives once the generation moved;
+        // it is read again instead of being dropped.
+        source.deliveries.hold = true;
+        rows[static_cast<std::size_t>(row)].rating = 2;
+        const int rows_requests = source.rows_requests;
+        CHECK(model.refresh_rows({key}) == 1);
+        model.refresh(0);
+        source.deliveries.release_newest();  // the walk's first page arrives before the read
+        source.deliveries.hold = false;
+        source.deliveries.release();
+        REQUIRE(process_events_until([&] { return refreshed == 2 && model.loaded_row(row)->rating == 2; }));
+        CHECK(source.rows_requests == rows_requests + 2);
+    }
+
+    TEST_CASE("a refresh keeps the selection of rows pushed past the old end or pulled up from it") {
+        application();
+        FakePageSource source;
+        auto& rows = source.results[""];
+        rows = make_rows(5, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 5; }));
+        std::vector<QAbstractItemModel::LayoutChangeHint> hints;
+        QObject::connect(&model, &QAbstractItemModel::layoutAboutToBeChanged,
+                         [&](const QList<QPersistentModelIndex>&, QAbstractItemModel::LayoutChangeHint hint) {
+                             hints.push_back(hint);
+                         });
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+
+        // Three imported rows sort first: the selected last row moves to row 7, past the old end.
+        const QPersistentModelIndex last = model.index(4, 3);
+        const SampleKey last_key = key_of(rows[4]);
+        auto added = make_rows(3, "added ", rows.front().library);
+        for (std::size_t index = 0; index < added.size(); ++index)
+            added[index].sample_id = 100 + static_cast<std::int64_t>(index);
+        rows.insert(rows.begin(), added.begin(), added.end());
+        model.refresh(0);
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(model.rowCount() == 8);
+        REQUIRE(last.isValid());
+        CHECK(last.row() == 7);
+        CHECK(last.column() == 3);
+        CHECK(*model.key_at(last.row()) == last_key);
+        REQUIRE_FALSE(hints.empty());
+        CHECK(hints.back() == QAbstractItemModel::VerticalSortHint);
+
+        // They are removed again: the row moves back up before the tail rows go.
+        rows.erase(rows.begin(), rows.begin() + 3);
+        model.refresh(0);
+        REQUIRE(process_events_until([&] { return refreshed == 2; }));
+        CHECK(model.rowCount() == 5);
+        REQUIRE(last.isValid());
+        CHECK(last.row() == 4);
+        CHECK(*model.key_at(4) == last_key);
+    }
+
+    TEST_CASE("while a refresh waits to walk again, evicted rows are not re-read with stale cursors") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(SampleTableModel::kPageSize * 12, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 12; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        int refreshed = 0;
+        QObject::connect(&model, &SampleTableModel::refreshed, [&] { ++refreshed; });
+        source.deliveries.hold = true;
+        model.refresh(0);
+        source.deliveries.release();    // the first walk page arrives; the second is requested …
+        ++source.structure_generation;  // … and is stale when it runs: the walk backs off
+        source.deliveries.release();
+        REQUIRE(source.stale_failures == 1);
+        REQUIRE(model.is_refreshing());  // still running during the back-off
+        const auto requests = source.page_requests.size();
+        static_cast<void>(name_at(model, SampleTableModel::kPageSize));  // an evicted row is shown
+        QCoreApplication::processEvents();
+        CHECK(source.page_requests.size() == requests);  // no re-read with its stale cursor
+        CHECK_FALSE(model.canFetchMore({}));
+        source.deliveries.hold = false;
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+        CHECK(source.stale_failures == 1);
+    }
+
+    TEST_CASE("an edit of evicted rows shows its prediction when their page is read again") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(SampleTableModel::kPageSize * 12, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 12; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        const int evicted_row = SampleTableModel::kPageSize + 3;
+        REQUIRE(model.loaded_row(evicted_row) == nullptr);
+        const SampleKey key = *model.key_at(evicted_row);
+        const SampleTableModel::RowPatch rate = [](SampleRow& row) { row.rating = 5; };
+        CHECK(model.patch_rows({key}, rate).empty());  // nothing loaded to patch now
+        model.begin_pending_edit({key}, rate);
+        static_cast<void>(name_at(model, evicted_row));  // the view shows the row: its page is read
+        REQUIRE(process_events_until([&] { return model.loaded_row(evicted_row) != nullptr; }));
+        CHECK(model.loaded_row(evicted_row)->rating == 5);  // the catalog still says 0
+        model.end_pending_edit({key});
+        CHECK_FALSE(model.has_pending_edit(key));
+    }
+
+    TEST_CASE("a failed edit is undone on screen even when the reconciling read fails too") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(3, "row ");
+        SampleTableModel model(source);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == 3; }));
+        FakeEditGateway gateway;
+        gateway.succeed = false;
+        source.rows_error = mso::fail(mso::ErrorCode::DbBusy, "the library is busy").error();
+        mso::ui::EditController controller(gateway, model);
+        std::optional<QString> failure;
+        QObject::connect(&controller, &mso::ui::EditController::failed,
+                         [&](const QString&, const QString& details) { failure = details; });
+        mso::catalog::EditCommand command;
+        command.rating = 4;
+        controller.apply({key_of(source.results[""][0])}, command, QStringLiteral("Rated 4"));
+        CHECK(model.loaded_row(0)->rating == 4);  // the prediction, at once
+        REQUIRE(process_events_until([&] { return failure.has_value(); }));
+        CHECK(failure->contains(QStringLiteral("undone on screen")));
+        CHECK(model.loaded_row(0)->rating == 0);  // and it really was
+    }
+
+    TEST_CASE("the selection's keys include rows whose data was evicted") {
+        application();
+        FakePageSource source;
+        source.results[""] = make_rows(SampleTableModel::kPageSize * 12, "row ");
+        SampleTableModel model(source);
+        mso::ui::SampleTableView view;
+        view.set_sample_model(&model);
+        model.set_query("", {});
+        REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize; }));
+        for (int page = 1; page < 12; ++page) {
+            model.fetchMore({});
+            REQUIRE(process_events_until([&] { return model.rowCount() == SampleTableModel::kPageSize * (page + 1); }));
+        }
+        view.selectAll();
+        const std::size_t selected = view.selected_row_count();
+        CHECK(selected == static_cast<std::size_t>(SampleTableModel::kPageSize * 12));
+        CHECK(view.selected_samples().size() < selected);  // only about 2,000 rows keep their data
+        const std::vector<SampleKey> keys = view.selected_keys();
+        REQUIRE(keys.size() == selected);
+        CHECK(keys.front() == key_of(source.results[""].front()));
+        CHECK(keys.back() == key_of(source.results[""].back()));
+        view.setCurrentIndex(model.index(SampleTableModel::kPageSize, 0));  // an evicted row
+        CHECK(view.current_key() == keys[SampleTableModel::kPageSize]);
+    }
+
+    // ---------------------------------------------------------------- library upgrades on open
+
+    TEST_CASE("jobs panel shows a library upgrade step by step and ends it when the library is open") {
+        application();
+        mso::ui::JobsPanel jobs;
+        auto* tree = jobs.findChild<QTreeWidget*>();
+        REQUIRE(tree != nullptr);
+        const auto library = mso::new_uuid();
+        mso::app::LibraryOpenProgressEvent event;
+        event.library = library;
+        event.directory = std::filesystem::path("C:/Libraries/Drums.msolib");
+        event.step = mso::catalog::OpenStep::BackingUp;
+        event.completed = 0;
+        event.total = 1;
+        jobs.update_library_open(event);
+        REQUIRE(jobs.row_count() == 1);
+        QTreeWidgetItem* row = tree->topLevelItem(0);
+        CHECK(row->text(0).contains(QStringLiteral("Upgrading library Drums.msolib")));
+        CHECK(row->text(2).startsWith(QStringLiteral("Backing up")));
+        tree->setCurrentItem(row);
+        CHECK_FALSE(child_named<QPushButton>(jobs, QStringLiteral("Cancel selected job"))->isEnabled());
+
+        event.step = mso::catalog::OpenStep::RebuildingKeys;
+        event.completed = 2;
+        event.total = 5;
+        jobs.update_library_open(event);
+        CHECK(jobs.row_count() == 1);  // one row per library
+        CHECK(row->text(1).contains(QStringLiteral("40")));
+        CHECK(row->text(2).startsWith(QStringLiteral("Rebuilding name and path keys")));
+        jobs.finish_completed_library_opens({library});  // mid-step: not done yet
+        CHECK_FALSE(row->text(2).startsWith(QStringLiteral("Done")));
+        event.completed = 5;
+        jobs.update_library_open(event);
+        jobs.finish_completed_library_opens({});  // the step ended but the library is not open yet
+        CHECK_FALSE(row->text(2).startsWith(QStringLiteral("Done")));
+        jobs.finish_completed_library_opens({library});
+        CHECK(row->text(2).startsWith(QStringLiteral("Done")));
+
+        // An open that fails ends its row as failed.
+        mso::app::LibraryOpenProgressEvent other = event;
+        other.library = mso::new_uuid();
+        other.directory = std::filesystem::path("C:/Libraries/Loops.msolib");
+        other.completed = 1;
+        jobs.update_library_open(other);
+        jobs.fail_unopened_library_opens({library}, QStringLiteral("the disk is full"));
+        CHECK(tree->topLevelItem(1)->text(2) == QStringLiteral("Failed: the disk is full"));
+    }
+
+    TEST_CASE("names that collided in a library upgrade are reported once, with the backup") {
+        application();
+        mso::app::OpenLibraryInfo clean;
+        clean.uuid = mso::new_uuid();
+        clean.name = "Clean";
+        mso::app::OpenLibraryInfo collided;
+        collided.uuid = mso::new_uuid();
+        collided.name = "Drums";
+        collided.key_conflicts = 3;
+        collided.pre_rekey_backup = std::filesystem::path("C:/Libraries/Drums/backups/pre-rekey.sqlite");
+        std::set<uuids::uuid> reported;
+        const auto notice = mso::ui::MainWindow::key_conflict_notice({clean, collided}, reported);
+        REQUIRE(notice.has_value());
+        CHECK(notice->first.contains(QStringLiteral("collided")));
+        CHECK(notice->second.contains(QStringLiteral("Drums: 3 name(s) or path(s)")));
+        CHECK(notice->second.contains(QStringLiteral("pre-rekey.sqlite")));
+        CHECK_FALSE(notice->second.contains(QStringLiteral("Clean")));
+        CHECK_FALSE(mso::ui::MainWindow::key_conflict_notice({clean, collided}, reported).has_value());
+    }
+
+    // ---------------------------------------------------------------- small helpers
+
+    TEST_CASE("parent cycles of a damaged catalog are found, chains into them are not") {
+        using ParentMap = std::map<std::int64_t, std::optional<std::int64_t>>;
+        CHECK(mso::ui::detail::nodes_on_parent_cycles(ParentMap{{1, std::nullopt}, {2, 1}, {3, 2}}).empty());
+        CHECK(mso::ui::detail::nodes_on_parent_cycles(ParentMap{{1, 2}, {2, 1}, {3, 1}}) ==
+              std::set<std::int64_t>{1, 2});
+        CHECK(mso::ui::detail::nodes_on_parent_cycles(ParentMap{{7, 7}}) == std::set<std::int64_t>{7});
+        CHECK(mso::ui::detail::nodes_on_parent_cycles(ParentMap{{1, 99}, {2, 3}, {3, 4}, {4, 2}, {5, 4}}) ==
+              std::set<std::int64_t>{2, 3, 4});
+    }
+
+    TEST_CASE("tool tips show user text literally, run states and provenance are translated whole") {
+        application();
+        const QString tip = mso::ui::DisplayFormat::plain_tooltip(QStringLiteral("<b>kick</b> & snare\nloop"));
+        CHECK(tip.contains(QStringLiteral("&lt;b&gt;kick&lt;/b&gt; &amp; snare<br>loop")));
+        CHECK(mso::ui::DisplayFormat::plain_tooltip({}).isEmpty());
+        CHECK(mso::ui::DisplayFormat::run_state("completed_with_errors") == QStringLiteral("completed with errors"));
+        CHECK(mso::ui::DisplayFormat::run_state("new_state") == QStringLiteral("new_state"));
+        CHECK(mso::ui::DisplayFormat::provenance("user", 0.8).contains(QStringLiteral("80%")));
+    }
+
+    // ---------------------------------------------------------------- drag path resolver
+
+    TEST_CASE("drag resolver: debounced check, partition of available paths, size limit") {
+        application();
+        std::atomic<int> lookups{0};
+        mso::ui::DragPathResolver resolver([&lookups](const SampleKey& key) -> mso::Result<std::filesystem::path> {
+            ++lookups;
+            if (key.sample_id % 2 == 0) return mso::fail(mso::ErrorCode::FileMissing, "gone");
+            return std::filesystem::path("C:/Samples") / ("sample " + std::to_string(key.sample_id) + ".wav");
+        });
+        int resolved = 0;
+        QObject::connect(&resolver, &mso::ui::DragPathResolver::resolved, [&] { ++resolved; });
+        const auto library = mso::new_uuid();
+        const std::vector<SampleKey> keys{{library, 1}, {library, 2}, {library, 3}};
+        resolver.resolve(keys);
+        CHECK_FALSE(resolver.is_ready_for(keys));  // debounced: nothing runs at once
+        CHECK(lookups == 0);
+        REQUIRE(process_events_until([&] { return resolved == 1; }));
+        CHECK(resolver.is_ready_for(keys));
+        CHECK(resolver.available_keys() == std::vector<SampleKey>{keys[0], keys[2]});
+        CHECK(resolver.unavailable_keys() == std::vector<SampleKey>{keys[1]});
+        CHECK(resolver.available_paths().size() == 2);
+        CHECK(resolver.path_of(keys[2]) == std::filesystem::path("C:/Samples/sample 3.wav"));
+        CHECK_FALSE(resolver.path_of(keys[1]).has_value());
+        CHECK_FALSE(resolver.path_of(SampleKey{library, 42}).has_value());
+
+        // The same selection again (a row refresh) is not checked again.
+        resolver.resolve(keys);
+        CHECK(resolver.is_ready_for(keys));
+        QCoreApplication::processEvents();
+        CHECK(lookups == 3);
+
+        // A selection over the limit is never checked (the drag is refused with a reason).
+        std::vector<SampleKey> many;
+        for (std::size_t index = 0; index <= mso::ui::DragPathResolver::kMaxDragSamples; ++index)
+            many.push_back({library, static_cast<std::int64_t>(index) + 10});
+        resolver.resolve(many);
+        CHECK_FALSE(resolver.is_ready_for(many));
+        CHECK_FALSE(resolver.is_ready_for(keys));
+        CHECK(resolver.available_keys().empty());
+    }
+
+    TEST_CASE("drag resolver: a newer selection stops the running check between two files") {
+        application();
+        Gate first_lookup_entered;
+        Gate release_first_lookup;
+        std::atomic<int> lookups{0};
+        const auto library = mso::new_uuid();
+        mso::ui::DragPathResolver resolver([&](const SampleKey& key) -> mso::Result<std::filesystem::path> {
+            if (++lookups == 1) {
+                first_lookup_entered.open();
+                release_first_lookup.wait();
+            }
+            return std::filesystem::path("C:/Samples") / std::to_string(key.sample_id);
+        });
+        int resolved = 0;
+        QObject::connect(&resolver, &mso::ui::DragPathResolver::resolved, [&] { ++resolved; });
+        const std::vector<SampleKey> first{{library, 1}, {library, 2}, {library, 3}, {library, 4}};
+        const std::vector<SampleKey> second{{library, 9}};
+        resolver.resolve(first);
+        REQUIRE(process_events_until([&] { return first_lookup_entered.is_open(); }));
+        resolver.resolve(second);  // the first check is inside its first lookup now
+        release_first_lookup.open();
+        REQUIRE(process_events_until([&] { return resolved == 1; }));
+        CHECK(resolver.is_ready_for(second));
+        CHECK_FALSE(resolver.is_ready_for(first));
+        CHECK(lookups == 2);  // the first check stopped after its first file; the second ran once
+        CHECK(resolver.available_keys() == second);
+        QCoreApplication::processEvents();
+        CHECK(resolved == 1);  // the superseded check never announced anything
+    }
 
     // ---------------------------------------------------------------- the real application
 
@@ -1521,9 +2023,17 @@ TEST_SUITE("ui") {
         REQUIRE(process_events_until([&] { return imported.has_value(); }, 30000));
         if (!imported->has_value()) FAIL(mso::ui::DisplayFormat::error(imported->error()).toStdString());
 
+        // The import reaches the in-memory index through the change feed shortly after import_now()
+        // returns (nothing here listens for the change events): query again until it has caught up.
         SampleTableModel model(session);
         model.set_query("", {});
-        REQUIRE(process_events_until([&] { return model.rowCount() == 4; }, 10000));
+        REQUIRE(process_events_until(
+            [&] {
+                if (model.is_loading() || model.rowCount() == 4) return model.rowCount() == 4 && !model.is_loading();
+                model.run_query("", {});
+                return false;
+            },
+            30000));
         QStringList names;
         for (int row = 0; row < 4; ++row)
             names << name_at(model, row);

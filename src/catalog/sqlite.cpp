@@ -78,6 +78,28 @@ private:
     int configured_ms_;
 };
 
+/// Interrupts the connection's statements once `stop` is requested, by a progress handler checked
+/// every kStepsPerCheck virtual-machine steps; removed again when the scope ends.
+class StopInterruption {
+public:
+    StopInterruption(sqlite3* handle, std::stop_token stop) : handle_(handle), stop_(std::move(stop)) {
+        if (stop_.stop_possible()) sqlite3_progress_handler(handle_, kStepsPerCheck, &requested, &stop_);
+    }
+    ~StopInterruption() {
+        if (stop_.stop_possible()) sqlite3_progress_handler(handle_, 0, nullptr, nullptr);
+    }
+    StopInterruption(const StopInterruption&) = delete;
+    StopInterruption& operator=(const StopInterruption&) = delete;
+
+private:
+    static constexpr int kStepsPerCheck = 4096;
+    /// Progress callback: non-zero interrupts the running statement (SQLITE_INTERRUPT).
+    static int requested(void* stop) noexcept { return static_cast<std::stop_token*>(stop)->stop_requested() ? 1 : 0; }
+
+    sqlite3* handle_;
+    std::stop_token stop_;
+};
+
 bool is_busy(int result_code) {
     const int primary_code = result_code & 0xFF;
     return primary_code == SQLITE_BUSY || primary_code == SQLITE_LOCKED;
@@ -109,6 +131,9 @@ Error make_sqlite_error(sqlite3* connection, int result_code, std::string_view o
             break;
         case SQLITE_CONSTRAINT:
             code = ErrorCode::InvalidArgument;
+            break;
+        case SQLITE_INTERRUPT:
+            code = ErrorCode::Cancelled;
             break;
         default:
             break;
@@ -160,6 +185,14 @@ void StatementCache::give_back(std::string sql, sqlite3_stmt* statement) noexcep
     } catch (const std::bad_alloc&) {
         sqlite3_finalize(statement);  // caching is an optimization; dropping the statement is safe
     }
+}
+
+std::vector<std::string> StatementCache::idle_sql() const {
+    std::vector<std::string> texts;
+    texts.reserve(idle_.size());
+    for (const auto& [sql, statement] : idle_)
+        texts.push_back(sql);
+    return texts;
 }
 
 void StatementCache::clear() noexcept {
@@ -408,7 +441,7 @@ Result<PreparedStatement> Connection::prepare(std::string_view sql) {
                                                SQLITE_PREPARE_PERSISTENT, &statement, nullptr);
     if (result_code != SQLITE_OK)
         return std::unexpected(
-            make_sqlite_error(handle_, result_code, std::format("prepare [{}]", sql.substr(0, 160))));
+            make_sqlite_error(handle_, result_code, std::format("prepare [{}]", utf8_prefix(sql, 160))));
     return PreparedStatement(handle_, statement, cache_, std::string(sql));
 }
 
@@ -483,7 +516,14 @@ void Connection::rollback() noexcept {
     if (in_transaction()) sqlite3_exec(handle_, "ROLLBACK", nullptr, nullptr, nullptr);
 }
 
-Result<std::string> Connection::integrity_check() {
+std::vector<std::string> Connection::cached_statement_sql() const {
+    return cache_ ? cache_->idle_sql() : std::vector<std::string>{};
+}
+
+Result<std::string> Connection::integrity_check(std::stop_token stop) {
+    if (!handle_) return fail(ErrorCode::Internal, "integrity check on a closed connection");
+    if (stop.stop_requested()) return fail(ErrorCode::Cancelled, "the integrity check was cancelled");
+    const StopInterruption interruption(handle_, stop);
     auto statement = prepare("PRAGMA integrity_check");
     if (!statement) return std::unexpected(statement.error());
     std::string report;
@@ -497,7 +537,10 @@ Result<std::string> Connection::integrity_check() {
     return report;
 }
 
-Result<std::vector<std::string>> Connection::foreign_key_violations() {
+Result<std::vector<std::string>> Connection::foreign_key_violations(std::stop_token stop) {
+    if (!handle_) return fail(ErrorCode::Internal, "foreign key check on a closed connection");
+    if (stop.stop_requested()) return fail(ErrorCode::Cancelled, "the foreign key check was cancelled");
+    const StopInterruption interruption(handle_, stop);
     auto statement = prepare("PRAGMA foreign_key_check");
     if (!statement) return std::unexpected(statement.error());
     std::vector<std::string> violations;
@@ -512,7 +555,7 @@ Result<std::vector<std::string>> Connection::foreign_key_violations() {
 }
 
 Result<void> Connection::backup_to(const std::filesystem::path& destination, int pages_per_step,
-                                   std::chrono::milliseconds busy_deadline) {
+                                   std::chrono::milliseconds busy_deadline, std::stop_token stop) {
     if (!handle_) return fail(ErrorCode::Internal, "backup from a closed connection");
     sqlite3* target = nullptr;
     const auto utf8_path = path_to_utf8(destination);
@@ -532,6 +575,11 @@ Result<void> Connection::backup_to(const std::filesystem::path& destination, int
     using Clock = std::chrono::steady_clock;
     std::optional<Clock::time_point> busy_since;
     while (true) {
+        if (stop.stop_requested()) {
+            sqlite3_backup_finish(backup);
+            sqlite3_close_v2(target);
+            return fail(ErrorCode::Cancelled, "the backup was cancelled");
+        }
         result_code = sqlite3_backup_step(backup, pages_per_step);
         if (result_code == SQLITE_OK) {
             busy_since.reset();

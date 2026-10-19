@@ -79,12 +79,12 @@ struct Operation {
 
 std::unexpected<Error> corrupt_operation(const nlohmann::json& operation, std::string_view why) {
     return fail(ErrorCode::DbCorrupt, std::format("malformed history operation ({}): {}", why,
-                                                  json_fields::dump_json(operation).substr(0, 200)));
+                                                  utf8_prefix(json_fields::dump_json(operation), 200)));
 }
 
 std::unexpected<Error> corrupt_value(std::string_view field, const nlohmann::json& value) {
     return fail(ErrorCode::DbCorrupt, std::format("history value for '{}' is invalid: {}", field,
-                                                  json_fields::dump_json(value).substr(0, 120)));
+                                                  utf8_prefix(json_fields::dump_json(value), 120)));
 }
 
 bool is_one_of(std::string_view value, std::initializer_list<std::string_view> allowed) {
@@ -532,7 +532,7 @@ Result<void> apply_operation(sqlite::Connection& connection, const nlohmann::jso
     if (*current != expected)
         return fail(
             ErrorCode::HistoryConflict,
-            std::format("{} changed since: expected {}, found {}", json_fields::dump_json(stored).substr(0, 200),
+            std::format("{} changed since: expected {}, found {}", utf8_prefix(json_fields::dump_json(stored), 200),
                         json_fields::dump_json(expected), json_fields::dump_json(*current)));
     if (*current == target) return {};
 

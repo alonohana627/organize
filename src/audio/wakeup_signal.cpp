@@ -21,7 +21,13 @@ void WakeupSignal::notify() noexcept {
 }
 
 bool WakeupSignal::wait_for(std::chrono::microseconds timeout) noexcept {
-    const std::int64_t timeout_microseconds = std::max<std::int64_t>(timeout.count(), 0);
+    // The semaphore's kernel wait counts whole milliseconds on Windows and drops the rest, so a
+    // remaining 0.4 ms would return at once and the caller would spin until its deadline. Rounding
+    // up to the next millisecond sleeps through it instead (at most 1 ms late).
+    constexpr std::int64_t kMicrosecondsPerMillisecond = 1000;
+    const std::int64_t requested = std::max<std::int64_t>(timeout.count(), 0);
+    const std::int64_t timeout_microseconds =
+        (requested + kMicrosecondsPerMillisecond - 1) / kMicrosecondsPerMillisecond * kMicrosecondsPerMillisecond;
     if (!semaphore_->semaphore.wait(timeout_microseconds)) {
         return false;
     }

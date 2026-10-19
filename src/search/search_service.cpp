@@ -53,8 +53,14 @@ std::optional<SortField> parse_sort_field(std::string_view text) noexcept {
 namespace {
 
 /// Version of the cursor token layout; version 2 added the library set to the fingerprint,
-/// version 3 replaced the relevance offset with per-library ranks consumed.
-constexpr int kCursorVersion = 3;
+/// version 3 replaced the relevance offset with per-library ranks consumed, version 4 added the
+/// per-library hydration retries.
+constexpr int kCursorVersion = 4;
+
+/// How many times the rows of a library whose hydration failed are offered again on the next
+/// page before they are skipped. One retry absorbs a transient failure (a busy reader); a
+/// persistent one (a damaged page) then costs one more page instead of paging forever.
+constexpr int kHydrationRetries = 1;
 
 /// SQL expression for each sort field; text sorts compare normalized keys.
 std::string_view sort_expression(SortField field) {
@@ -112,18 +118,27 @@ struct OrderedKey {
 
 /// Keyset position of one library inside a federated cursor.
 struct LibraryPosition {
-    int partition = 0;
-    nlohmann::json value;  ///< last sort value (null, integer or string)
-    std::int64_t last_id = 0;
-    bool started = false;
-    bool exhausted = false;
+    int partition = 0;          ///< 0 = in the non-null values, 1 = in the nulls
+    nlohmann::json value;       ///< last sort value (null, integer or string)
+    std::int64_t last_id = 0;   ///< last sample id consumed
+    bool started = false;       ///< false until a row of this library was consumed
+    bool exhausted = false;     ///< no rows left after the position
+    int hydration_retries = 0;  ///< rows after the position failed to hydrate this many pages in a row
 };
 
 /// A decoded continuation token.
 struct DecodedCursor {
     std::map<std::string, LibraryPosition> positions;   ///< by library UUID text (metadata sorts)
     std::map<std::string, std::size_t> ranks_consumed;  ///< by library UUID text: ranked rows delivered (relevance)
+    std::map<std::string, int> hydration_retries;       ///< by library UUID text, as in LibraryPosition (relevance)
 };
+
+/// Reads a retry count (0..kHydrationRetries) from a cursor; nullopt when malformed.
+std::optional<int> decode_retries(const nlohmann::json& value) {
+    const auto count = json_fields::integer_value(value);
+    if (!count || *count < 0 || *count > kHydrationRetries) return std::nullopt;
+    return static_cast<int>(*count);
+}
 
 /// Identifies the result set a cursor belongs to: query, scope, order and the set of libraries.
 std::string query_fingerprint(const SearchRequest& request, std::span<catalog::Library* const> libraries) {
@@ -162,6 +177,14 @@ Result<DecodedCursor> decode_cursor(const std::optional<Cursor>& cursor, const s
             decoded.ranks_consumed.emplace(library, static_cast<std::size_t>(*count));
         }
     }
+    if (const auto* retries = json_fields::member_field(document, "retry")) {
+        if (!retries->is_object()) return stale();
+        for (const auto& [library, count] : retries->items()) {
+            const auto retried = decode_retries(count);
+            if (!retried) return stale();
+            decoded.hydration_retries.emplace(library, *retried);
+        }
+    }
     const auto* libraries = json_fields::member_field(document, "libraries");
     if (libraries == nullptr) return decoded;
     if (!libraries->is_object()) return stale();
@@ -171,9 +194,11 @@ Result<DecodedCursor> decode_cursor(const std::optional<Cursor>& cursor, const s
         const auto last_id = json_fields::integer_field(state, "id");
         const auto started = json_fields::boolean_field(state, "started");
         const auto exhausted = json_fields::boolean_field(state, "done");
+        const auto* retries = json_fields::member_field(state, "retry");
+        const auto retried = retries != nullptr ? decode_retries(*retries) : std::nullopt;
         if (!partition || (*partition != 0 && *partition != 1) || value == nullptr ||
             !(value->is_null() || value->is_number_integer() || value->is_string()) || !last_id || !started ||
-            !exhausted)
+            !exhausted || !retried)
             return stale();
         LibraryPosition position;
         position.partition = static_cast<int>(*partition);
@@ -181,13 +206,15 @@ Result<DecodedCursor> decode_cursor(const std::optional<Cursor>& cursor, const s
         position.last_id = *last_id;
         position.started = *started;
         position.exhausted = *exhausted;
+        position.hydration_retries = *retried;
         decoded.positions.emplace(library, std::move(position));
     }
     return decoded;
 }
 
-/// Compiles the navigation scope into SQL for one library.
-Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& connection) {
+/// Compiles the navigation scope into SQL for one library (`revision` names it, see compile_query).
+Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& connection,
+                                   const LibraryRevision& revision) {
     SqlPredicate out;
     std::vector<std::string> parts;
     if (scope.folder && !scope.root_id)
@@ -213,13 +240,13 @@ Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& conne
             condition.parameters.emplace_back(prefix);
             condition.parameters.emplace_back(detail::prefix_upper_bound(prefix));
         }
-        auto filtered = primary_location_filter(connection, condition);
+        auto filtered = primary_location_filter(connection, condition, revision);
         if (!filtered) return std::unexpected(filtered.error());
         parts.push_back(std::move(filtered->sql));
         out.parameters.insert(out.parameters.end(), filtered->parameters.begin(), filtered->parameters.end());
     }
     if (scope.collection_id) {
-        auto collection = compile_collection(*scope.collection_id, connection);
+        auto collection = compile_collection(*scope.collection_id, connection, revision);
         if (!collection) return std::unexpected(collection.error());
         parts.push_back('(' + collection->sql + ')');
         out.parameters.insert(out.parameters.end(), collection->parameters.begin(), collection->parameters.end());
@@ -249,14 +276,17 @@ Result<SqlPredicate> compile_scope(const Scope& scope, sqlite::Connection& conne
 
 /// The query and scope of a request compiled for one library.
 struct LibraryFilter {
-    SqlPredicate query;
-    SqlPredicate scope;
+    SqlPredicate query;  ///< the query text (compile_query)
+    SqlPredicate scope;  ///< the navigation scope (compile_scope)
 };
 
-Result<LibraryFilter> compile_filter(const Query& query, const Scope& scope, sqlite::Connection& connection) {
-    auto compiled_query = compile_query(query, connection);
+/// Compiles the query and the scope of a request for `library`, on one of its read connections.
+Result<LibraryFilter> compile_filter(const Query& query, const Scope& scope, catalog::Library& library,
+                                     sqlite::Connection& connection) {
+    const LibraryRevision revision{library.uuid(), library.identity().catalog_revision};
+    auto compiled_query = compile_query(query, connection, revision);
     if (!compiled_query) return std::unexpected(compiled_query.error());
-    auto compiled_scope = compile_scope(scope, connection);
+    auto compiled_scope = compile_scope(scope, connection, revision);
     if (!compiled_scope) return std::unexpected(compiled_scope.error());
     return LibraryFilter{std::move(*compiled_query), std::move(*compiled_scope)};
 }
@@ -276,7 +306,7 @@ Result<std::vector<OrderedKey>> fetch_library_keys(catalog::Library& library, co
     auto reader = library.acquire_reader();
     if (!reader) return std::unexpected(reader.error());
     auto& connection = reader->connection();
-    auto filter = compile_filter(query, request.scope, connection);
+    auto filter = compile_filter(query, request.scope, library, connection);
     if (!filter) return std::unexpected(filter.error());
 
     const std::string expression(sort_expression(request.sort));
@@ -376,6 +406,7 @@ std::vector<uuids::uuid> hydrate_page(std::span<catalog::Library* const> librari
     return failed;
 }
 
+/// The page size actually served: `requested` clamped to 1..SearchService::kMaxPageSize.
 std::size_t clamp_page_size(std::size_t requested) {
     return std::clamp<std::size_t>(requested, 1, SearchService::kMaxPageSize);
 }
@@ -398,11 +429,22 @@ bool ranks_before(const RankedKey& left, const RankedKey& right) {
     return left.sample_id < right.sample_id;
 }
 
+/// The libraries whose rows failed to hydrate on this page and are offered again on the next page:
+/// those retried fewer than kHydrationRetries times so far (`retries_so_far(library)`). The rows
+/// of the other failed libraries are skipped.
+template <class RetriesSoFar>
+std::vector<uuids::uuid> libraries_to_retry(const std::vector<uuids::uuid>& failed, RetriesSoFar&& retries_so_far) {
+    std::vector<uuids::uuid> retried;
+    for (const auto& library : failed)
+        if (retries_so_far(library) < kHydrationRetries) retried.push_back(library);
+    return retried;
+}
+
 /// Relevance sort: per library, the top kRelevanceDepth matches of the full filter, full-text hits
 /// by BM25 first; libraries are fused by reciprocal rank, text hits ahead of rows that matched
 /// only through a non-text branch (`kick OR tag:Drums`), which rank by name. The cursor records how
 /// many ranked rows of each library were delivered, so rows of a library whose hydration failed
-/// are retried on the next page (as metadata sorts do) instead of being skipped.
+/// are retried on the next page (as metadata sorts do), kHydrationRetries times, and then skipped.
 Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries, const SearchRequest& request,
                                     const Query& query, const DecodedCursor& cursor, std::size_t page_size,
                                     const std::string& fingerprint) {
@@ -421,7 +463,7 @@ Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries
         auto ranked = [&]() -> Result<std::vector<RankedKey>> {
             auto reader = library->acquire_reader();
             if (!reader) return std::unexpected(reader.error());
-            auto filter = compile_filter(query, request.scope, reader->connection());
+            auto filter = compile_filter(query, request.scope, *library, reader->connection());
             if (!filter) return std::unexpected(filter.error());
             constexpr std::string_view kRanked =
                 "(SELECT rowid AS id, bm25(sample_fts) AS score FROM sample_fts WHERE sample_fts MATCH ?)";
@@ -484,11 +526,22 @@ Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries
     for (auto& row : page.rows)
         row.relevance = scores[{row.library, row.sample_id}];
 
-    // Advance each library by the rows delivered from it; a library whose rows could not be
-    // hydrated keeps its count so the next page retries them.
+    // Advance each library by the rows taken from it. A library whose rows could not be hydrated
+    // keeps its count so the next page retries them; failing again skips them.
+    std::map<std::string, int> next_retries = cursor.hydration_retries;
+    const auto retried = libraries_to_retry(failed, [&](const uuids::uuid& library) {
+        const auto found = next_retries.find(uuids::to_string(library));
+        return found != next_retries.end() ? found->second : 0;
+    });
     std::map<std::string, std::size_t> next_consumed = cursor.ranks_consumed;
-    for (const auto& key : fused)
-        if (!std::ranges::contains(failed, key.library)) ++next_consumed[uuids::to_string(key.library)];
+    for (const auto& key : fused) {
+        if (std::ranges::contains(retried, key.library)) continue;
+        const auto library = uuids::to_string(key.library);
+        ++next_consumed[library];
+        next_retries.erase(library);  // delivered, or skipped after its retries
+    }
+    for (const auto& library : retried)
+        ++next_retries[uuids::to_string(library)];
     bool more = false;
     for (const auto& [library, count] : ranked_counts) {
         const auto found = next_consumed.find(uuids::to_string(library));
@@ -498,8 +551,9 @@ Result<SearchPage> relevance_search(std::span<catalog::Library* const> libraries
         nlohmann::json ranked_state = nlohmann::json::object();
         for (const auto& [library, consumed] : next_consumed)
             ranked_state[library] = consumed;
-        page.next = Cursor{json_fields::dump_json(
-            nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"ranked", std::move(ranked_state)}})};
+        nlohmann::json token{{"v", kCursorVersion}, {"q", fingerprint}, {"ranked", std::move(ranked_state)}};
+        if (!next_retries.empty()) token["retry"] = next_retries;
+        page.next = Cursor{json_fields::dump_json(token)};
     }
     return page;
 }
@@ -542,34 +596,40 @@ Result<SearchPage> metadata_search(std::span<catalog::Library* const> libraries,
         entries.push_back({key.library, key.sample_id});
     const auto failed = hydrate_page(libraries, entries, page.coverage, page.rows);
 
-    // New per-library positions: the last key consumed from each; untouched libraries, and those
-    // whose rows could not be hydrated, keep theirs so the next page retries them.
+    // New per-library positions: the last key consumed from each; untouched libraries keep theirs.
+    // A library whose rows could not be hydrated keeps its position so the next page retries them;
+    // failing again at that position skips them, so a persistent failure cannot page forever.
     std::map<std::string, LibraryPosition> next_positions = cursor.positions;
+    const auto retried = libraries_to_retry(failed, [&](const uuids::uuid& library) {
+        const auto found = next_positions.find(uuids::to_string(library));
+        return found != next_positions.end() ? found->second.hydration_retries : 0;
+    });
     std::map<uuids::uuid, std::size_t> consumed;
     for (const auto& key : merged) {
-        if (std::ranges::contains(failed, key.library)) continue;
+        if (std::ranges::contains(retried, key.library)) continue;
         ++consumed[key.library];
         auto& position = next_positions[uuids::to_string(key.library)];
         position.partition = key.partition;
         position.value = key.sort_value;
         position.last_id = key.sample_id;
         position.started = true;
+        position.hydration_retries = 0;  // delivered, or skipped after its retries
     }
+    for (const auto& library : retried)
+        ++next_positions[uuids::to_string(library)].hydration_retries;
     bool more = false;
     for (const auto& [library, fetched] : fetched_counts) {
         const bool library_has_more =
-            std::ranges::contains(failed, library) || fetched == page_size || consumed[library] < fetched;
+            std::ranges::contains(retried, library) || fetched == page_size || consumed[library] < fetched;
         next_positions[uuids::to_string(library)].exhausted = !library_has_more;
         more = more || library_has_more;
     }
     if (more) {
         nlohmann::json state = nlohmann::json::object();
         for (const auto& [key, position] : next_positions)
-            state[key] = {{"p", position.partition},
-                          {"v", position.value},
-                          {"id", position.last_id},
-                          {"started", position.started},
-                          {"done", position.exhausted}};
+            state[key] = {{"p", position.partition},    {"v", position.value},
+                          {"id", position.last_id},     {"started", position.started},
+                          {"done", position.exhausted}, {"retry", position.hydration_retries}};
         page.next = Cursor{
             json_fields::dump_json(nlohmann::json{{"v", kCursorVersion}, {"q", fingerprint}, {"libraries", state}})};
     }
@@ -606,12 +666,14 @@ Result<std::vector<std::int64_t>> matching_ids(catalog::Library& library, const 
     if (!query) return std::unexpected(query.error());
     auto reader = library.acquire_reader();
     if (!reader) return std::unexpected(reader.error());
-    auto filter = compile_filter(*query, request.scope, reader->connection());
+    auto filter = compile_filter(*query, request.scope, library, reader->connection());
     if (!filter) return std::unexpected(filter.error());
     const bool bounded = maximum_ids != std::numeric_limits<std::size_t>::max();
+    // `+s.deleted`: on the (deleted, ...) sort indexes SQLite would read every live sample and sort
+    // the matches; on the rowid it is driven by the full-text hits or walks the table in id order.
     auto statement = reader->connection().prepare(
         std::format("SELECT s.id FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "
-                    "WHERE s.deleted=0 AND ({}) AND ({}) ORDER BY s.id{}",
+                    "WHERE +s.deleted=0 AND ({}) AND ({}) ORDER BY s.id{}",
                     filter->query.sql, filter->scope.sql, bounded ? " LIMIT ?" : ""));
     if (!statement) return std::unexpected(statement.error());
     const int next =
@@ -667,7 +729,7 @@ Result<CountResult> SearchService::count(std::span<catalog::Library* const> libr
         auto counted = [&]() -> Result<std::int64_t> {
             auto reader = library->acquire_reader();
             if (!reader) return std::unexpected(reader.error());
-            auto filter = compile_filter(*query, request.scope, reader->connection());
+            auto filter = compile_filter(*query, request.scope, *library, reader->connection());
             if (!filter) return std::unexpected(filter.error());
             auto statement = reader->connection().prepare(
                 std::format("SELECT count(*) FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id "

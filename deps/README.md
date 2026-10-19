@@ -96,9 +96,19 @@ or a vendored file whose content is not the recorded post-patch result.
 
 Current patches:
 - `patches/csv_parser/0001-crlf-record-terminator.patch`: RFC 4180 CRLF record terminator instead of LF.
-- `patches/miniaudio/0001-stb-vorbis-setup-allocation-overflow.patch`: stb_vorbis setup made safe on
-  damaged files (found by the review and by `tests/fuzz`): setup allocations sized as `size_t` and
-  capped at 128 MiB per stream (`STB_VORBIS_MAX_SETUP_MEMORY`), vendor and comment lengths and the
-  comment count checked against the bytes left before allocating, `uint32` shifts in `get32_packet`,
-  an entries x dimensions overflow check (the libvorbis `ilog` rule), and `lookup1_values` compared in
-  floating point without an overflowing cast.
+- `patches/miniaudio/0001-stb-vorbis-setup-allocation-overflow.patch`: stb_vorbis made safe on
+  damaged files (found by the reviews and by `tests/fuzz`). Each change carries a "Music Sample
+  Organizer patch" comment in `stb_vorbis.c`:
+  - setup allocations sized as `size_t` and capped at 128 MiB per stream
+    (`STB_VORBIS_MAX_SETUP_MEMORY`);
+  - vendor and comment lengths and the comment count checked against the bytes left in the stream
+    before allocating (in push mode a long comment still means "push more data"), strings that run past
+    the end of their packet refused, the comment list never left half-initialized, and in FILE mode
+    the bytes left counted down once instead of an `ftell` per comment;
+  - `uint32` shifts in `get32_packet`;
+  - codebooks limited to 24 bits of entries x dimensions (the libvorbis rule), with an overflow check,
+    and `lookup1_values` compared in floating point without an overflowing cast;
+  - a sparse codebook's temporary tables freed when its setup fails (they leaked per corrupt file);
+  - a failed Huffman decode (-1) no longer looked up in `sorted_values`;
+  - `Mapping::submap_floor` and `submap_residue` sized for the 16 submaps a mapping may have.
+  Re-check this list whenever the patch changes.

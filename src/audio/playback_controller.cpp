@@ -84,6 +84,9 @@ bool PlaybackController::run_pass() {
     }
     handle_end_of_stream();
     const bool more_work = produce();
+    if (gate_publication_pending_) {
+        publish_gate();  // no first block could be written this pass: publish the epoch anyway
+    }
     publish_settings();
     return more_work;
 }
@@ -378,6 +381,9 @@ bool PlaybackController::produce() {
         produced_frames_ += slot->header->frame_count;
         ring_.commit_write();
         shared_.production.store(EpochProduction{gate_.epoch, produced_frames_});
+        if (gate_publication_pending_) {
+            publish_gate();  // the re-anchored epoch's first block is ready for the callback
+        }
         if (end_of_stream) {
             end_of_stream_written_ = true;
             return false;
@@ -386,7 +392,7 @@ bool PlaybackController::produce() {
     return true;
 }
 
-void PlaybackController::restart_at(std::int64_t source_frame) {
+void PlaybackController::restart_at(std::int64_t source_frame, GatePublication publication) {
     if (!stream_) {
         return;
     }
@@ -394,28 +400,39 @@ void PlaybackController::restart_at(std::int64_t source_frame) {
         fail_source(restarted.error().code);
         return;
     }
-    begin_epoch(stream_->anchor_frame());
+    begin_epoch(stream_->anchor_frame(), publication);
 }
 
 void PlaybackController::reshape() {
     // The audio already handed to the device plays out in the old shape; the new shape continues
     // exactly where it ends. Re-anchoring at the audible position instead would repeat the device
     // buffer (40-60 ms) on every change, and changes faster than that would keep restarting.
-    restart_at(consumed_frame());
+    // The callback keeps playing the old epoch's blocks until the new epoch's first block is in the
+    // ring; publishing the gate earlier would let a callback drop them and starve for a period.
+    restart_at(consumed_frame(), GatePublication::AfterFirstBlock);
 }
 
-void PlaybackController::begin_epoch(std::int64_t start_frame) noexcept {
+void PlaybackController::begin_epoch(std::int64_t start_frame, GatePublication publication) noexcept {
     ++gate_.epoch;
     produced_frames_ = 0;
     end_of_stream_written_ = false;
     shared_.production.store(EpochProduction{gate_.epoch, 0});
     shared_.epoch_start_frame.store(start_frame, std::memory_order_relaxed);
+    if (publication == GatePublication::Immediate) {
+        publish_gate();
+    } else {
+        gate_publication_pending_ = true;
+    }
+}
+
+void PlaybackController::publish_gate() noexcept {
+    gate_publication_pending_ = false;
     shared_.transport_gate.store(gate_.packed(), std::memory_order_release);
 }
 
 void PlaybackController::set_output_enabled(bool enabled) noexcept {
     gate_.output_enabled = enabled;
-    shared_.transport_gate.store(gate_.packed(), std::memory_order_release);
+    publish_gate();
 }
 
 void PlaybackController::fail_source(ErrorCode code) noexcept {

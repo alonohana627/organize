@@ -25,7 +25,9 @@ namespace mso::media::detail {
 /// Small reads from a file are served from a read-ahead window of kReadAheadBytes, so a parser
 /// walking headers costs one system call per window instead of one per header (on a network share
 /// each call is a round trip). The budget charges only the bytes handed to the parser; a window
-/// never extends past the end of the file or beyond what the parser could still be given.
+/// never extends past the end of the file or beyond what the parser could still be given, and the
+/// bytes read ahead (beyond each request) total at most the byte budget, so scattered small reads
+/// cannot pull more than twice ProbeLimits::max_bytes off the disk.
 class BoundedFileReader {
 public:
     /// Size of the read-ahead window for reads smaller than it.
@@ -40,6 +42,9 @@ public:
     [[nodiscard]] std::uint64_t file_size() const noexcept { return file_size_; }
     /// Bytes charged against the budget so far: those handed to the parsers.
     [[nodiscard]] std::uint64_t bytes_read() const noexcept { return bytes_read_; }
+    /// Bytes read from the file so far, read-ahead included (0 over memory); at most twice the
+    /// byte budget.
+    [[nodiscard]] std::uint64_t bytes_fetched() const noexcept { return bytes_fetched_; }
     /// Bytes that may still be read before the budget is exhausted.
     [[nodiscard]] std::uint64_t remaining_budget() const noexcept;
     /// When reads start failing with ProbeLimit; also bounds work done between reads (FFmpeg analysis).
@@ -80,6 +85,8 @@ private:
     std::chrono::steady_clock::time_point deadline_;
     std::vector<std::uint8_t> window_;  ///< read-ahead bytes of the file, starting at window_offset_
     std::uint64_t window_offset_ = 0;
+    std::uint64_t read_ahead_bytes_ = 0;  ///< bytes read into windows beyond their requests, at most byte_budget_
+    std::uint64_t bytes_fetched_ = 0;     ///< bytes read from the file, requests and read-ahead together
 };
 
 }  // namespace mso::media::detail

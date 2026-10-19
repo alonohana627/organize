@@ -14,6 +14,14 @@
 if(NOT WIN32)
   return()
 endif()
+# CPACK_WIX_INSTALL_SCOPE (below) exists from CMake 3.29; an older CMake ignores it silently and builds an
+# installer that registers its shortcuts and uninstaller for the installing user only. No installer
+# rather than that one: configuring still works, but `cpack` finds no CPackConfig.cmake.
+if(CMAKE_VERSION VERSION_LESS 3.29)
+  message(WARNING "MSO: the Windows installer needs CMake 3.29 or newer (this is ${CMAKE_VERSION}); "
+                  "packaging is disabled for this build")
+  return()
+endif()
 
 set(CPACK_GENERATOR WIX)
 set(CPACK_PACKAGE_NAME "Music Sample Organizer")

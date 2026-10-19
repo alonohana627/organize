@@ -3,9 +3,10 @@
 /// Preview audio engine: streams one selected sample at a time to the output device.
 ///
 /// Threads (docs/02_ARCHITECTURE.md §3, §8):
-///  - control thread (the UI thread): open(), device selection and restart, post(), snapshot().
+///  - control thread (the UI thread): open(), post(), snapshot() and the asynchronous device calls.
 ///    create() and destruction may happen on any thread (a worker pool may create the engine and
-///    the UI thread destroy it), just never at the same time as another call;
+///    the UI thread destroy it), just never at the same time as another call. The blocking device
+///    calls may be made from any thread (see "Which calls block" below);
 ///  - one decoder thread per engine: opens and decodes the source, folds channels to stereo,
 ///    resamples to the device rate and keeps the PCM ring prebuffered (at most 250 ms);
 ///  - one output thread per engine (System and Null backends): every audio backend and device call
@@ -13,8 +14,28 @@
 ///    same thread; it also re-opens a lost endpoint by itself, with backoff;
 ///  - the device's real-time callback: reads the ring, applies volume, writes the output. It never
 ///    allocates, locks, logs, touches files or decodes.
+///
+/// Which calls block (System and Null backends):
+///  - create() opens the backend and the first endpoint: hundreds of milliseconds, seconds when the
+///    audio service is slow. Run it off the UI thread.
+///  - list_output_devices(), select_output_device() and restart_output_device() wait for the output
+///    thread: enumerating, opening, starting and stopping WASAPI endpoints takes hundreds of
+///    milliseconds and sometimes seconds, and a request also waits behind the requests queued
+///    before it and behind an automatic re-open in progress. A UI must not call them on its event
+///    thread; it uses the *_async forms, which return at once, or calls these from a worker thread
+///    (they are safe from any thread, concurrently with each other and with every call except
+///    destruction).
+///  - Destruction closes the endpoint and joins the threads: bounded, but stopping an endpoint
+///    whose driver hangs can take seconds (WASAPI waits up to 5 s for a stuck device thread).
+///  - open(), post() and snapshot() never wait for device work: open() hands the file to the
+///    decoder thread, post() is a lock-free mailbox write and snapshot() reads atomics.
+///  - render_offline() does the callback's work on the calling thread (Offline backend only).
+///
+/// Every backend reports its endpoints and failures the same way; Offline answers device calls at
+/// once on the calling thread (no devices; INVALID_ARGUMENT for select and restart).
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -53,6 +74,11 @@ struct OutputDeviceInfo {
     bool is_system_default = false;  ///< the endpoint the system currently uses by default
 };
 
+/// Receives the outcome of an asynchronous device request (PreviewEngine::list_output_devices_async()
+/// and its siblings), exactly once.
+template <class Value>
+using DeviceRequestCompletion = std::function<void(Result<Value>)>;
+
 /// Engine configuration. Out-of-range values are clamped to the documented limits.
 struct PreviewOptions {
     OutputBackend backend = OutputBackend::System;  ///< where audio goes
@@ -73,16 +99,19 @@ struct PreviewOptions {
     std::uint32_t device_retry_longest_milliseconds = 10'000;
 };
 
-/// Single-sample preview player. Create with create(); all methods except post() and snapshot()
-/// belong to the control thread. post() must be called from one thread at a time; snapshot() is
-/// safe from any thread. Destruction closes the device on the output thread and joins the output
-/// and decoder threads (bounded).
+/// Single-sample preview player. Create with create(). open() and the asynchronous device calls
+/// belong to the control thread; the blocking device calls may come from any thread; post() must be
+/// called from one thread at a time; snapshot() is safe from any thread. Destruction closes the
+/// device on the output thread and joins the output and decoder threads (bounded). See the file
+/// comment for which calls block.
 ///
-/// Losing the endpoint (headphones unplugged, audio service restarted) is reported in the snapshot
-/// (output_device_lost, last_error DEVICE_LOST, state Error). The engine then re-opens the selected
-/// endpoint, or the system default when it is gone, by itself with backoff (PreviewOptions); the
-/// transport comes back where it was heard, with Playing turned into Paused. restart_output_device()
-/// retries at once and also resumes playback.
+/// Losing the endpoint (headphones unplugged, audio service restarted, a driver that stops calling
+/// back) is reported in the snapshot (output_device_lost, last_error DEVICE_LOST, state Error). The
+/// engine then re-opens the selected endpoint, or the system default when it is gone, by itself with
+/// backoff (PreviewOptions); the transport comes back where it was heard, with Playing turned into
+/// Paused. restart_output_device() retries at once and also resumes playback. A change of the
+/// system's default device (a headset plugged in) is not a loss: an engine that follows the system
+/// default moves to the new device and keeps playing.
 class PreviewEngine {
 public:
     /// Opens the backend and starts the output and decoder threads. If the endpoint cannot be opened
@@ -112,6 +141,24 @@ public:
     /// again. On failure the endpoint stays lost, the error is returned and automatic retries go on.
     /// INVALID_ARGUMENT for the Offline backend.
     [[nodiscard]] virtual Result<void> restart_output_device() = 0;
+
+    /// list_output_devices() without waiting. `on_done` is called exactly once with the outcome:
+    ///  - on the engine's output thread once the request has run, in the order requests were made;
+    ///  - on the calling thread before this returns when the request is answered at once (Offline
+    ///    backend) or refused (RESOURCE_LIMIT: more than 32 device requests waiting, or no memory);
+    ///  - with CANCELLED, on the output thread during destruction, for a request still waiting then.
+    /// `on_done` must be quick and must not block: no blocking device call (it would wait for the
+    /// thread it runs on, and is refused with INVALID_ARGUMENT), no destruction of the engine. It may
+    /// call snapshot() and the *_async calls. A UI hands the result to its own thread from there
+    /// (Qt: QMetaObject::invokeMethod on a QPointer-guarded receiver with Qt::QueuedConnection). An
+    /// empty `on_done` discards the outcome.
+    virtual void list_output_devices_async(DeviceRequestCompletion<std::vector<OutputDeviceInfo>> on_done) = 0;
+
+    /// select_output_device() without waiting; `on_done` as for list_output_devices_async().
+    virtual void select_output_device_async(OutputDeviceId device, DeviceRequestCompletion<void> on_done) = 0;
+
+    /// restart_output_device() without waiting; `on_done` as for list_output_devices_async().
+    virtual void restart_output_device_async(DeviceRequestCompletion<void> on_done) = 0;
 
     /// Starts a new source generation for `file`: the decoder thread opens it and prebuffers from
     /// the start. Does not auto-play. Old PCM is discarded; decode errors appear in the snapshot.

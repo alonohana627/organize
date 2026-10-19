@@ -13,9 +13,11 @@ namespace {
 constexpr std::int64_t kMinimumMilliBpm = 20'000;
 constexpr std::int64_t kMaximumMilliBpm = 400'000;
 
-/// Samples (as `sample_id`) with a non-retired location in root ?1.
+/// Samples (as `sample_id`) with a non-retired location in root ?1. A sample with two locations
+/// there is listed twice; mark_samples_changed's upsert absorbs that more cheaply than DISTINCT,
+/// which would sort the whole root in a temporary B-tree.
 constexpr std::string_view kRootSamplesSql =
-    "SELECT DISTINCT location.sample_id AS sample_id FROM locations location "
+    "SELECT location.sample_id AS sample_id FROM locations location "
     "WHERE location.root_id=?1 AND location.state<>'retired'";
 
 /// Old paths of relink candidates, probed before the writer is taken: path → still exists on disk.
@@ -545,15 +547,17 @@ Result<RootRecord> Library::add_root(std::string_view name, RootMode mode, std::
     return root;
 }
 
-Result<std::vector<RootRecord>> Library::list_roots() {
+Result<std::vector<RootRecord>> Library::list_roots(RootListing listing) {
     auto reader = acquire_reader();
     if (!reader) return std::unexpected(reader.error());
-    auto statement = reader->connection().prepare(
-        "SELECT root.id, root.uuid, root.name, root.mode, root.availability, root.scan_generation, root.last_seen_at, "
+    constexpr std::string_view kSampleCount =
         "(SELECT count(DISTINCT location.sample_id) FROM locations location JOIN samples sample "
-        " ON sample.id=location.sample_id WHERE location.root_id=root.id AND location.state<>'retired' "
-        " AND sample.deleted=0), root.case_sensitive "
-        "FROM roots root WHERE root.deleted=0 ORDER BY root.name, root.id");
+        "ON sample.id=location.sample_id WHERE location.root_id=root.id AND location.state<>'retired' "
+        "AND sample.deleted=0)";
+    auto statement = reader->connection().prepare(std::format(
+        "SELECT root.id, root.uuid, root.name, root.mode, root.availability, root.scan_generation, root.last_seen_at, "
+        "{}, root.case_sensitive FROM roots root WHERE root.deleted=0 ORDER BY root.name, root.id",
+        listing == RootListing::WithSampleCounts ? kSampleCount : std::string_view("0")));
     if (!statement) return std::unexpected(statement.error());
     std::vector<RootRecord> roots;
     auto walked = detail::for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
@@ -650,6 +654,14 @@ Result<ScanSession> Library::begin_scan(std::int64_t root_id) {
     if (!abandon) return std::unexpected(abandon.error());
     abandon->bind(1, root_id).bind(2, now_unix_ms() - std::chrono::milliseconds(kMaximumScanResumeAge).count());
     if (auto abandoned = abandon->run(); !abandoned) return std::unexpected(abandoned.error());
+    // The frontier only serves resumption: rows of finished sessions (including those of catalogs
+    // written before finish_scan cleared its own) are dropped so the table stays bounded.
+    auto forget = writer_.prepare(
+        "DELETE FROM scan_frontier WHERE scan_id IN (SELECT id FROM scan_sessions WHERE root_id=?1 "
+        "AND state IN ('completed','cancelled','failed'))");
+    if (!forget) return std::unexpected(forget.error());
+    forget->bind(1, root_id);
+    if (auto forgotten = forget->run(); !forgotten) return std::unexpected(forgotten.error());
 
     // Resume a recently interrupted scan of this root so its completed directories are not redone.
     auto paused = writer_.prepare(
@@ -769,9 +781,11 @@ Result<void> Library::mark_scan_entries_seen(const ScanSession& session, std::sp
 
     // Only the scan bookkeeping changes (stats stay as they were). A location that an earlier scan
     // marked missing exists again, but nothing about its bytes was verified: it becomes `unknown`.
+    // `state<>'retired'` is the partial index's own predicate: SQLite does not infer it from
+    // `state='missing'`, and without it every location of the root is read per skipped path.
     auto revive = writer_.prepare(
         "UPDATE locations SET state='unknown', seen_scan_generation=?3, last_seen_at=?4 "
-        "WHERE root_id=?1 AND path_key=?2 AND state='missing' RETURNING sample_id");
+        "WHERE root_id=?1 AND path_key=?2 AND state<>'retired' AND state='missing' RETURNING sample_id");
     auto mark = writer_.prepare(
         "UPDATE locations SET seen_scan_generation=?3, last_seen_at=?4 "
         "WHERE root_id=?1 AND path_key=?2 AND state<>'retired'");
@@ -800,8 +814,19 @@ Result<void> Library::mark_scan_entries_seen(const ScanSession& session, std::sp
 }
 
 Result<void> Library::record_scan_gap(const ScanSession& session, std::string_view relative_directory, bool denied) {
+    const ScanGap gap{.relative_directory = std::string(relative_directory), .denied = denied};
+    return record_scan_gaps(session, std::span(&gap, 1));
+}
+
+Result<void> Library::record_scan_gaps(const ScanSession& session, std::span<const ScanGap> gaps) {
     if (auto writable = ensure_writable(); !writable) return writable;
+    if (gaps.size() > kMaximumScanBatchFiles)
+        return fail(ErrorCode::InvalidArgument,
+                    std::format("at most {} scan gaps per call (got {})", kMaximumScanBatchFiles, gaps.size()));
+    if (gaps.empty()) return {};
     const std::lock_guard lock(writer_mutex_);
+    sqlite::WriteTransaction transaction(writer_);
+    if (auto began = transaction.begin(); !began) return began;
     auto case_sensitive = root_case_sensitivity(writer_, session.root_id);
     if (!case_sensitive) return std::unexpected(case_sensitive.error());
     // The key lets finish_scan match the subtree by path key, so on a case-insensitive root a gap
@@ -811,9 +836,12 @@ Result<void> Library::record_scan_gap(const ScanSession& session, std::string_vi
         "ON CONFLICT(scan_id,relative_directory) DO UPDATE SET state=excluded.state, "
         "directory_key=excluded.directory_key");
     if (!statement) return std::unexpected(statement.error());
-    statement->bind(1, session.id).bind(2, relative_directory).bind(3, denied ? "denied" : "failed");
-    statement->bind(4, mso::path_key(relative_directory, *case_sensitive));
-    return statement->run();
+    for (const auto& gap : gaps) {
+        statement->bind(1, session.id).bind(2, gap.relative_directory).bind(3, gap.denied ? "denied" : "failed");
+        statement->bind(4, mso::path_key(gap.relative_directory, *case_sensitive));
+        if (auto recorded = statement->run(); !recorded) return recorded;
+    }
+    return transaction.commit();  // scan bookkeeping only: no catalog revision
 }
 
 Result<ScanFinishOutcome> Library::finish_scan(const ScanSession& session, bool cancelled) {
@@ -894,6 +922,11 @@ Result<ScanFinishOutcome> Library::finish_scan(const ScanSession& session, bool 
         if (!complete) return std::unexpected(complete.error());
         complete->bind(1, session.id).bind(2, outcome.complete_coverage ? 1 : 0);
         if (auto completed = complete->run(); !completed) return std::unexpected(completed.error());
+        // A completed scan is never resumed: its frontier (one row per directory) is not needed.
+        auto forget = writer_.prepare("DELETE FROM scan_frontier WHERE scan_id=?1");
+        if (!forget) return std::unexpected(forget.error());
+        forget->bind(1, session.id);
+        if (auto forgotten = forget->run(); !forgotten) return std::unexpected(forgotten.error());
         auto seen = writer_.prepare(
             "UPDATE roots SET availability='online', last_seen_at=?2 WHERE id=?1 AND availability<>'online'");
         if (!seen) return std::unexpected(seen.error());
@@ -936,9 +969,10 @@ Result<std::map<std::string, Library::KnownStat>> Library::known_stats_in_direct
     if (!case_sensitive) return std::unexpected(case_sensitive.error());
     auto statement = connection.prepare(
         relative_directory.empty()
-            ? "SELECT path_key, byte_size, mtime_ns FROM locations WHERE root_id=?1 AND folder_id IS NULL "
-              "AND state<>'retired'"
-            : "SELECT location.path_key, location.byte_size, location.mtime_ns FROM locations location "
+            ? "SELECT path_key, byte_size, mtime_ns, observed_volume_id, file_id FROM locations WHERE root_id=?1 "
+              "AND folder_id IS NULL AND state<>'retired'"
+            : "SELECT location.path_key, location.byte_size, location.mtime_ns, location.observed_volume_id, "
+              "location.file_id FROM locations location "
               "JOIN folders folder ON folder.id=location.folder_id WHERE location.root_id=?1 AND folder.root_id=?1 "
               "AND folder.path_key=?2 AND location.state<>'retired'");
     if (!statement) return std::unexpected(statement.error());
@@ -946,7 +980,15 @@ Result<std::map<std::string, Library::KnownStat>> Library::known_stats_in_direct
     if (!relative_directory.empty()) statement->bind(2, mso::path_key(relative_directory, *case_sensitive));
     std::map<std::string, KnownStat> stats;
     auto walked = detail::for_each_row(*statement, [&](sqlite::PreparedStatement& row) -> Result<void> {
-        stats.emplace(row.column_text(0), KnownStat{row.column_optional_int64(1), row.column_optional_int64(2)});
+        std::optional<std::string> file_id;
+        if (!row.column_is_null(4)) {
+            const auto bytes = row.column_blob(4);
+            file_id.emplace(bytes.begin(), bytes.end());
+        }
+        stats.emplace(row.column_text(0), KnownStat{.byte_size = row.column_optional_int64(1),
+                                                    .mtime_ns = row.column_optional_int64(2),
+                                                    .volume_id = row.column_optional_text(3),
+                                                    .file_id = std::move(file_id)});
         return {};
     });
     if (!walked) return std::unexpected(walked.error());

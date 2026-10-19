@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <format>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 
 #include "mso/catalog/taxonomy_lookup.hpp"
 #include "mso/domain/taxonomy.hpp"
@@ -19,6 +21,53 @@ constexpr int kMaxSmartCollectionNesting = 4;
 constexpr std::string_view kAvailableSql =
     "EXISTS(SELECT 1 FROM locations al JOIN roots ar ON ar.id=al.root_id WHERE al.sample_id=s.id "
     "AND al.state='present' AND ar.availability<>'offline' AND ar.deleted=0)";
+
+/// The plans primary_location_filter chose, by library, revision, library size and condition:
+/// paging through one folder counts its candidates once. Process-wide, thread-safe and bounded
+/// (cleared when full: a miss only costs one count).
+class LocationPlanCache {
+public:
+    /// The remembered choice for `key` (true = index-driven), if any.
+    std::optional<bool> find(const std::string& key) {
+        const std::lock_guard lock(mutex_);
+        const auto found = plans_.find(key);
+        if (found == plans_.end()) return std::nullopt;
+        return found->second;
+    }
+
+    /// Remembers the choice for `key`.
+    void remember(std::string key, bool index_driven) {
+        const std::lock_guard lock(mutex_);
+        if (plans_.size() >= kMaximumPlans) plans_.clear();
+        plans_.insert_or_assign(std::move(key), index_driven);
+    }
+
+private:
+    static constexpr std::size_t kMaximumPlans = 256;  ///< folders and scopes in use at once are few
+    std::mutex mutex_;
+    std::unordered_map<std::string, bool> plans_;
+};
+
+/// The one cache of every library's folder plans.
+LocationPlanCache& location_plan_cache() {
+    static LocationPlanCache cache;
+    return cache;
+}
+
+/// The cache key of a location condition: library, revision, library size, SQL and parameters
+/// (strings length-prefixed, so no two different conditions share a key).
+std::string location_plan_key(const LibraryRevision& revision, std::int64_t library_size,
+                              const SqlPredicate& condition) {
+    std::string key = std::format("{}|{}|{}|{}|", uuids::to_string(revision.library), revision.catalog_revision,
+                                  library_size, condition.sql);
+    for (const auto& parameter : condition.parameters) {
+        if (const auto* number = std::get_if<std::int64_t>(&parameter))
+            key += std::format("i{}|", *number);
+        else
+            key += std::format("s{}:{}|", std::get<std::string>(parameter).size(), std::get<std::string>(parameter));
+    }
+    return key;
+}
 
 /// Escapes LIKE wildcards so user text matches literally (used with ESCAPE '\').
 std::string escape_like(std::string_view text) {
@@ -65,8 +114,10 @@ private:
 /// kMaxCompiledNodes budget.
 class QueryCompiler {
 public:
-    /// Compiles against the read connection `connection` (one snapshot).
-    explicit QueryCompiler(sqlite::Connection& connection) : connection_(connection) {}
+    /// Compiles against the read connection `connection` (one snapshot) of the library `revision`
+    /// names, when known (folder plans are then reused across calls).
+    QueryCompiler(sqlite::Connection& connection, const std::optional<LibraryRevision>& revision)
+        : connection_(connection), revision_(revision) {}
 
     /// Compiles a whole query; the empty query compiles to "1".
     Result<SqlPredicate> compile(const Query& query) {
@@ -407,7 +458,7 @@ private:
             fragment.sql = "0";
         } else {
             fragment.sql = std::move(alternatives);
-            auto filtered = primary_location_filter(connection_, fragment);
+            auto filtered = primary_location_filter(connection_, fragment, revision_);
             if (!filtered) return std::unexpected(filtered.error());
             fragment = std::move(*filtered);
         }
@@ -431,8 +482,9 @@ private:
     }
 
     sqlite::Connection& connection_;
-    int nesting_ = 0;                 ///< smart collections currently being expanded
-    std::size_t compiled_nodes_ = 0;  ///< nodes compiled so far, shared by the whole expansion
+    std::optional<LibraryRevision> revision_;  ///< the library and revision read, when known
+    int nesting_ = 0;                          ///< smart collections currently being expanded
+    std::size_t compiled_nodes_ = 0;           ///< nodes compiled so far, shared by the whole expansion
     std::optional<std::vector<RootFacts>> roots_;
     std::optional<std::vector<CollectionFacts>> collections_;
     std::map<std::string, SqlPredicate> folder_fragments_;        ///< by folder: value
@@ -441,17 +493,14 @@ private:
 
 }  // namespace
 
-Result<SqlPredicate> primary_location_filter(sqlite::Connection& connection, const SqlPredicate& location_condition) {
-    // The largest sample id bounds the library size in O(log n) (ids are never reused).
-    auto largest = connection.prepare("SELECT COALESCE(max(id),0) FROM samples");
-    if (!largest) return std::unexpected(largest.error());
-    auto has_largest = largest->next_row();
-    if (!has_largest) return std::unexpected(has_largest.error());
-    const std::int64_t library_size = *has_largest ? largest->column_int64(0) : 0;
-    largest->reset();
-    const std::int64_t threshold = std::max<std::int64_t>(1, library_size / kIndexDrivenLocationShare);
+namespace {
 
-    // Candidate locations, counted index-only and never past the threshold.
+/// Whether the location condition is selective enough for the index-driven shape: fewer candidate
+/// locations than 1/kIndexDrivenLocationShare of `library_size`, counted index-only and never past
+/// that threshold.
+Result<bool> is_selective(sqlite::Connection& connection, const SqlPredicate& location_condition,
+                          std::int64_t library_size) {
+    const std::int64_t threshold = std::max<std::int64_t>(1, library_size / kIndexDrivenLocationShare);
     auto counted = connection.prepare(
         std::format("SELECT count(*) FROM (SELECT 1 FROM locations fl WHERE fl.state<>'retired' AND ({}) LIMIT ?)",
                     location_condition.sql));
@@ -461,10 +510,37 @@ Result<SqlPredicate> primary_location_filter(sqlite::Connection& connection, con
     if (!has_count) return std::unexpected(has_count.error());
     const std::int64_t candidates = *has_count ? counted->column_int64(0) : 0;
     counted->reset();
+    return candidates < threshold;
+}
+
+}  // namespace
+
+Result<SqlPredicate> primary_location_filter(sqlite::Connection& connection, const SqlPredicate& location_condition,
+                                             const std::optional<LibraryRevision>& revision) {
+    // The largest sample id bounds the library size in O(log n) (ids are never reused).
+    auto largest = connection.prepare("SELECT COALESCE(max(id),0) FROM samples");
+    if (!largest) return std::unexpected(largest.error());
+    auto has_largest = largest->next_row();
+    if (!has_largest) return std::unexpected(has_largest.error());
+    const std::int64_t library_size = *has_largest ? largest->column_int64(0) : 0;
+    largest->reset();
+
+    std::optional<bool> selective;
+    std::string cache_key;
+    if (revision) {
+        cache_key = location_plan_key(*revision, library_size, location_condition);
+        selective = location_plan_cache().find(cache_key);
+    }
+    if (!selective) {
+        auto counted = is_selective(connection, location_condition, library_size);
+        if (!counted) return std::unexpected(counted.error());
+        selective = *counted;
+        if (revision) location_plan_cache().remember(std::move(cache_key), *selective);
+    }
 
     SqlPredicate filter;
     filter.parameters = location_condition.parameters;
-    if (candidates < threshold)
+    if (*selective)
         filter.sql = std::format(
             "s.id IN (SELECT fl.sample_id FROM locations fl WHERE fl.state<>'retired' AND ({}) "
             "AND fl.id={})",
@@ -496,12 +572,14 @@ std::string fts_expression(const TextTerm& term) {
     return quoted;
 }
 
-Result<SqlPredicate> compile_query(const Query& query, sqlite::Connection& connection) {
-    return QueryCompiler(connection).compile(query);
+Result<SqlPredicate> compile_query(const Query& query, sqlite::Connection& connection,
+                                   const std::optional<LibraryRevision>& revision) {
+    return QueryCompiler(connection, revision).compile(query);
 }
 
-Result<SqlPredicate> compile_collection(std::int64_t collection_id, sqlite::Connection& connection) {
-    return QueryCompiler(connection).compile_collection(collection_id);
+Result<SqlPredicate> compile_collection(std::int64_t collection_id, sqlite::Connection& connection,
+                                        const std::optional<LibraryRevision>& revision) {
+    return QueryCompiler(connection, revision).compile_collection(collection_id);
 }
 
 std::string_view availability_sql() {

@@ -107,10 +107,10 @@ private:
 
     explicit Workspace(std::filesystem::path directory) : directory_(std::move(directory)) {}
     /// Reads and parses workspace.json into `document`; entries of the wrong shape are skipped.
-    Result<FileState> read_file(Document& document) const;
+    [[nodiscard]] Result<FileState> read_file(Document& document) const;
     /// Applies `change` to the latest on-disk document under the inter-process lock and writes it
     /// atomically when `change` reports a modification (returns true).
-    Result<void> update(const std::function<bool(Document&)>& change);
+    [[nodiscard]] Result<void> update(const std::function<bool(Document&)>& change);
     /// The current stamp of workspace.json; nullopt when it does not exist or cannot be read.
     std::optional<FileStamp> current_stamp() const;
 

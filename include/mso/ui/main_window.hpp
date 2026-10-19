@@ -8,7 +8,9 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mso/app/application.hpp"
@@ -75,6 +77,14 @@ public:
     SampleTableView* sample_table() const { return table_; }
     /// The notification strip (tests read its message).
     NotificationBar* notification_bar() const { return notification_bar_; }
+    /// The notification for libraries whose upgrade kept colliding names apart (key_conflicts > 0):
+    /// title and details, or nullopt when every such library is already in `reported` (it is added
+    /// there). One message covers every library of one call.
+    static std::optional<std::pair<QString, QString>> key_conflict_notice(
+        const std::vector<app::OpenLibraryInfo>& libraries, std::set<uuids::uuid>& reported);
+    /// True while a re-read of the result window is scheduled for samples the table does not hold
+    /// (tests check that changes to known rows never schedule one).
+    bool window_refresh_pending() const { return window_refresh_timer_.isActive(); }
     /// The command with a ShortcutCatalog id (tests check where its shortcut lives), or null.
     QAction* command(const QString& id) const;
     /// Assigns key sequences to the commands. A command whose sequence is a single key without
@@ -242,7 +252,8 @@ private:
 
     QTimer selection_timer_;       ///< coalesces selection and row changes into one update per event-loop pass
     QTimer window_refresh_timer_;  ///< throttles re-reads for changes outside the loaded rows
-    std::optional<SampleKey> previous_current_;  ///< audition-on-selection plays only on a change
+    std::set<uuids::uuid> reported_key_conflicts_;  ///< libraries whose upgrade collisions were shown
+    std::optional<SampleKey> previous_current_;     ///< audition-on-selection plays only on a change
 };
 
 }  // namespace mso::ui

@@ -1,6 +1,7 @@
 # Building Music Sample Organizer
 
-The project builds with **clang and libc++ in C++23**, configured by **CMake** (3.28+) with **Ninja**.
+The project builds with **clang and libc++ in C++23**, configured by **CMake** (3.28+; the Windows
+installer needs 3.29+) with **Ninja**.
 Everything the core needs is vendored in `deps/` and built as part of the project. Two large libraries
 come from the system: **Qt 6.5+** (desktop UI) and **FFmpeg** (AAC, Opus, ALAC, WMA...). Both are
 optional for a local build (the configure step says what is missing); `MSO_REQUIRE_GUI` and
@@ -52,14 +53,18 @@ cmake --install build/release --prefix "C:/Programs/MusicSampleOrganizer"
 `<prefix>\bin` then holds the three executables with every DLL they load (Qt through `windeployqt`;
 libc++, FFmpeg and their dependencies resolved from the toolchain), and `<prefix>\share\qt6\plugins`
 the Qt plugins that `qt.conf` points to. Network-related Qt plugins are not deployed (the application
-is offline). CI starts the installed app with only `C:\Windows\System32` on `PATH` to prove this.
+is offline). The `ci` leg starts the installed app with only `C:\Windows\System32` on `PATH`; that
+step passed in run 39233493989.
 
 ### Windows installer (.msi)
 
 To install on another PC, build an installer from the same install rules (`cmake/Packaging.cmake`).
-It needs the [WiX Toolset 3.x](https://github.com/wixtoolset/wix3/releases): unpack
-`wix314-binaries.zip` anywhere and put that folder on `PATH`, or point `WIX` at it (CI installs the
-Chocolatey package `wixtoolset` 3.14.1 and sets `WIX`). Build it from the MSYS2 CLANG64 shell: the
+It needs the [WiX Toolset 3.x](https://github.com/wixtoolset/wix3/releases) and CMake 3.29 or newer
+(older versions skip packaging with a warning, because they cannot make the installer per machine).
+Unpack `wix314-binaries.zip` anywhere and put that folder on `PATH`, or point `WIX` at it: CPack
+(3.29+) looks for `candle.exe` and `light.exe` in `$WIX` and in `$WIX/bin`, so both the flat zip and
+the Chocolatey package `wixtoolset` 3.14.1 (preinstalled on the `ci` runner; its programs are in `bin`)
+work (checked against the CPackWIX module of CMake 4.4). Build it from the MSYS2 CLANG64 shell: the
 install step asks MSYS2's `pacman` which package each bundled DLL comes from.
 
 ```sh
@@ -169,6 +174,9 @@ QT_QPA_PLATFORM=offscreen MSO_AUDIO_BACKEND=null build/debug/mso_ui_tests.exe
 
 ## Fuzzing
 
+**Deferred by the owner to priority P10 (2026-10-19):** the CI fuzz job is off, and the targets are
+not extended for now. They still build and run by hand as described here.
+
 `tests/fuzz/` holds one libFuzzer target per piece of code that reads damaged or unusual input: the
 media probe once per container family (`fuzz_probe_riff`, `_flac`, `_mpeg_id3`, `_ogg`, `_mp4`, `_asf`,
 `_ape`, through `media::probe_memory`), `fuzz_stb_vorbis` (the vendored Vorbis decoder: open, decode,
@@ -179,13 +187,15 @@ past findings.
 
 ```sh
 cmake --preset fuzz && cmake --build --preset fuzz
-python tools/run_fuzzers.py                          # every target 60 s, 4 at a time (as CI)
+python tools/run_fuzzers.py                          # every target 60 s, 4 at a time
 python tools/run_fuzzers.py --seconds 600 stb_vorbis # one target, longer
 build/fuzz/tests/fuzz/fuzz_stb_vorbis.exe build/fuzz/fuzz-artifacts/stb_vorbis/crash-...   # replay a finding
 ```
 
 A crash, sanitizer report, hang (25 s per input), or memory use above 2 GB fails the run and saves the
-input under `build/fuzz/fuzz-artifacts/<name>/`. On Windows, clang's driver does not accept
+input under `build/fuzz/fuzz-artifacts/<name>/`. LeakSanitizer does not exist on Windows, so a leak
+there is found only when it pushes a target past the memory limit (as the stb_vorbis codebook leak
+was). On Windows, clang's driver does not accept
 `-fsanitize=fuzzer` for the MinGW target, so `cmake/ProjectOptions.cmake` passes the equivalent
 coverage flags and links MSYS2's `libclang_rt.fuzzer-x86_64.a` directly.
 

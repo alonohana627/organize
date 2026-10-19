@@ -3,8 +3,12 @@
 #include <doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <format>
+#include <regex>
+#include <set>
+#include <stop_token>
 
 #include <nlohmann/json.hpp>
 
@@ -146,6 +150,65 @@ void write_library_at_version(const std::filesystem::path& directory, const uuid
     connection->close();
     const nlohmann::json manifest = {{"format_version", 1}, {"library_uuid", uuids::to_string(uuid)}, {"name", "Old"}};
     REQUIRE(write_file_atomically(directory / Library::kManifestFileName, manifest.dump()).has_value());
+}
+
+/// Every compiled statement idle in the library's statement caches: the writer's and each reader's.
+/// Readers are borrowed all at once so every pooled connection is visited.
+std::set<std::string> cached_statements(Library& library) {
+    std::set<std::string> statements;
+    for (auto& sql : writer(library).cached_statement_sql())
+        statements.insert(std::move(sql));
+    std::vector<ReaderLease> readers;
+    for (int reader = 0; reader < OpenOptions{}.max_readers; ++reader) {
+        auto lease = library.acquire_reader();
+        REQUIRE(lease.has_value());
+        readers.push_back(std::move(*lease));
+    }
+    for (auto& reader : readers)
+        for (auto& sql : reader.connection().cached_statement_sql())
+            statements.insert(std::move(sql));
+    return statements;
+}
+
+/// The names a statement uses for `locations` and `jobs`: the table names and every alias it gives
+/// them ("locations location", "jobs AS job").
+std::set<std::string> covered_table_names(const std::string& sql) {
+    static const std::set<std::string> kNotAliases = {
+        "WHERE",  "SET",     "ON",        "JOIN",   "LEFT",   "INNER",     "CROSS",  "INDEXED", "NOT",   "GROUP",
+        "ORDER",  "LIMIT",   "USING",     "WHEN",   "AND",    "OR",        "UNION",  "EXCEPT",  "AS",    "VALUES",
+        "SELECT", "DEFAULT", "RETURNING", "HAVING", "WINDOW", "INTERSECT", "UPDATE", "DELETE",  "INSERT"};
+    static const std::regex kTable(R"(\b(locations|jobs)\b(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z_0-9]*))?)",
+                                   std::regex::icase);
+    std::set<std::string> names;
+    for (std::sregex_iterator match(sql.begin(), sql.end(), kTable), end; match != end; ++match) {
+        names.insert((*match)[1].str());
+        std::string alias = (*match)[2].str();
+        std::string upper = alias;
+        std::ranges::transform(upper, upper.begin(), [](unsigned char letter) { return std::toupper(letter); });
+        if (!alias.empty() && !kNotAliases.contains(upper)) names.insert(std::move(alias));
+    }
+    return names;
+}
+
+/// The EXPLAIN QUERY PLAN lines of `sql` that read a whole `locations` or `jobs` table or index
+/// ("SCAN <name>", with or without an index) or sort in a temporary B-tree.
+std::vector<std::string> full_scans_and_sorts(sqlite::Connection& connection, const std::string& sql) {
+    const auto names = covered_table_names(sql);
+    auto plan = connection.prepare("EXPLAIN QUERY PLAN " + sql);
+    REQUIRE_MESSAGE(plan.has_value(), plan.error().message(), " in: ", sql);
+    std::vector<std::string> findings;
+    while (true) {
+        auto has_row = plan->next_row();
+        REQUIRE(has_row.has_value());
+        if (!*has_row) break;
+        const std::string detail = plan->column_text(3);
+        static const std::regex kScan(R"(^SCAN (\S+))");
+        std::smatch scanned;
+        if ((std::regex_search(detail, scanned, kScan) && names.contains(scanned[1].str())) ||
+            detail.starts_with("USE TEMP B-TREE"))
+            findings.push_back(detail);
+    }
+    return findings;
 }
 
 }  // namespace
@@ -575,6 +638,43 @@ TEST_SUITE("catalog") {
 
         REQUIRE(library.undo().has_value());
         CHECK(query(library, "SELECT count(*) FROM sample_tags") == 0);
+    }
+
+    TEST_CASE("a chunked edit whose committed chunks changed nothing resumes after them, with no action yet") {
+        ScratchDirectory scratch;
+        std::vector<ScannedFile> files;
+        for (int index = 0; index < 1100; ++index)
+            files.push_back(test::synthetic_file(std::format("bulk/{:04}.wav", index), 100 + index, 1'000'000));
+        auto populated = test::make_library(scratch / "lib", files);
+        auto& library = *populated.library;
+        EditCommand edit;
+        edit.sample_ids = all_sample_ids(library);
+        edit.favorite = true;
+        // The whole first chunk is already favorite (a no-op), and the second chunk fails.
+        execute(library, std::format("UPDATE samples SET favorite=1 WHERE id<={}",
+                                     edit.sample_ids[EditCommand::kSamplesPerChunk - 1]));
+        execute(library, std::format("CREATE TEMP TRIGGER inject_failure BEFORE UPDATE OF favorite ON samples "
+                                     "WHEN new.id={} BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+                                     edit.sample_ids[700]));
+        REQUIRE_FALSE(library.apply_edit(edit).has_value());
+        CHECK(library.history()->empty());
+        CHECK(query_text(library, std::format("SELECT state FROM command_receipts WHERE operation_uuid='{}'",
+                                              uuids::to_string(edit.operation))) == "partial");
+
+        execute(library, "DROP TRIGGER temp.inject_failure");
+        auto resumed = library.apply_edit(edit);
+        REQUIRE_MESSAGE(resumed.has_value(), resumed.error().message());
+        CHECK_FALSE(resumed->replayed);
+        CHECK_FALSE(resumed->partial);
+        CHECK(resumed->applied == 1100);  // samples processed, as for an edit that never failed
+        CHECK(resumed->history_action.has_value());
+        CHECK(query(library, "SELECT count(*) FROM samples WHERE favorite=1") == 1100);
+        auto history = library.history();
+        REQUIRE(history.has_value());
+        REQUIRE(history->size() == 1);
+        CHECK(history->front().state == "applied");
+        REQUIRE(library.undo().has_value());  // undoes exactly what this edit changed
+        CHECK(query(library, "SELECT count(*) FROM samples WHERE favorite=1") == 500);
     }
 
     TEST_CASE("a partial edit that can no longer resume is reported as partial, never as success") {
@@ -1353,6 +1453,82 @@ TEST_SUITE("catalog") {
               "cancelled");
     }
 
+    TEST_CASE("many scan gaps are recorded in one call and protect their subtrees; known stats carry file identity") {
+        ScratchDirectory scratch;
+        auto library = Library::create(scratch / "lib", "Gaps");
+        REQUIRE(library.has_value());
+        auto& catalog = **library;
+        auto identified = test::synthetic_file("Open/Kick.wav", 10, 1'000);
+        identified.volume_id = "0011aabb";
+        identified.file_id = std::string("\x01\x00\x02\xff", 4) + std::string(12, 'i');
+        const std::vector<ScannedFile> files = {identified, test::synthetic_file("Denied/Pad.wav", 20, 1'000),
+                                                test::synthetic_file("Failed/Loop.wav", 30, 1'000)};
+        const auto root = add_scanned_root(catalog, "Root", files, /*case_sensitive=*/false);
+
+        auto stats = catalog.known_stats_in_directory(root, "Open");
+        REQUIRE(stats.has_value());
+        const auto& known = stats->at(path_key("Open/Kick.wav", false));
+        CHECK(known.byte_size == 10);
+        CHECK(known.volume_id == identified.volume_id);
+        CHECK(known.file_id == identified.file_id);  // raw bytes, NUL and 0xFF included
+        auto unidentified = catalog.known_stats_in_directory(root, "Denied");
+        REQUIRE(unidentified.has_value());
+        CHECK_FALSE(unidentified->begin()->second.file_id.has_value());
+
+        auto session = catalog.begin_scan(root);
+        REQUIRE(session.has_value());
+        REQUIRE(
+            catalog.commit_scan_batch(*session, std::span(files).first(1), {}, [](std::string_view) { return false; })
+                .has_value());
+        const std::vector<ScanGap> gaps = {{.relative_directory = "DENIED", .denied = true},
+                                           {.relative_directory = "Failed", .denied = false}};
+        REQUIRE(catalog.record_scan_gaps(*session, gaps).has_value());
+        REQUIRE(catalog.record_scan_gaps(*session, {}).has_value());
+        CHECK(query(catalog, "SELECT count(*) FROM scan_frontier WHERE state IN ('denied','failed')") == 2);
+        const std::vector<ScanGap> too_many(Library::kMaximumScanBatchFiles + 1);
+        CHECK(catalog.record_scan_gaps(*session, too_many).error().code == ErrorCode::InvalidArgument);
+        auto finished = catalog.finish_scan(*session, false);
+        REQUIRE(finished.has_value());
+        CHECK_FALSE(finished->complete_coverage);
+        CHECK(finished->marked_missing == 0);  // both files sit inside a gap
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Pad")) == LocationState::Present);
+        CHECK(location_state(catalog, test::sample_id_named(catalog, "Loop")) == LocationState::Present);
+    }
+
+    TEST_CASE("scan frontier rows live only while their scan can resume") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        const auto frontier_rows = [&] { return query(library, "SELECT count(*) FROM scan_frontier"); };
+        const auto none = [](std::string_view) { return false; };
+
+        // A cancelled scan keeps its completed directories for the resumed run.
+        auto interrupted = library.begin_scan(populated.root_id);
+        REQUIRE(interrupted.has_value());
+        REQUIRE(library.commit_scan_batch(*interrupted, three_samples(), std::vector<std::string>{"Drums"}, none)
+                    .has_value());
+        REQUIRE(library.record_scan_gap(*interrupted, "Denied", /*denied=*/true).has_value());
+        REQUIRE(library.finish_scan(*interrupted, /*cancelled=*/true).has_value());
+        CHECK(frontier_rows() == 2);
+        auto resumed = library.begin_scan(populated.root_id);
+        REQUIRE(resumed.has_value());
+        REQUIRE(resumed->id == interrupted->id);
+        CHECK(library.completed_directories(*resumed).value_or(std::vector<std::string>{}) ==
+              std::vector<std::string>{"Drums"});
+        // Completing it drops them.
+        REQUIRE(library.finish_scan(*resumed, false).has_value());
+        CHECK(frontier_rows() == 0);
+
+        // Rows a finished session left behind (catalogs from before this rule) go at the next scan.
+        execute(library, std::format("INSERT INTO scan_frontier(scan_id,relative_directory,state) "
+                                     "VALUES({0},'Old','complete'),({0},'Older','complete')",
+                                     resumed->id));
+        auto next = library.begin_scan(populated.root_id);
+        REQUIRE(next.has_value());
+        CHECK(next->id != resumed->id);
+        CHECK(frontier_rows() == 0);
+    }
+
     TEST_CASE("a conflicting undo keeps its receipt: resending it reports the conflict again") {
         ScratchDirectory scratch;
         auto populated = test::make_library(scratch / "lib", three_samples());
@@ -1494,6 +1670,46 @@ TEST_SUITE("catalog") {
         CHECK(library.list_analysis_runs()->front().state == "completed");
     }
 
+    TEST_CASE("leased jobs of a paused run return as paused: on release, transient failure and lease expiry") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        auto run = library.create_analysis_run({"Tempo", {"tempo"}, all_sample_ids(library), false});
+        REQUIRE(run.has_value());
+        std::vector<Library::JobLease> leases;
+        for (int job = 0; job < 3; ++job) {
+            // The last lease is already expired, so the next lease_next_job reclaims it.
+            const auto duration = job == 2 ? std::chrono::milliseconds(-1) : std::chrono::milliseconds(60'000);
+            auto leased = library.lease_next_job(duration);
+            REQUIRE(leased.has_value());
+            REQUIRE(leased->has_value());
+            leases.push_back(**leased);
+        }
+        REQUIRE(library.control_run(run->id, Library::RunControl::Pause).has_value());
+        REQUIRE(library.release_job(leases[0]).has_value());
+        REQUIRE(library.fail_job(leases[1], ErrorCode::CorruptAudio, /*transient=*/true).has_value());
+        auto nothing = library.lease_next_job(std::chrono::seconds(15));  // reclaims the expired lease
+        REQUIRE(nothing.has_value());
+        CHECK_FALSE(nothing->has_value());
+        for (const auto& lease : leases) {
+            CAPTURE(lease.job_id);
+            CHECK(job_state(library, lease.job_id) == "paused");
+        }
+        CHECK(query(library, "SELECT count(*) FROM jobs WHERE state IN ('queued','interrupted')") == 0);
+
+        REQUIRE(library.control_run(run->id, Library::RunControl::Resume).has_value());
+        auto runs = library.list_analysis_runs();
+        REQUIRE(runs.has_value());
+        CHECK(runs->front().queued == 3);
+        CHECK(runs->front().paused == 0);
+        // Outside a pause the same path still requeues.
+        auto again = library.lease_next_job(std::chrono::seconds(15));
+        REQUIRE(again.has_value());
+        REQUIRE(again->has_value());
+        REQUIRE(library.release_job(**again).has_value());
+        CHECK(job_state(library, (*again)->job_id) == "queued");
+    }
+
     TEST_CASE("a damaged job row fails on its own and the queue moves on") {
         ScratchDirectory scratch;
         auto populated = test::make_library(scratch / "lib", three_samples());
@@ -1574,28 +1790,139 @@ TEST_SUITE("catalog") {
         CHECK(query(library, "SELECT count(*) FROM tags") == 2);  // found, not created again
     }
 
-    TEST_CASE("rebuilt keys that would collide keep the old keys and open a review item") {
+    TEST_CASE("a key rebuild with collisions rekeys everything else, keeps colliding rows apart and lists them") {
         ScratchDirectory scratch;
+        std::int64_t root = 0;
         {
             auto library = Library::create(scratch / "lib", "Keys");
             REQUIRE(library.has_value());
-            const std::vector<ScannedFile> files = {test::synthetic_file("Kick.wav", 10, 1'000),
-                                                    test::synthetic_file("kick.wav", 20, 1'000)};
-            add_scanned_root(**library, "Root", files, /*case_sensitive=*/true);
-            // As if the root had been stored case-insensitive under a key scheme that kept them apart.
-            execute(**library,
-                    "UPDATE roots SET case_sensitive=0; UPDATE library_state SET normalization_version='older'");
+            const std::vector<ScannedFile> files = {
+                test::synthetic_file("Kick.wav", 10, 1'000), test::synthetic_file("kick.wav", 20, 1'000),
+                test::synthetic_file("Snare.wav", 30, 1'000), test::synthetic_file("A.wav", 40, 1'000),
+                test::synthetic_file("B.wav", 50, 1'000)};
+            root = add_scanned_root(**library, "Root", files, /*case_sensitive=*/true);
+            REQUIRE((*library)->ensure_tag("Bass").has_value());
+            REQUIRE((*library)->ensure_tag("Kick").has_value());
+            // As if the root had been stored case-insensitive under a key scheme that kept Kick.wav
+            // and kick.wav apart; A.wav and B.wav hold each other's new keys (they must swap); the tag
+            // "Kick" was renamed "bass" outside the app, so its new key is the tag "Bass"'s key.
+            execute(
+                **library,
+                "UPDATE roots SET case_sensitive=0; UPDATE library_state SET normalization_version='older'; "
+                "UPDATE locations SET path_key='swap' WHERE relative_path='A.wav'; "
+                "UPDATE locations SET path_key='A.WAV' WHERE relative_path='B.wav'; "
+                "UPDATE locations SET path_key='B.WAV' WHERE relative_path='A.wav'; "
+                "UPDATE locations SET path_key='old-'||relative_path WHERE relative_path IN ('Kick.wav','Snare.wav'); "
+                "UPDATE tags SET name='bass' WHERE name='Kick'");
         }
-        for (int open = 0; open < 2; ++open) {
-            auto reopened = Library::open(scratch / "lib");
-            REQUIRE_MESSAGE(reopened.has_value(), reopened.error().message());
-            auto& library = **reopened;
-            CHECK(query_text(library, "SELECT normalization_version FROM library_state") == "older");
-            CHECK(query(library, "SELECT count(DISTINCT path_key) FROM locations") == 2);
-            auto review = library.open_review_items();
-            REQUIRE(review.has_value());
-            CHECK(std::ranges::count(*review, std::string("normalization_conflict"), &ReviewItem::kind) == 1);
+        std::vector<OpenProgress> progress;
+        auto reopened = Library::open(scratch / "lib",
+                                      {.on_progress = [&](const OpenProgress& step) { progress.push_back(step); }});
+        REQUIRE_MESSAGE(reopened.has_value(), reopened.error().message());
+        auto& library = **reopened;
+        CHECK(query_text(library, "SELECT normalization_version FROM library_state") == kFoldVersion);
+        const auto key_of = [&](std::string_view relative_path) {
+            return query_text(library,
+                              std::format("SELECT path_key FROM locations WHERE relative_path='{}'", relative_path));
+        };
+        CHECK(key_of("Snare.wav") == "SNARE.WAV");
+        CHECK(key_of("A.wav") == "A.WAV");  // the swap settled
+        CHECK(key_of("B.wav") == "B.WAV");
+        // Exactly one of Kick.wav and kick.wav has the new key; the other keeps a placeholder.
+        CHECK(query(library, "SELECT count(*) FROM locations WHERE path_key='KICK.WAV'") == 1);
+        CHECK(query(library, "SELECT count(*) FROM locations WHERE substr(path_key,1,1)=char(1)") == 1);
+        CHECK(query(library, "SELECT count(*) FROM tags WHERE substr(name_key,1,1)=char(1)") == 1);
+        CHECK(query(library, "SELECT count(*) FROM samples") == 5);  // nothing merged
+
+        const auto& report = library.recovery_report();
+        CHECK(report.key_conflicts == 2);
+        REQUIRE(report.pre_rekey_backup.has_value());
+        CHECK(std::filesystem::exists(*report.pre_rekey_backup));
+        auto review = library.open_review_items();
+        REQUIRE(review.has_value());
+        REQUIRE(std::ranges::count(*review, std::string("normalization_conflict"), &ReviewItem::kind) == 1);
+        const auto item = std::ranges::find(*review, std::string("normalization_conflict"), &ReviewItem::kind);
+        const auto evidence = nlohmann::json::parse(item->evidence_json);
+        CHECK(evidence.at("conflict_count").get<int>() == 2);
+        CHECK(evidence.at("conflicts").size() == 2);
+        // The rebuild reported its parts in order and finished.
+        REQUIRE_FALSE(progress.empty());
+        CHECK(progress.front().step == OpenStep::BackingUp);
+        CHECK(progress.back().step == OpenStep::RebuildingKeys);
+        CHECK(progress.back().completed == progress.back().total);
+
+        // The point of rekeying the rest: a scan of the case-insensitive root finds every file it
+        // already knows by its new key, so nothing is added twice and nothing goes missing.
+        auto session = library.begin_scan(root);
+        REQUIRE(session.has_value());
+        const std::vector<ScannedFile> rescanned = {test::synthetic_file("SNARE.wav", 30, 1'000),
+                                                    test::synthetic_file("A.wav", 40, 1'000),
+                                                    test::synthetic_file("B.wav", 50, 1'000)};
+        auto committed = library.commit_scan_batch(*session, rescanned, {}, [](std::string_view) { return true; });
+        REQUIRE(committed.has_value());
+        CHECK(committed->added == 0);
+        CHECK(query(library, "SELECT count(*) FROM samples") == 5);
+
+        // The next open has nothing to rebuild and keeps the one review item.
+        reopened->reset();
+        auto again = Library::open(scratch / "lib");
+        REQUIRE(again.has_value());
+        CHECK((*again)->recovery_report().key_conflicts == 0);
+        CHECK_FALSE((*again)->recovery_report().pre_rekey_backup.has_value());
+        review = (*again)->open_review_items();
+        REQUIRE(review.has_value());
+        CHECK(std::ranges::count(*review, std::string("normalization_conflict"), &ReviewItem::kind) == 1);
+    }
+
+    TEST_CASE("a stopped backup leaves no file and reports CANCELLED; a running one does not block writers") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", three_samples());
+        auto& library = *populated.library;
+        std::stop_source stopped;
+        stopped.request_stop();
+        auto cancelled = library.create_backup("manual", stopped.get_token());
+        REQUIRE_FALSE(cancelled.has_value());
+        CHECK(cancelled.error().code == ErrorCode::Cancelled);
+        const auto backup_files = [&] {
+            std::size_t count = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(scratch / "lib/backups"))
+                count += entry.is_regular_file() ? 1 : 0;
+            return count;
+        };
+        CHECK(backup_files() == 0);
+
+        // The two long phases stop on request: the page copy (checked before every step) and the
+        // verification of the copy (SQLite's progress handler interrupts the integrity check).
+        auto reader = library.acquire_reader();
+        REQUIRE(reader.has_value());
+        auto& source = reader->connection();
+        {
+            // A snapshot like create_backup's: the writer keeps committing while it is open.
+            sqlite::ReadTransaction snapshot(source);
+            REQUIRE(snapshot.begin().has_value());
+            REQUIRE(source.query_int64("SELECT count(*) FROM sqlite_schema").has_value());
+            REQUIRE(library.apply_edit(rate({test::sample_id_named(library, "Snare")}, 4)).has_value());
+            auto copied = source.backup_to(scratch / "copy.sqlite", 1, std::chrono::seconds(1), std::stop_token{});
+            REQUIRE(copied.has_value());
+            auto refused =
+                source.backup_to(scratch / "refused.sqlite", 1, std::chrono::seconds(1), stopped.get_token());
+            REQUIRE_FALSE(refused.has_value());
+            CHECK(refused.error().code == ErrorCode::Cancelled);
         }
+        auto copy = sqlite::Connection::open(scratch / "copy.sqlite", {.read_only = true, .write_ahead_log = false});
+        REQUIRE(copy.has_value());
+        CHECK(copy->query_int64("SELECT count(*) FROM samples WHERE rating=4").value_or(-1) == 0);  // the snapshot
+        CHECK(copy->integrity_check().value_or("") == "ok");
+        auto interrupted = copy->integrity_check(stopped.get_token());
+        REQUIRE_FALSE(interrupted.has_value());
+        CHECK(interrupted.error().code == ErrorCode::Cancelled);
+        auto interrupted_keys = copy->foreign_key_violations(stopped.get_token());
+        REQUIRE_FALSE(interrupted_keys.has_value());
+        CHECK(interrupted_keys.error().code == ErrorCode::Cancelled);
+
+        auto backup = library.create_backup("manual");
+        REQUIRE(backup.has_value());
+        CHECK(backup_files() == 1);
     }
 
     TEST_CASE("an upgrade parks the waiting jobs of paused runs and settles paused runs with nothing left") {
@@ -1640,6 +1967,146 @@ TEST_SUITE("catalog") {
         CAPTURE(*report);
         CHECK(report->starts_with("integrity: ok; foreign keys: 0 violation(s); search index: "));
         CHECK_FALSE(report->ends_with("search index: ok"));
+    }
+
+    // ------------------------------------------------------------ third review round
+
+    TEST_CASE("every statement the catalog runs on locations and jobs is index-driven: no full scan, no sort") {
+        // Theme 1 of the third review: a statement can miss the partial index it was written for
+        // (SQLite does not infer `state<>'retired'` from `state='missing'`). This exercises scans,
+        // availability, edits, history and the analysis queue, then explains every statement the
+        // library's connections compiled. Plans come from SQLite's built-in estimates (catalogs are
+        // never ANALYZEd), so they are the same here as in a library with a million locations.
+        ScratchDirectory scratch;
+        auto created = Library::create(scratch / "lib", "Plans");
+        REQUIRE(created.has_value());
+        auto& library = **created;
+        auto moved = test::synthetic_file("Old/Moved.wav", 10, 1'000);
+        moved.volume_id = "volume";
+        moved.file_id = std::string(16, 'x');
+        const std::vector<ScannedFile> first_files = {
+            test::synthetic_file("Drums/Kick.wav", 20, 1'000), test::synthetic_file("Drums/Snare.wav", 30, 1'000),
+            test::synthetic_file("Cloud/Pad.wav", 40, 1'000), test::synthetic_file("Gone/Old.wav", 50, 1'000), moved};
+        const auto root = add_scanned_root(library, "Root", first_files, /*case_sensitive=*/false);
+        const auto none = [](std::string_view) { return false; };
+
+        // A rescan with a rename, a changed file, a new file, skipped entries and a gap, then one more
+        // scan that brings the missing file back as a skipped entry, and a cancelled scan.
+        auto rescan = library.begin_scan(root);
+        REQUIRE(rescan.has_value());
+        auto renamed = moved;
+        renamed.relative_path = "New/Moved.wav";
+        const std::vector<ScannedFile> second_files = {test::synthetic_file("Drums/Kick.wav", 21, 1'000), renamed,
+                                                       test::synthetic_file("Drums/Clap.wav", 60, 1'000)};
+        REQUIRE(library.commit_scan_batch(*rescan, second_files, std::vector<std::string>{"Drums"}, none).has_value());
+        REQUIRE(library.mark_scan_entries_seen(*rescan, std::vector<std::string>{"Cloud/Pad.wav"}).has_value());
+        REQUIRE(library.record_scan_gap(*rescan, "Denied", /*denied=*/true).has_value());
+        REQUIRE(library.completed_directories(*rescan).has_value());
+        REQUIRE(library.known_stats_in_directory(root, "").has_value());
+        REQUIRE(library.known_stats_in_directory(root, "Drums").has_value());
+        REQUIRE(library.finish_scan(*rescan, false).has_value());
+        auto revive = library.begin_scan(root);
+        REQUIRE(revive.has_value());
+        auto all_present = second_files;
+        all_present.push_back(test::synthetic_file("Drums/Snare.wav", 30, 1'000));
+        REQUIRE(library.commit_scan_batch(*revive, all_present, {}, none).has_value());
+        REQUIRE(library.mark_scan_entries_seen(*revive, std::vector<std::string>{"Gone/Old.wav", "Cloud/Pad.wav"})
+                    .has_value());
+        REQUIRE(library.finish_scan(*revive, false).has_value());
+        auto cancelled = library.begin_scan(root);
+        REQUIRE(cancelled.has_value());
+        REQUIRE(library.finish_scan(*cancelled, true).has_value());
+        REQUIRE(library.set_root_availability(root, Availability::Offline).has_value());
+        REQUIRE(library.set_root_availability(root, Availability::Online).has_value());
+        REQUIRE(library.rename_root(root, "Renamed").has_value());
+        REQUIRE(library.list_folders(root).has_value());
+        REQUIRE(library.list_roots().has_value());
+        REQUIRE(library.list_roots(RootListing::WithoutSampleCounts).has_value());
+
+        // Edits, history and reads of one sample.
+        const auto samples = all_sample_ids(library);
+        REQUIRE(library.sample_detail(samples.front()).has_value());
+        EditCommand tag_edit = rate(samples, 4);
+        tag_edit.tags_add = {"Drums"};
+        REQUIRE(library.apply_edit(tag_edit).has_value());
+        REQUIRE(library.undo().has_value());
+        REQUIRE(library.redo().has_value());
+        REQUIRE(library.changes_since(0).has_value());
+
+        // The analysis queue: both kinds of run, every lease outcome and every run control.
+        auto run = library.create_analysis_run({"Plans", {"tempo", "byte_hash"}, samples, true});
+        REQUIRE(run.has_value());
+        REQUIRE(library.create_analysis_run_for_root(root, "Root plans", {"tempo"}, true).has_value());
+        const auto facts = [](const Library::JobLease& lease) {
+            return Library::AnalysisFacts{.sample_id = lease.sample_id,
+                                          .content_revision = lease.content_revision,
+                                          .bpm_milli = 120'000,
+                                          .byte_sha256 = std::string(64, 'a'),
+                                          .tempo_algorithm = "test",
+                                          .tempo_requested = true};
+        };
+        const auto lease = [&] {
+            auto next = library.lease_next_job(std::chrono::seconds(15));
+            REQUIRE(next.has_value());
+            REQUIRE(next->has_value());
+            return **next;
+        };
+        auto completed = lease();
+        REQUIRE(library.renew_lease(completed, std::chrono::seconds(15)).has_value());
+        REQUIRE(library.complete_job(completed, facts(completed)).has_value());
+        REQUIRE(library.fail_job(lease(), ErrorCode::CorruptAudio, /*transient=*/true).has_value());
+        REQUIRE(library.fail_job(lease(), ErrorCode::SourceOffline, /*transient=*/false).has_value());
+        REQUIRE(library.release_job(lease()).has_value());
+        REQUIRE(library.control_run(run->id, Library::RunControl::Pause).has_value());
+        REQUIRE(library.control_run(run->id, Library::RunControl::Resume).has_value());
+        REQUIRE(library.control_run(run->id, Library::RunControl::Cancel).has_value());
+        REQUIRE(library.list_analysis_runs().has_value());
+
+        // Plans that read more than the rows they need, each with the reason it is bounded anyway.
+        struct Accepted {
+            std::string_view statement;  ///< a fragment that identifies the statement
+            std::string_view plan_line;  ///< the EXPLAIN QUERY PLAN line that is accepted for it
+            std::string_view reason;
+        };
+        constexpr std::array<Accepted, 6> kAccepted = {{
+            {"FROM jobs INDEXED BY jobs_ready", "SCAN jobs USING INDEX jobs_ready",
+             "the lease walks the ready jobs in lease order and stops at the first leasable one"},
+            {"INSERT INTO jobs(", "USE TEMP B-TREE FOR ORDER BY",
+             "run creation sorts its own selection once, so job ids follow sample ids"},
+            {"INSERT INTO sample_search(", "USE TEMP B-TREE FOR group_concat(ORDER BY)",
+             "orders the few locations and tags of one sample"},
+            {"WHERE location.sample_id=?1 AND location.state<>'retired' ORDER BY location.id",
+             "USE TEMP B-TREE FOR ORDER BY", "orders the locations of one sample"},
+            {"FROM roots root WHERE root.deleted=0 ORDER BY root.name", "USE TEMP B-TREE FOR ORDER BY",
+             "sorts the handful of roots by name"},
+            {"count(DISTINCT location.sample_id)", "USE TEMP B-TREE FOR count(DISTINCT)",
+             "per-root sample counts are opt-in (RootListing::WithSampleCounts): one pass over the root's locations"},
+        }};
+
+        // Nothing was dropped from a full cache, so every statement that ran is in the set below.
+        CHECK(writer(library).cached_statement_count() < sqlite::StatementCache::kMaximumIdleStatements);
+        const auto statements = cached_statements(library);
+        std::size_t checked = 0;
+        bool saw_revive = false;
+        bool saw_lease = false;
+        for (const auto& sql : statements) {
+            if (covered_table_names(sql).empty()) continue;
+            ++checked;
+            saw_revive = saw_revive || sql.contains("state<>'retired' AND state='missing'");
+            saw_lease = saw_lease || sql.contains("INDEXED BY jobs_ready");
+            auto findings = full_scans_and_sorts(writer(library), sql);
+            std::erase_if(findings, [&](const std::string& line) {
+                return std::ranges::any_of(kAccepted, [&](const Accepted& accepted) {
+                    return sql.contains(accepted.statement) && line == accepted.plan_line;
+                });
+            });
+            CAPTURE(sql);
+            CHECK_MESSAGE(findings.empty(), std::format("{}", findings));
+        }
+        MESSAGE(std::format("{} statements on locations or jobs explained", checked));
+        CHECK(checked >= 40);
+        CHECK(saw_revive);
+        CHECK(saw_lease);
     }
 
     TEST_CASE("benchmark: leasing at 100k queued jobs and finishing a scan with many directories" *
@@ -1703,6 +2170,43 @@ TEST_SUITE("catalog") {
         // finish_scan: 20k unseen locations under 2k gap-free directories plus one denied directory.
         auto session = library.begin_scan(root->id);
         REQUIRE(session.has_value());
+
+        // mark_scan_entries_seen: one full batch of skipped paths (cloud placeholders, links) in the
+        // 100k-location root, half of them missing since an earlier scan. All above sample 50 000,
+        // so the finish_scan numbers below are unchanged.
+        constexpr int kSkipped = static_cast<int>(Library::kMaximumScanBatchFiles);
+        std::vector<std::string> skipped_paths;
+        for (int index = 0; index < kSkipped; ++index) {
+            const int sample = 50'001 + index * 97;
+            skipped_paths.push_back(std::format("D{}/S{}.wav", sample % kDirectories, sample));
+        }
+        execute(library, "UPDATE locations SET state='missing' WHERE sample_id>50000 AND sample_id%2=0");
+        {
+            // Before: the review-time revive statement, without the partial index's predicate.
+            constexpr std::string_view kOldRevive =
+                "UPDATE locations SET state='unknown', seen_scan_generation=?3, last_seen_at=?4 "
+                "WHERE root_id=?1 AND path_key=?2 AND state='missing' RETURNING sample_id";
+            auto old_revive = writer(library).prepare(kOldRevive);
+            REQUIRE(old_revive.has_value());
+            REQUIRE(writer(library).begin_immediate().has_value());
+            started = Clock::now();
+            for (const auto& path : skipped_paths) {
+                old_revive->bind(1, root->id).bind(2, path_key(path, false)).bind(3, session->generation).bind(4, 0);
+                while (old_revive->next_row().value_or(false)) {
+                }
+                old_revive->reset();
+            }
+            const double old_skip_batch = milliseconds_per(Clock::now() - started, 1);
+            writer(library).rollback();
+            started = Clock::now();
+            REQUIRE(library.mark_scan_entries_seen(*session, skipped_paths).has_value());
+            const double new_skip_batch = milliseconds_per(Clock::now() - started, 1);
+            CHECK(query(library, "SELECT count(*) FROM locations WHERE state='unknown'") == kSkipped / 2);
+            MESSAGE(
+                std::format("mark_scan_entries_seen, {} skipped paths at {} locations: before {:.1f} ms (revive "
+                            "statement alone), after {:.1f} ms (whole call)",
+                            kSkipped, kSamples, old_skip_batch, new_skip_batch));
+        }
         execute(library, std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<{}) "
                                      "INSERT INTO scan_frontier(scan_id,relative_directory,state) "
                                      "SELECT {}, 'D'||i, 'complete' FROM n",
@@ -1728,6 +2232,64 @@ TEST_SUITE("catalog") {
             std::format("finish_scan, 20k unseen of {} in {} directories: before {:.1f} ms (one of its two "
                         "unseen passes), after {:.1f} ms (whole finish_scan)",
                         kSamples, kDirectories, old_subquery, new_finish));
+
+        // list_roots, with and without the per-root sample counts.
+        constexpr int kListings = 10;
+        started = Clock::now();
+        for (int listing = 0; listing < kListings; ++listing)
+            REQUIRE(library.list_roots().has_value());
+        const double counted_listing = milliseconds_per(Clock::now() - started, kListings);
+        started = Clock::now();
+        for (int listing = 0; listing < kListings; ++listing)
+            REQUIRE(library.list_roots(RootListing::WithoutSampleCounts).has_value());
+        const double plain_listing = milliseconds_per(Clock::now() - started, kListings);
+        MESSAGE(std::format("list_roots at {} locations: {:.2f} ms with sample counts, {:.3f} ms without", kSamples,
+                            counted_listing, plain_listing));
+
+        // Key rebuild on open, with every location and folder key stale (all of them change).
+        constexpr std::string_view kStaleKeys =
+            "UPDATE library_state SET normalization_version='older'; "
+            "UPDATE locations SET path_key=lower(path_key); UPDATE folders SET path_key=lower(path_key)";
+        execute(library, std::string(kStaleKeys));
+        {
+            // Before: the review-time two-pass rebuild of locations and folders (rolled back).
+            constexpr std::array<std::string_view, 4> kOldRekey = {
+                "UPDATE folders SET path_key=char(1)||id WHERE path_key IS NOT "
+                "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=folders.root_id))",
+                "UPDATE folders SET path_key=path_key(relative_path,(SELECT case_sensitive FROM roots "
+                "WHERE roots.id=folders.root_id)) WHERE substr(path_key,1,1)=char(1)",
+                "UPDATE locations SET path_key=char(1)||id WHERE path_key IS NOT "
+                "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=locations.root_id))",
+                "UPDATE locations SET path_key=path_key(relative_path,(SELECT case_sensitive FROM roots "
+                "WHERE roots.id=locations.root_id)) WHERE substr(path_key,1,1)=char(1)"};
+            REQUIRE(writer(library).begin_immediate().has_value());
+            started = Clock::now();
+            for (const auto sql : kOldRekey)
+                REQUIRE(writer(library).execute_script(sql).has_value());
+            const double old_rekey = milliseconds_per(Clock::now() - started, 1);
+            writer(library).rollback();
+            const auto directory = library.directory();
+            created->reset();
+            std::optional<Clock::time_point> rebuild_started;
+            std::optional<Clock::time_point> rebuild_finished;
+            const auto open_started = Clock::now();
+            auto reopened = Library::open(directory, {.on_progress = [&](const OpenProgress& progress) {
+                                              if (progress.step != OpenStep::RebuildingKeys) return;
+                                              if (!rebuild_started) rebuild_started = Clock::now();
+                                              if (progress.completed == progress.total) rebuild_finished = Clock::now();
+                                          }});
+            const double whole_open = milliseconds_per(Clock::now() - open_started, 1);
+            REQUIRE(reopened.has_value());
+            REQUIRE(rebuild_started.has_value());
+            REQUIRE(rebuild_finished.has_value());
+            CHECK(query(**reopened, "SELECT count(*) FROM locations WHERE path_key<>upper(path_key)") == 0);
+            MESSAGE(
+                std::format("key rebuild of {} locations and {} folders: before {:.0f} ms (two-pass location "
+                            "and folder statements), after {:.0f} ms (whole rebuild, all tables); open with "
+                            "its verified backup {:.0f} ms",
+                            kSamples, kDirectories, old_rekey,
+                            milliseconds_per(*rebuild_finished - *rebuild_started, 1), whole_open));
+        }
     }
 
 }  // TEST_SUITE("catalog")

@@ -1,6 +1,8 @@
 // bench: synthetic-metadata scale benchmark (docs/06_QUALITY_AND_OPERATIONS.md). It measures the
 // catalog, SQLite search and the in-memory SampleIndex on generated rows; it is not a claim about
-// decoding real audio.
+// decoding real audio. File names are realistic by default (25-60 bytes, about a fifth not ASCII,
+// like commercial pack names), so the index memory it reports includes the heap blocks real names
+// need; `--names short` uses the earlier 12-16-byte names for comparison.
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -31,8 +33,30 @@ constexpr std::int64_t kBatchRows = 500;
 constexpr std::int64_t kMaximumRows = 10'000'000;
 constexpr int kMaximumRepetitions = 10'000;
 
+/// How `bench` names its synthetic files.
+enum class NameStyle {
+    Realistic,  ///< pack-style names of 25-60 bytes, about a fifth with non-ASCII characters
+    Short,      ///< "kick 0001234": 12-16 bytes, inside libc++'s small-string buffer
+};
+
+/// A pack-style display name such as "Vengeance House Vol 3 - Kick Hard 0001234 128bpm Am".
+std::string realistic_name(std::mt19937_64& random, std::string_view word, std::int64_t index) {
+    static constexpr std::string_view kPacks[] = {
+        "Vengeance House Vol 3", "Deep Tech Essentials", "Café Lo-Fi Textures", "Analog Drum Machines",
+        "Cinematic Risers Pro",  "Über Bass Collection", "東京 Night Drums",    "Organic Percussion",
+        "Modular Synth Loops",   "Vocal Chops Deluxe",   "Señorita Latin Kits", "Ambient Pad Library"};
+    static constexpr std::string_view kVariants[] = {"Hard", "Soft", "Wet", "Dry", "Long", "Short", "Punchy", ""};
+    static constexpr std::string_view kKeys[] = {"Am", "C", "F#m", "Gm", "Eb", "Dm"};
+    const auto pack = kPacks[random() % std::size(kPacks)];
+    const auto variant = kVariants[random() % std::size(kVariants)];
+    std::string name = std::format("{} - {}{}{} {:07}", pack, word, variant.empty() ? "" : " ", variant, index);
+    if (random() % 3 == 0) name += std::format(" {}bpm {}", 80 + random() % 90, kKeys[random() % std::size(kKeys)]);
+    return name;
+}
+
 /// Deterministic synthetic catalog rows with skewed names, folders, durations, BPM and missing values.
-std::vector<catalog::ScannedFile> synthetic_batch(std::mt19937_64& random, std::int64_t first, std::int64_t count) {
+std::vector<catalog::ScannedFile> synthetic_batch(std::mt19937_64& random, std::int64_t first, std::int64_t count,
+                                                  NameStyle names) {
     static constexpr std::string_view kWords[] = {"kick", "snare",  "hat",   "clap",    "bass", "pad",
                                                   "lead", "vox",    "riser", "impact",  "loop", "perc",
                                                   "tom",  "shaker", "שלום",  "サンプル"};
@@ -45,7 +69,9 @@ std::vector<catalog::ScannedFile> synthetic_batch(std::mt19937_64& random, std::
         const auto word = kWords[static_cast<std::size_t>(skew(random)) % std::size(kWords)];
         const auto folder = kFolders[random() % std::size(kFolders)];
         catalog::ScannedFile file;
-        file.relative_path = std::format("{}/{} {:07}.wav", folder, word, index);
+        file.relative_path = names == NameStyle::Short
+                                 ? std::format("{}/{} {:07}.wav", folder, word, index)
+                                 : std::format("{}/{}.wav", folder, realistic_name(random, word, index));
         file.byte_size = static_cast<std::int64_t>(10'000 + random() % 50'000'000);
         file.mtime_ns = 1'700'000'000'000'000'000 + index;
         catalog::ObservedMetadata metadata;
@@ -129,6 +155,7 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
         std::string directory;
         std::int64_t rows = 100'000;
         int repetitions = 30;
+        std::string names = "realistic";
     };
     auto& options = context.command_options<Options>();
     command->add_option("library", options.directory, "New library folder to create")->required();
@@ -136,8 +163,13 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
         ->check(CLI::Range(std::int64_t{1}, kMaximumRows));
     command->add_option("--repetitions", options.repetitions, "Measurements per query")
         ->check(CLI::Range(1, kMaximumRepetitions));
+    command
+        ->add_option("--names", options.names,
+                     "realistic (pack-style names of 25-60 bytes) or short (12-16 bytes, the earlier benchmark)")
+        ->check(CLI::IsMember({"realistic", "short"}));
     command->callback([&] {
-        const auto& [directory, rows, repetitions] = options;
+        const auto& [directory, rows, repetitions, names] = options;
+        const auto name_style = names == "short" ? NameStyle::Short : NameStyle::Realistic;
         auto application = context.application();
         if (!application) return void(exit_code = context.report(application.error()));
         auto created = (*application)->create_library(path_from_utf8(directory), "Benchmark");
@@ -153,8 +185,12 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             auto session = library.begin_scan(root_record->id);
             if (!session) return std::unexpected(session.error());
             const auto import_started = Clock::now();
+            std::int64_t name_bytes = 0;
             for (std::int64_t first = 0; first < rows; first += kBatchRows) {
-                const auto batch = synthetic_batch(random, first, std::min(kBatchRows, rows - first));
+                const auto batch = synthetic_batch(random, first, std::min(kBatchRows, rows - first), name_style);
+                for (const auto& file : batch)
+                    name_bytes +=
+                        static_cast<std::int64_t>(file.relative_path.size() - file.relative_path.rfind('/') - 1);
                 auto committed = library.commit_scan_batch(*session, batch, {}, [](std::string_view) { return false; });
                 if (!committed) return std::unexpected(committed.error());
             }
@@ -163,6 +199,8 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             const double import_seconds = std::chrono::duration<double>(Clock::now() - import_started).count();
             context.print("inserted {} synthetic rows in {:.1f} s ({:.0f} rows/s, catalog only, no file I/O)", rows,
                           import_seconds, static_cast<double>(rows) / import_seconds);
+            context.print("{} file names, {:.1f} bytes on average", names,
+                          static_cast<double>(name_bytes) / static_cast<double>(rows));
 
             const std::vector<Scenario> scenarios = {
                 {"first page, name sort", {.sort = search::SortField::Name}},
@@ -206,7 +244,10 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             const auto memory_before_index = process_memory_bytes();
             app::SampleIndex index(library.uuid());
             const auto load_started = Clock::now();
-            if (auto loaded = index.load(library); !loaded) return loaded;
+            // The application caps the index at SampleIndex::kDefaultRowLimit rows; the benchmark
+            // lifts the cap so it can also measure larger libraries.
+            const auto row_limit = std::max(static_cast<std::size_t>(rows), app::SampleIndex::kDefaultRowLimit);
+            if (auto loaded = index.load(library, {}, row_limit); !loaded) return loaded;
             if (auto caught_up = index.synchronize(library); !caught_up) return std::unexpected(caught_up.error());
             context.print("{:<50} {:7.0f} ms for {} rows", "load (for_each_row)",
                           std::chrono::duration<double, std::milli>(Clock::now() - load_started).count(), index.size());
@@ -251,6 +292,28 @@ void register_bench_commands(CLI::App& root, CommandContext& context, int& exit_
             });
             context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms", "rating edit committed + index patched",
                           edit.median_ms, edit.p95_ms);
+            // The index's share of that: the commit runs first, unmeasured.
+            const auto patch_only = measure(
+                std::max(1, repetitions / 5), failures, [&] { return index.synchronize(library).has_value(); },
+                [&] {
+                    catalog::EditCommand command;
+                    command.sample_ids = {2};
+                    command.rating = static_cast<int>(++rating % 6);
+                    if (!library.apply_edit(command)) ++failures;
+                });
+            context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms", "index patch of one rating edit (no commit)",
+                          patch_only.median_ms, patch_only.p95_ms);
+            // Like a burst of analysis results: many rows change one sort value at once.
+            std::int64_t bpm = 0;
+            const auto batch_edit = measure(std::max(1, repetitions / 5), failures, [&] {
+                catalog::EditCommand command;
+                for (std::int64_t sample = 1; sample <= std::min<std::int64_t>(rows, 1000); ++sample)
+                    command.sample_ids.push_back(sample * std::max<std::int64_t>(1, rows / 1000));
+                command.bpm = catalog::BpmOverrideEdit{catalog::OverrideState::Value, (90 + ++bpm % 60) * 1000};
+                return library.apply_edit(command).has_value() && index.synchronize(library).has_value();
+            });
+            context.print("{:<50} median {:7.2f} ms   p95 {:7.2f} ms", "BPM edit of 1000 rows + index patched",
+                          batch_edit.median_ms, batch_edit.p95_ms);
             index.drop_query_caches();
             context.print("{:<50} {}", "index memory after the queries (sort orders built)",
                           memory_text(memory_before_index, process_memory_bytes(), index.size()));

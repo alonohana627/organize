@@ -25,8 +25,9 @@ public:
     /// enter the kernel).
     void notify() noexcept;
 
-    /// Sleeps until notified or until `timeout` elapses. Returns true when woken by notify().
-    /// Only one thread may wait on a given signal.
+    /// Sleeps until notified or until `timeout`, rounded up to whole milliseconds, elapses (the
+    /// kernel wait has millisecond resolution; rounding down would spin). Returns true when woken by
+    /// notify(). Only one thread may wait on a given signal.
     bool wait_for(std::chrono::microseconds timeout) noexcept;
 
 private:

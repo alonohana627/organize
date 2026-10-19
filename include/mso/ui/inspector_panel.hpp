@@ -1,7 +1,9 @@
 #pragma once
 /// @file
 /// InspectorPanel: details and organizing fields of the selected samples.
+#include <QElapsedTimer>
 #include <QString>
+#include <QTimer>
 #include <QWidget>
 
 #include <cstdint>
@@ -40,25 +42,41 @@ class StarRatingWidget;
 /// Drafts: what the user typed or chose and has not applied (name, notes, BPM and key overrides)
 /// survives refreshes of the same selection, focused or not, and is discarded when the selection
 /// changes — then every field shows the new selection, even one that still has the focus, so an
-/// Apply never writes the previous sample's draft to the new one. Edits are offered only when the
-/// whole selection is loaded: acting on part of it is refused (the panel says why).
+/// Apply never writes the previous sample's draft to the new one.
+///
+/// Large selections: the table keeps the keys of every selected row but the data of only about
+/// 2,000, so the panel summarizes the loaded rows and says so; an edit still applies to the whole
+/// selection (the main window resolves every key). Categories and collections need the libraries
+/// of the whole selection, which the window passes along.
+///
+/// The category and collection lists follow structure changes of the selection's library only,
+/// at most one read in flight and at most one start per kChoicesReloadIntervalMilliseconds (an
+/// import changes the structure several times a second); a change meanwhile is read afterwards.
 class InspectorPanel final : public QWidget {
     Q_OBJECT
 
 public:
+    /// Category and collection list reads start at most this often per structure-change burst.
+    static constexpr int kChoicesReloadIntervalMilliseconds = 1000;
+
     /// A panel reading details through `session`, which must outlive it.
     explicit InspectorPanel(ApplicationSession& session, QWidget* parent = nullptr);
 
     /// Shows the selected rows (loaded rows only). `total_selected` counts loaded and unloaded
-    /// rows; when it is larger, editing is switched off and the panel says why.
-    void show_selection(std::vector<search::SampleRow> rows, std::size_t total_selected);
+    /// rows; when it is larger the panel says that it summarizes the loaded ones. `libraries` are
+    /// the libraries of the whole selection (nullopt: those of `rows`, i.e. all rows are loaded).
+    void show_selection(std::vector<search::SampleRow> rows, std::size_t total_selected,
+                        std::optional<std::set<uuids::uuid>> libraries = std::nullopt);
     /// Disables editing (read-only library or no selection).
     void set_read_only(bool read_only);
     /// Re-reads the single selected sample's details (its row changed in the catalog). Fields the
     /// user is editing keep their values.
     void reload_detail();
-    /// Re-reads the category and collection lists (taxonomy changed, or the selection's library).
-    void reload_library_choices();
+    /// Tags, categories or collections of `library` changed: re-reads the category and collection
+    /// lists when it is the selection's library (coalesced, see the class comment).
+    void library_structure_changed(const uuids::uuid& library);
+    /// Category and collection list reads started since construction (tests check the coalescing).
+    std::uint64_t choice_reads_started() const { return choice_reads_started_; }
 
 signals:
     /// Apply these fields to the current selection (sample_ids are filled in by the receiver).
@@ -85,6 +103,10 @@ private:
     void load_detail(const search::SampleRow& row);
     /// Shows a sample's detail, leaving drafts untouched.
     void show_detail(const catalog::SampleDetail& detail);
+    /// Re-reads the category and collection lists at once (the selection's library changed).
+    void reload_library_choices();
+    /// Starts the owed list read when none is in flight and the interval has passed.
+    void start_due_choices_read();
     /// Reads one library's categories and manual collections for the combo boxes.
     void load_library_choices(const uuids::uuid& library);
     /// Shows what the selected rows have in common ("Mixed" where they differ), diffing against
@@ -96,10 +118,9 @@ private:
     void show_row_overrides();
     /// Enables the controls that make sense for the selection and read-only state.
     void update_enabled();
-    /// Emits editRequested() unless nothing is selected, the library is read-only or only part of
-    /// the selection is loaded.
+    /// Emits editRequested() unless nothing is selected or the library is read-only.
     void request(catalog::EditCommand command);
-    /// True when every selected row is loaded (edits act on the whole selection only).
+    /// True when every selected row is loaded (otherwise the summary covers the loaded ones).
     bool whole_selection_loaded() const { return total_selected_ <= rows_.size(); }
 
     /// Reads details and choices through the Application.
@@ -111,6 +132,12 @@ private:
     std::optional<catalog::SampleDetail> detail_;      ///< detail of a single selection, once read
     std::uint64_t detail_request_ = 0;                 ///< drops stale detail deliveries
     std::uint64_t choices_request_ = 0;                ///< drops stale category/collection deliveries
+    std::optional<uuids::uuid> choices_library_;       ///< library the combo boxes were last filled for
+    int choice_reads_in_flight_ = 0;                   ///< list reads not yet delivered
+    bool choices_dirty_ = false;                       ///< the library's structure changed since the last read
+    QElapsedTimer choices_last_started_;               ///< when the last list read started
+    QTimer choices_timer_;                             ///< starts a deferred list read
+    std::uint64_t choice_reads_started_ = 0;           ///< list reads started (tests)
     bool read_only_ = false;                           ///< the selection's library is read-only
     bool notes_dirty_ = false;                         ///< notes typed but not saved
     bool bpm_draft_ = false;                           ///< the BPM override was changed but not applied

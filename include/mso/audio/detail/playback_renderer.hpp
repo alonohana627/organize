@@ -2,6 +2,7 @@
 /// @file
 /// The real-time half of preview: turns PCM ring blocks into device output.
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -37,9 +38,17 @@ public:
 
     /// Sets the device rate (ramp lengths, accepted blocks) and the output latency the playhead is
     /// compensated for, for a device that is about to start. The playhead history restarts from the
-    /// position last heard on the previous device, a held block of another rate is dropped on the
-    /// next render, and output that is enabled fades back in. Call only while no callback can run.
+    /// position last heard on the previous device, and output that is enabled fades back in.
+    /// Every epoch published so far is superseded: its blocks were rendered from the previous
+    /// device's consumed position, which lies ahead of what was heard, so the device plays nothing
+    /// until the decoder thread re-anchors at the audible position (it does so for every new device
+    /// configuration); the wait is not counted as an underrun. Call only while no callback can run.
     void configure(std::uint32_t output_rate, std::uint32_t latency_frames) noexcept;
+
+    /// Changes the latency the playhead is compensated for, on a device that keeps running (the
+    /// backend moved it to another endpoint at the same stream rate). Safe while callbacks run: the
+    /// next callback uses it.
+    void update_latency(std::uint32_t latency_frames) noexcept;
 
     /// Fills all of `stereo_output` (interleaved left/right).
     void render(std::span<float> stereo_output) noexcept;
@@ -54,7 +63,8 @@ private:
     }
     /// Reads the next frame of the current epoch; false when there is none (or output just stopped).
     [[nodiscard]] bool read_frame(float& left, float& right) noexcept;
-    /// True when a block must not be played: an older epoch, or rendered for another device rate.
+    /// True when a block must not be played: an older epoch, one superseded by configure(), or one
+    /// rendered for another device rate.
     [[nodiscard]] bool is_superseded(const PcmBlockHeader& header) const noexcept;
     /// Releases the current block (reporting end of stream when it carries the flag).
     void finish_block() noexcept;
@@ -69,10 +79,11 @@ private:
     PcmRing& ring_;                ///< blocks from the decoder thread
     SharedPlaybackState& shared_;  ///< published status
 
-    std::uint32_t output_rate_ = 0;     ///< device rate; blocks of other rates are dropped
-    std::uint64_t latency_frames_ = 0;  ///< device buffer the playhead lags by
-    std::uint64_t epoch_ = 0;           ///< newest epoch adopted
-    bool output_enabled_ = false;       ///< output switch adopted with epoch_
+    std::uint32_t output_rate_ = 0;                 ///< device rate; blocks of other rates are dropped
+    std::atomic<std::uint32_t> latency_frames_{0};  ///< device buffer the playhead lags by
+    std::uint64_t epoch_ = 0;                       ///< newest epoch adopted
+    std::uint64_t superseded_through_epoch_ = 0;    ///< configure(): epochs up to this one are never played
+    bool output_enabled_ = false;                   ///< output switch adopted with epoch_
 
     std::optional<ReadablePcmBlock> current_block_;  ///< block being played (still owned by the ring)
     std::uint32_t frames_into_block_ = 0;            ///< frames of current_block_ already played

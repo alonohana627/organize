@@ -15,3 +15,6 @@ models/
 samples/
 *.user
 .vs/
+# Fuzz seed corpora are checked in byte for byte, whatever their extension (the cursor and worker
+# protocol seeds are .bin files).
+!tests/fuzz/corpus/**

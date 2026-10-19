@@ -130,7 +130,7 @@
       ],
       "content_sha256": {
         "miniaudio/LICENSE": "457f1b500e0adf6bc059edddfa78a2f62012e7c3bb43476c20e0bd23b25ba0eb",
-        "miniaudio/extras/stb_vorbis.c": "1ba414d68bc74350826cadc6d880d2b5fc4d0c1851abd65de4b75ce10f097f53",
+        "miniaudio/extras/stb_vorbis.c": "6b311245a8f3ae533de1c11572dc22b4215ff1d4e435e2401d387be5a6876f1b",
         "miniaudio/miniaudio.h": "ac7af4de748b7e26b777f37e01cee313a308a7296a3eb080e2906b320cc55c89"
       }
     },

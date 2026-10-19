@@ -75,8 +75,10 @@ constexpr int kExitUsage = 64;             ///< invalid command line (EX_USAGE)
 
 /// Once the worker is told to stop (Shutdown, end of input, a protocol violation), how long it
 /// waits for its task thread to end. A thread stuck in a decoder or file read never ends; the
-/// worker then exits without it instead of waiting forever.
-constexpr std::chrono::milliseconds kTaskStopDeadline{2000};
+/// worker then exits without it instead of waiting forever. Half the supervisor's default
+/// shutdown_grace (2 s), so the worker's own exit, with its own exit status, comes well before the
+/// supervisor would terminate it.
+constexpr std::chrono::milliseconds kTaskStopDeadline{1000};
 
 /// The compiler that built this worker, for the handshake's build id.
 #if defined(__clang__)

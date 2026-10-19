@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <numbers>
 
 namespace mso::analysis {
@@ -68,11 +69,15 @@ std::span<const float> MagnitudeSpectrum::compute(std::span<const float> head, s
     magnitudes_[0] = std::abs(transform_buffer_[0]) * normalization_;
     // sqrt of the squared sum in double instead of std::hypot: squares of finite floats cannot
     // overflow a double (even for a crafted file with huge float samples), and hypot's
-    // overflow-safe scaling costs several times as much on this per-bin hot path.
+    // overflow-safe scaling costs several times as much on this per-bin hot path. The magnitude can
+    // still exceed FLT_MAX by up to sqrt(2), and narrowing such a double to float is undefined, so it
+    // is capped first (one min per bin).
+    constexpr double kLargestFloat = std::numeric_limits<float>::max();
     for (std::size_t bin = 1; 2 * bin < length; ++bin) {
         const double real = transform_buffer_[2 * bin - 1];
         const double imaginary = transform_buffer_[2 * bin];
-        magnitudes_[bin] = static_cast<float>(std::sqrt(real * real + imaginary * imaginary)) * normalization_;
+        const double magnitude = std::min(std::sqrt(real * real + imaginary * imaginary), kLargestFloat);
+        magnitudes_[bin] = static_cast<float>(magnitude) * normalization_;
     }
     if (length % 2 == 0) magnitudes_[length / 2] = std::abs(transform_buffer_[length - 1]) * normalization_;
     return magnitudes_;

@@ -16,6 +16,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <set>
 
 #include "mso/ui/about_dialog.hpp"
 #include "mso/ui/analysis_controller.hpp"
@@ -348,7 +349,7 @@ void MainWindow::connect_controllers() {
     });
     connect(edit_controller_, &EditController::structureChanged, this, [this](const uuids::uuid& library) {
         navigator_->reload_library(library);
-        inspector_->reload_library_choices();
+        inspector_->library_structure_changed(library);
     });
     connect(edit_controller_, &EditController::reloadRequested, this, &MainWindow::refresh_results);
     connect(inspector_, &InspectorPanel::editRequested, this,
@@ -394,6 +395,12 @@ void MainWindow::connect_controllers() {
     });
     connect(library_controller_, &LibraryController::statusMessage, this, &MainWindow::show_status);
     connect(library_controller_, &LibraryController::failed, this, &MainWindow::show_failure);
+    connect(library_controller_, &LibraryController::libraryOpenFailed, this, [this](const QString& reason) {
+        std::vector<uuids::uuid> open;
+        for (const auto& info : session_.libraries())
+            open.push_back(info.uuid);
+        jobs_->fail_unopened_library_opens(open, reason);
+    });
     connect(export_controller_, &ExportController::statusMessage, this, &MainWindow::show_status);
     connect(export_controller_, &ExportController::failed, this, &MainWindow::show_failure);
     connect(preview_, &PreviewPanel::statusMessage, this, &MainWindow::show_status);
@@ -426,6 +433,7 @@ void MainWindow::connect_session() {
     connect(&session_, &ApplicationSession::librariesChanged, this, &MainWindow::on_libraries_changed);
     connect(&session_, &ApplicationSession::catalogChanged, this, &MainWindow::on_catalog_changed);
     connect(&session_, &ApplicationSession::importProgressed, jobs_, &JobsPanel::update_import);
+    connect(&session_, &ApplicationSession::libraryOpenProgressed, jobs_, &JobsPanel::update_library_open);
     connect(&session_, &ApplicationSession::operationFinished, this, [this](const app::OperationFinishedEvent& event) {
         jobs_->finish_operation(event);
         const QString description = DisplayFormat::from_utf8(event.description);
@@ -443,6 +451,8 @@ void MainWindow::connect_session() {
             event.library ? tr("%1: %2").arg(session_.library_name(*event.library), DisplayFormat::error(event.error))
                           : DisplayFormat::error(event.error);
         show_failure(tr("Problem while %1").arg(context), details);
+        // A library that failed to become writable (its upgrade included) stops showing as upgrading.
+        if (event.library) jobs_->fail_library_open(*event.library, DisplayFormat::error(event.error));
     });
     connect(&session_, &ApplicationSession::libraryAccessChanged, this,
             [this](const app::LibraryAccessChangedEvent& event) {
@@ -480,7 +490,10 @@ void MainWindow::on_libraries_changed() {
     std::vector<uuids::uuid> open;
     for (const auto& info : libraries)
         open.push_back(info.uuid);
-    jobs_->retain_libraries(open);  // runs of a closed library are no longer cancellable
+    jobs_->retain_libraries(open);                // runs of a closed library are no longer cancellable
+    jobs_->finish_completed_library_opens(open);  // an upgraded library is listed once it is open
+    if (const auto notice = key_conflict_notice(libraries, reported_key_conflicts_))
+        show_failure(notice->first, notice->second);
     navigator_->reload();
     history_->reload();
     root_locations_->reload();
@@ -503,20 +516,39 @@ void MainWindow::on_catalog_changed(const app::CatalogChangedEvent& event) {
             keys.push_back(key);
             selected_sample_changed = selected_sample_changed || key == current;
         }
-        const std::size_t loaded = model_->refresh_rows(keys);  // in place: no re-query, no scroll jump
+        const std::size_t known = model_->refresh_rows(keys);  // in place: no re-query, no scroll jump
         if (selected_sample_changed) inspector_->reload_detail();
-        // Samples the table has not loaded may be new (an import) or may now match the query: re-read
-        // the visible window, at most every kWindowRefreshMilliseconds (the index answers in ms).
-        if (loaded < keys.size() && !window_refresh_timer_.isActive()) window_refresh_timer_.start();
+        // Samples the table does not hold (loaded or evicted) may be new (an import) or may now match
+        // the query: re-read the window, at most every kWindowRefreshMilliseconds (the index answers
+        // in ms; the model runs one refresh at a time and owes at most one more).
+        if (known < keys.size() && !window_refresh_timer_.isActive()) window_refresh_timer_.start();
     }
     if (event.structure_changed) {
         navigator_->reload_library(event.library);
-        inspector_->reload_library_choices();
+        inspector_->library_structure_changed(event.library);  // ignored unless it is the selection's
         root_locations_->reload();
     }
     // History made by this window is reloaded when its edit settles (EditController); this covers
     // history made elsewhere, read at most every few seconds and only while the panel is visible.
     history_->catalog_changed(event.library);
+}
+
+std::optional<std::pair<QString, QString>> MainWindow::key_conflict_notice(
+    const std::vector<app::OpenLibraryInfo>& libraries, std::set<uuids::uuid>& reported) {
+    QStringList lines;
+    for (const auto& info : libraries) {
+        if (info.key_conflicts <= 0 || !reported.insert(info.uuid).second) continue;
+        QString line = tr("%1: %n name(s) or path(s) became identical under the new comparison rules and were kept "
+                          "apart (they are listed for review).",
+                          nullptr, static_cast<int>(info.key_conflicts))
+                           .arg(DisplayFormat::from_utf8(info.name));
+        if (info.pre_rekey_backup)
+            line = tr("%1 A backup from before the upgrade is at %2.")
+                       .arg(line, DisplayFormat::from_path(*info.pre_rekey_backup));
+        lines << line;
+    }
+    if (lines.isEmpty()) return std::nullopt;
+    return std::pair{tr("Some names collided after the library upgrade"), lines.join(QLatin1Char('\n'))};
 }
 
 void MainWindow::refresh_results() {
@@ -543,13 +575,26 @@ void MainWindow::on_selection_changed() {
     const std::vector<search::SampleRow> samples = table_->selected_samples();
     const std::size_t selected = table_->selected_row_count();
     std::vector<SampleKey> keys;
-    bool read_only = false;
+    keys.reserve(samples.size());
+    std::set<uuids::uuid> libraries;
     for (const auto& sample : samples) {
         keys.push_back({sample.library, sample.sample_id});
-        if (auto info = session_.library_info(sample.library); info && info->read_only) read_only = true;
+        libraries.insert(sample.library);
     }
-    drag_resolver_->resolve(keys);
-    inspector_->show_selection(samples, selected);
+    // Edits act on the whole selection: when part of it is evicted, its libraries come from the
+    // keys every page keeps (only then: that walks every selected row).
+    const bool partly_loaded = samples.size() < selected;
+    if (partly_loaded) {
+        libraries.clear();
+        for (const SampleKey& key : table_->selected_keys())
+            libraries.insert(key.library);
+    }
+    // One pass over the open libraries, not one lookup (and copy) per selected sample.
+    const bool read_only = std::ranges::any_of(session_.libraries(), [&libraries](const app::OpenLibraryInfo& info) {
+        return info.read_only && libraries.contains(info.uuid);
+    });
+    drag_resolver_->resolve(keys);  // the loaded rows: drags need their paths
+    inspector_->show_selection(samples, selected, partly_loaded ? std::optional(libraries) : std::nullopt);
     inspector_->set_read_only(read_only);
 
     const std::optional<SampleKey> current = table_->current_key();
@@ -665,16 +710,15 @@ std::optional<std::vector<SampleKey>> MainWindow::complete_selection(const QStri
         show_status(tr("Select one or more samples first."));
         return std::nullopt;
     }
+    // Every page keeps its rows' keys, evicted or not, so this covers the whole selection.
     std::vector<SampleKey> keys = table_->selected_keys();
     if (keys.size() < selected) {
-        // Acting on the loaded part only would change fewer samples than the status bar says are
-        // selected, without telling anyone.
+        // Only possible while the rows themselves are still arriving: acting on part of the
+        // selection would change fewer samples than the status bar says are selected.
         show_failure(tr("%1: nothing was changed").arg(action),
-                     tr("Only %1 of the %2 selected samples are loaded (the table keeps about %3 in memory), so "
-                        "the command would miss the others. Select fewer samples and try again.")
-                         .arg(DisplayFormat::count(static_cast<std::int64_t>(keys.size())),
-                              DisplayFormat::count(static_cast<std::int64_t>(selected)),
-                              DisplayFormat::count(SampleTableModel::kMaxHydratedPages * SampleTableModel::kPageSize)));
+                     tr("%1 of the %2 selected rows are still loading. Try again in a moment.")
+                         .arg(DisplayFormat::count(static_cast<std::int64_t>(selected - keys.size())),
+                              DisplayFormat::count(static_cast<std::int64_t>(selected))));
         return std::nullopt;
     }
     return keys;
@@ -694,8 +738,11 @@ void MainWindow::remove_selection_from_library() {
 void MainWindow::toggle_favorite() {
     const auto keys = complete_selection(tr("Toggle favorite"));
     if (!keys) return;
+    // Decided from the rows in memory (an evicted row's flag is not known without reading it): when
+    // every loaded selected row is a favorite, the command unmarks the whole selection.
     const auto samples = table_->selected_samples();
-    const bool all_favorite = std::ranges::all_of(samples, [](const auto& sample) { return sample.favorite; });
+    const bool all_favorite =
+        !samples.empty() && std::ranges::all_of(samples, [](const auto& sample) { return sample.favorite; });
     catalog::EditCommand command;
     command.favorite = !all_favorite;
     edit_controller_->apply(*keys, command, all_favorite ? tr("Unmarked favorite") : tr("Marked favorite"));
@@ -711,6 +758,12 @@ void MainWindow::create_smart_collection(const uuids::uuid& library, const QStri
     const QString query = search_bar_->text().trimmed();
     if (query.isEmpty()) {
         show_failure(tr("New smart collection"), tr("Type a search first; the smart collection keeps that query."));
+        return;
+    }
+    // Refuse a query that does not parse (the error names the position), instead of storing it and
+    // failing every later search of the collection.
+    if (auto valid = search::SearchService().validate(DisplayFormat::to_utf8(query)); !valid) {
+        show_failure(tr("New smart collection"), QString::fromStdString(valid.error().safe_detail));
         return;
     }
     catalog::TaxonomyCommand command;

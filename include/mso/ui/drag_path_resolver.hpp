@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <optional>
 #include <stop_token>
@@ -27,6 +28,9 @@ class ApplicationSession;
 /// Selection changes are debounced (kDebounceMilliseconds) and run on a dedicated one-thread pool,
 /// so file checks never delay searches or edits on the session's pool. A newer selection cancels
 /// the running check between two files (stop token) and its result is dropped.
+///
+/// The check itself is a PathLookup: Application::resolve_playable_path through the session, or
+/// any thread-safe function (tests check the debounce, cancellation and bookkeeping with one).
 class DragPathResolver final : public QObject {
     Q_OBJECT
 
@@ -36,8 +40,14 @@ public:
     /// Quiet time after the last selection change before the check starts.
     static constexpr int kDebounceMilliseconds = 150;
 
+    /// Resolves one sample's file (called on the resolver's own pool thread, one key at a time).
+    using PathLookup = std::function<Result<std::filesystem::path>(const SampleKey& key)>;
+
     /// Resolves through `session`, which must outlive the resolver.
     explicit DragPathResolver(ApplicationSession& session, QObject* parent = nullptr);
+    /// Resolves through `lookup`, which must be safe to call from another thread.
+    explicit DragPathResolver(PathLookup lookup, QObject* parent = nullptr);
+    /// Cancels the running check and waits for it.
     ~DragPathResolver() override;
 
     /// Schedules a check of `keys` (replacing any earlier request).
@@ -60,9 +70,17 @@ signals:
 private:
     /// Starts the debounced check on the resolver's own pool.
     void start_check();
+    /// Stores a finished check of generation `generation` (dropped when superseded or cancelled).
+    void finish_check(std::uint64_t generation, std::vector<Result<std::filesystem::path>> results);
+    /// Resolves `keys` one after another with `lookup` until `stop` is requested; a stopped check
+    /// returns fewer results than keys.
+    static std::vector<Result<std::filesystem::path>> check_keys(const std::vector<SampleKey>& keys,
+                                                                 const PathLookup& lookup, const std::stop_token& stop);
 
-    /// Resolves through the Application.
-    ApplicationSession& session_;
+    /// Resolves through the Application (null when a PathLookup was given).
+    ApplicationSession* session_ = nullptr;
+    /// The lookup given instead of a session (empty with a session).
+    PathLookup lookup_;
     QThreadPool pool_;              ///< one thread, separate from the session's pool
     QTimer debounce_;               ///< waits kDebounceMilliseconds after the last selection change
     std::stop_source stop_;         ///< cancels the running check

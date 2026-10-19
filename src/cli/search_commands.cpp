@@ -1,4 +1,6 @@
 // search, show, tags, collections commands.
+#include <set>
+
 #include <nlohmann/json.hpp>
 
 #include "mso/cli/command_context.hpp"
@@ -62,17 +64,70 @@ nlohmann::json row_json(const search::SampleRow& row) {
             {"availability", std::string(search::to_string(row.availability))}};
 }
 
-/// Prints a warning per library missing from the results; true when any is missing.
-bool warn_incomplete(const CommandContext& context, const std::vector<search::LibraryCoverage>& coverage) {
-    bool incomplete = false;
-    for (const auto& library : coverage)
-        if (!library.complete) {
-            incomplete = true;
-            context.warn("results exclude library '{}': {}", library.name,
-                         library.error ? library.error->message() : "unavailable");
+/// Warns once per library missing from the results (every page reports coverage, so a library
+/// that stays offline would otherwise be reported once per page).
+class CoverageWarnings {
+public:
+    explicit CoverageWarnings(const CommandContext& context) : context_(context) {}
+
+    /// Warns about each library of `coverage` that is missing and was not reported yet.
+    void check(const std::vector<search::LibraryCoverage>& coverage) {
+        for (const auto& library : coverage) {
+            if (library.complete) continue;
+            incomplete_ = true;
+            if (!warned_.insert(uuids::to_string(library.library)).second) continue;
+            context_.warn("results exclude library '{}': {}", library.name,
+                          library.error ? library.error->message() : "unavailable");
         }
-    return incomplete;
-}
+    }
+    /// True when any page or count missed a library.
+    bool incomplete() const { return incomplete_; }
+
+private:
+    const CommandContext& context_;
+    std::set<std::string> warned_;  ///< library UUIDs already reported
+    bool incomplete_ = false;
+};
+
+/// Prints `search --json` output as it arrives: a JSON array of rows, or with --count the object
+/// {"rows": [...], "total": n, "complete": b}. Rows are printed one per line as they are read,
+/// so memory stays bounded whatever --limit allows. Each line is held back until the next one
+/// (or the end) is known, to put the separating comma on the line it belongs to. Nothing is
+/// printed before the first row, so a search that fails at once prints no partial document.
+class StreamedRows {
+public:
+    StreamedRows(const CommandContext& context, bool with_total) : context_(context), with_total_(with_total) {}
+
+    /// Prints one row.
+    void add(const nlohmann::json& row) {
+        open();
+        if (pending_) context_.print("  {},", *pending_);
+        pending_ = json_fields::dump_json(row);
+    }
+    /// Closes the array (and the object with its total).
+    void finish(std::optional<std::int64_t> total, bool complete) {
+        open();
+        if (pending_) context_.print("  {}", *pending_);
+        pending_.reset();
+        if (with_total_)
+            context_.print("], \"total\": {}, \"complete\": {}}}", total.value_or(0), complete ? "true" : "false");
+        else
+            context_.print("]");
+    }
+
+private:
+    /// Prints the opening bracket (or brace) once.
+    void open() {
+        if (opened_) return;
+        opened_ = true;
+        context_.print("{}", with_total_ ? "{\"rows\": [" : "[");
+    }
+
+    const CommandContext& context_;
+    bool with_total_ = false;
+    bool opened_ = false;
+    std::optional<std::string> pending_;
+};
 
 /// Registers `search`.
 void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
@@ -93,7 +148,9 @@ void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
     command->add_option("query", options.query, "Query, e.g. 'kick bpm:120..130 tag:Drums rating:>=3'");
     command->add_option("--sort", options.sort, "Sort field")->check(CLI::IsMember(kSortNames));
     command->add_flag("--desc", options.descending, "Descending order");
-    command->add_option("--limit", options.limit, "Maximum rows to print (pages of up to 500 are fetched)")
+    command
+        ->add_option("--limit", options.limit,
+                     "Maximum rows to print (pages of up to 500 are fetched and printed as they arrive)")
         ->check(CLI::Range(std::size_t{0}, std::size_t{10'000'000}));
     command->add_flag("--count", options.count, "Also report the exact total");
     command->callback([&] {
@@ -109,18 +166,20 @@ void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
             .descending = descending,
             .page_size = std::clamp<std::size_t>(limit, 1, search::SearchService::kMaxPageSize)};
         auto* application = *context.application();
-        bool incomplete = false;
+        CoverageWarnings coverage(context);
+        // With --count the JSON output stays one document: {"rows": [...], "total": n, "complete": b}.
+        std::optional<StreamedRows> json_rows;
+        if (context.json_output) json_rows.emplace(context, count);
         std::size_t printed = 0;
-        nlohmann::json rows = nlohmann::json::array();
         while (printed < limit) {
             auto page = application->search(request);
             if (!page) return void(exit_code = context.report(page.error()));
-            incomplete = warn_incomplete(context, page->coverage) || incomplete;
+            coverage.check(page->coverage);
             for (const auto& row : page->rows) {
                 if (printed >= limit) break;
                 ++printed;
-                if (context.json_output)
-                    rows.push_back(row_json(row));
+                if (json_rows)
+                    json_rows->add(row_json(row));
                 else
                     print_row(context, row);
             }
@@ -132,20 +191,14 @@ void register_search(CLI::App& root, CommandContext& context, int& exit_code) {
             request.cursor.reset();
             auto counted = application->count(request);
             if (!counted) return void(exit_code = context.report(counted.error()));
-            incomplete = warn_incomplete(context, counted->coverage) || incomplete;
+            coverage.check(counted->coverage);
             total = counted->total;
         }
-        if (context.json_output) {
-            // With --count the output stays one JSON document: {"rows": [...], "total": n}.
-            if (total)
-                context.print(
-                    "{}", json_fields::dump_json({{"rows", rows}, {"total", *total}, {"complete", !incomplete}}, 2));
-            else
-                context.print("{}", json_fields::dump_json(rows, 2));
-        } else if (total) {
+        if (json_rows)
+            json_rows->finish(total, !coverage.incomplete());
+        else if (total)
             context.print("{} matching sample(s)", *total);
-        }
-        if (incomplete) exit_code = kExitPartial;
+        if (coverage.incomplete()) exit_code = kExitPartial;
     });
 }
 

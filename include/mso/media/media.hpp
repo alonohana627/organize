@@ -66,7 +66,7 @@ struct ProbeResult {
     EmbeddedTags tags;                        ///< embedded text and musical tags
     std::vector<LoopPoint> loops;             ///< container loop markers that fit inside the stream (at most 64)
     /// Bytes the parsers consumed (never more than ProbeLimits::max_bytes). The file is read through
-    /// a 16 KiB read-ahead window, so slightly more may have come off the disk.
+    /// a 16 KiB read-ahead window, so more may have come off the disk: at most twice max_bytes.
     std::uint64_t bytes_read = 0;
 };
 

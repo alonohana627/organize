@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 2026-10-19 · branch `phase/p1-browser` · committed: the first implementation (`4a91682`), the first review round (`6b10cc9`) and the Windows installer (`6b5f1d4`). The **second review round** (section below, from the second `CODE_REVIEW.md`) is not committed yet (awaiting the owner's OK).
+Updated 2026-10-19 · branch `phase/p1-browser` · committed: the first implementation (`4a91682`), the first review round (`6b10cc9`), the Windows installer (`6b5f1d4`) and the second review round (`7115e88`). The **third review round** (section below, from the third `CODE_REVIEW.md`) is not committed yet (awaiting the owner's OK).
 
 ## Where the roadmap stands
 
@@ -14,6 +14,7 @@ Updated 2026-10-19 · branch `phase/p1-browser` · committed: the first implemen
 | **P5** semantic search | Not started, and deferred well past the current work (owner, 2026-10-19). |
 | **P6** 5M scale | Not started. Tempo-aware preview is scrapped (owner, 2026-10-19). |
 | **P7** VST3 | Not started. |
+| **P10** fuzzing | Deferred by the owner (2026-10-19, "we had enough" for now): the CI fuzz job is off and the targets are not extended (no decoder target, no new seeds, no CTest replay of the seeds). The 11 targets in `tests/fuzz/`, their seed corpus and `tools/run_fuzzers.py` stay in the repository and run by hand. `CODE_REVIEW.md` §8 lists the deferred findings (§5.3). |
 
 Deliberate deviations from the specification, at the owner's request:
 - Scrapped (2026-10-19), not to be built: tempo-aware preview against a project tempo (P6), and the
@@ -28,12 +29,16 @@ Deliberate deviations from the specification, at the owner's request:
   specification's ACL'd named pipe and handshake nonce will not be built.
 - **In-memory sample index (owner's request), against docs/06's 768 MiB browse budget:** the desktop app
   keeps every open library's sample rows in an in-memory index for responsiveness. Measured with
-  `mso bench` (release, Windows): 248–265 bytes per row at 1M rows (237–254 MiB), 262–322 bytes per row at
-  100k. The indexes of all open libraries are capped at 1,000,000 rows together
-  (`ApplicationOptions::index_row_limit`, about 260 MiB). A library that would exceed the cap is searched
-  in SQLite with identical results, and the user is told. A reload keeps the previous index until the
-  new one is ready, so the index can briefly use twice its memory (about 520 MiB at the cap), which
-  still fits the 768 MiB browse budget together with the UI and SQLite's page cache. The 64 MiB
+  `mso bench` (release, Windows, 1M rows with realistic pack-style names averaging 46 bytes, third
+  round): 295 bytes per row after load (282 MiB), 314 bytes per row once sort orders are built
+  (300 MiB). The indexes of all open libraries are capped at 1,000,000 rows together
+  (`ApplicationOptions::index_row_limit`, about 300 MiB). A library that would exceed the cap is searched
+  in SQLite with identical results, and the user is told; it is indexed again once it fits. A reload
+  keeps the previous index until the new one is ready, so the index can briefly use twice its memory
+  (about 600 MiB at the cap), which still fits the 768 MiB browse budget together with the UI and
+  SQLite's page cache. (The second round's 248–265 bytes per row came from short synthetic names that
+  fit the small-string buffer; with realistic names that code needed 466–490 bytes per row, over budget
+  during a reload. `mso bench --names short` reproduces the old figure.) The 64 MiB
   hydrated-row budget is unchanged: full rows are built only for returned pages.
 - The desktop app analyzes automatically: after each import it queues the `Full` profile for the
   folder (only new or changed samples run), rescans folders at start-up and on reconnect, and creates
@@ -55,8 +60,9 @@ Deliberate exceptions to owner rule 1 ("use libraries, never hand-roll"), with t
     from the file). They are fuzzed with libFuzzer under AddressSanitizer and UndefinedBehaviorSanitizer
     through `media::probe_memory`, one target per family (RIFF/AIFF/CAF, FLAC, MPEG with ID3, Ogg with
     Vorbis comments and OpusTags, MP4, ASF, APEv2; `tests/fuzz/`): 60 s each, about 0.5–1 million
-    inputs per target, no finding (2026-10-19, see "Verified"). CI repeats the 60 s runs on every
-    push. This is crash-proofing against damaged files. (Until this round the claim rested on a
+    inputs per target, no finding (2026-10-19, see "Verified"). The CI fuzz job never completed a run
+    (its only run failed at configure, see "CI on GitHub") and is now off: fuzzing is deferred to P10.
+    This is crash-proofing against damaged files. (Until this round the claim rested on a
     400-iteration seeded random test without sanitizers.)
 
   Decoding still uses miniaudio, stb_vorbis and FFmpeg. The CRC for the Ogg tail check
@@ -80,6 +86,9 @@ Deliberate exceptions to owner rule 1 ("use libraries, never hand-roll"), with t
     producer blocking or allocating.
 
   The decoder and output threads now wake up through moodycamel's `LightweightSemaphore`.
+- **The audio output thread's request queue is a bounded (32) mutex plus deque of `std::packaged_task`:**
+  requests come from many threads and carry futures or completions, and the vendored moodycamel queue
+  is single-producer.
 
 Not a deviation any more: the preview's **declick fades**. Intact audio is no longer faded (attacks at
 frame 0 stay untouched); only mid-signal starts, resume and underrun recovery fade, and loop-seam
@@ -88,6 +97,151 @@ crossfades are opt-in (`transport::SetSeamFades`, reported in the snapshot).
 Platform code is isolated (`#ifdef _WIN32` with POSIX branches, in `.cpp` files and `detail/` headers).
 The Linux build compiled in CI run 39229983572 (core, CLI and worker, release and ASan/UBSan), but that
 run failed tests (see "Not verified / known gaps"), and no Linux run is current.
+
+## Third review round 2026-10-19 (third CODE_REVIEW.md): what changed
+
+**Build, CI, dependencies and docs** (infra)
+- CI (`.github/workflows/ci.yml`): MSYS2 now upgrades before installing (`update: true`). With
+  `update: false`, the first run of the Windows legs (39254087106) installed clang 22.1.8 from the
+  runner image's stale package database instead of the current 23.1.3 used here. The "Toolchain
+  versions" step also prints the installed clang, libc++, Qt and FFmpeg packages.
+- Fuzzing is deferred by the owner to P10 (see the roadmap): the CI fuzz job is off
+  (`if: ${{ false }}`), and the targets are not extended. Its only run (39254087106) failed at configure
+  because the `cursor` seeds and five `worker_protocol` seeds were never committed: `.gitignore`
+  ignored `*.bin`. `.gitignore` now keeps everything under `tests/fuzz/corpus/`; those six files must
+  be added in the next commit.
+- `cmake/DependencyNotices.cmake`: the literal CR byte in a `string(REPLACE)` is now the escape `"\r"`,
+  so the file is plain LF text.
+- `cmake/Packaging.cmake`: with CMake older than 3.29 (which ignores `CPACK_WIX_INSTALL_SCOPE`) packaging
+  is skipped with a warning instead of producing a per-user installer.
+- `cmake/InstallThirdPartyLicenses.cmake`: pacman runs under `LC_ALL=C` (its field labels are
+  translated otherwise), and `share/licenses/PACKAGES.txt` is written on every path, so the pointer in
+  `THIRD_PARTY_NOTICES.txt` never leads nowhere.
+- Docs: CI legs are described as configured until a green run is cited; corrected the WiX lookup, the
+  close-versus-open wait, the stale-cursor conditions, the partial-selection wording, the preview
+  re-anchor claim, `folder:Loops`, the CRLF counts and the stb_vorbis patch list in `deps/README.md`.
+- The second review's request to commit the deps line-ending refresh separately from the stb_vorbis
+  patch could not be followed: both are already in one commit, `7115e88`.
+
+**Catalog and domain** (catalog)
+- Rescans of OneDrive or link-heavy roots: the skip-revive statement now uses `locations_live_path`;
+  marking 500 skipped paths seen fell from 1612 ms to 29–83 ms at 100k locations (release).
+- A plan test explains every catalog statement on `locations` and `jobs` (41 statements) and fails on a
+  full scan or a temporary sort, except six documented, deliberate plans.
+- Case-insensitive keys follow NTFS for BMP letters whose case pair round-trips (`kFoldVersion` bumped):
+  the first open after the upgrade takes a verified `pre-rekey` backup and rebuilds every unique key
+  collision-safe; real collisions stay apart and are listed in one `normalization_conflict` review
+  item, never merged. Known exceptions (ß/ẞ, Georgian Mkhedruli/Mtavruli) are pinned in tests.
+- Backups read from a reader snapshot (imports and edits keep running) and can be cancelled
+  (CANCELLED, partial file removed). `list_roots(WithoutSampleCounts)` costs 0.013 ms instead of 116 ms.
+- Paused runs keep their jobs paused through release, failure and lease expiry; `scan_frontier` rows
+  are cleaned up; chunked edits whose first chunks change nothing resume correctly; `record_scan_gaps`
+  records a batch of gaps in one transaction; `OpenOptions::on_progress` reports long opens.
+- The FTS5 content check still runs on the writer: SQLite treats it as an INSERT. The reader's
+  `PRAGMA integrity_check` covers the index structure.
+
+**Search** (search)
+- Rows that fail to hydrate are offered again once, then skipped, so paging always ends; the library is
+  marked incomplete in that page's coverage. Cursors are version 4.
+- The folder plan choice is cached per library revision (256 entries); a plan test covers every
+  location condition the compiler emits.
+- Row hydration no longer reads the whole library: SQLite had picked a `(deleted, …)` sort index for
+  `s.deleted=0` and sorted every live sample; `+s.deleted=0` makes it search by id. Release, 1M rows:
+  `load_rows` of one id 45.3 ms → 0.01 ms (it was almost all of an edit's index update), 200 ids
+  51.2 → 3.6 ms, the index load (`for_each_row`) 1977 → 1064 ms, the first unfiltered SQL page
+  46.7 → 1.1 ms, `matching_ids` for one file name 41.6 → 0.02 ms; a very broad text term at 100K (`kick`)
+  is about 5 ms slower. A plan test pins the three hydration statements.
+- `for_each_row` takes a stop token: a library closed during its first index load stops streaming and
+  releases its snapshot at once (`SampleIndex::load` uses it).
+
+**Media and import** (media-files)
+- stb_vorbis patch extended: all 16 submaps kept (GHSL-2023-168) and a failed codebook lookup no longer
+  read through a null table (GHSL-2023-172), each with a regression test; the patch comment maps every
+  advisory to its fix.
+- Read errors in the Vorbis and FFmpeg decoders are reported (retryable) instead of a silent end, and a
+  seek recovers once the drive is back (FFmpeg's own I/O error state is cleared too).
+- WOF-compressed files (`compact /exe`, CompactGUI) import as ordinary files. Skipped entries are
+  reported to the catalog only for audio extensions; gaps are recorded in batches.
+- Read-ahead is capped at the probe's byte budget (`bytes_fetched()` reports disk traffic).
+
+**Analysis, worker and audio** (engine)
+- Plugging in a headset (a Windows default-device change) is no longer a lost device: preview follows
+  the new default and keeps playing, and the device name and latency update.
+- A device that stops silently, or whose driver stops calling back, is detected within about 1 s by a
+  watchdog on the output thread and re-opened automatically.
+- New `PreviewEngine::*_async` device calls; the UI no longer blocks on device enumeration, choice or
+  restart. At most 32 device requests wait; destroying the engine answers them CANCELLED.
+- A device switch no longer replays audio from before the switch.
+- Analysis reports a file on an unreachable server, share or drive as SOURCE_OFFLINE (retried), never as
+  FILE_MISSING. A worker with a stuck task exits within 1 s; the end-of-input and protocol-violation
+  exits are tested (Windows).
+
+**Application and CLI** (app-cli)
+- Index reloads are coalesced per library (one queued, one running; requests during a load become one
+  follow-up); background index updates at most every 100 ms. An edit the outbox cannot describe (a tag
+  renamed on more than 10,000 samples) returns only after the reload it caused.
+- Sort orders are patched in place: at 1M rows a committed rating edit went from 111 ms to 37 ms, a
+  1,000-row BPM edit from 480 ms to 162 ms, and the index load from 3.98 s to 2.79 s (release, realistic
+  names). Index memory: see the deviation at the top.
+- AnalysisSupervisor deadline, abandon and backoff are unit-tested against a `--self-test` worker.
+  `mso search --json` streams its rows; `mso backup` honours Ctrl+C (exit 130); `docs/COMMAND_LINE.md`
+  lists every option. New `LibraryOpenProgressEvent` (at most one per 100 ms) for long upgrades;
+  `ApplicationOptions::event_handler` is installed before start-up reopens libraries, so their upgrade
+  progress reaches the UI too.
+
+**Desktop UI** (ui)
+- One anchored table refresh at a time plus at most one owed, 250 ms after the commit, so paging keeps
+  working during long analysis; rows held in any page count as known. Row reads that arrive in an older
+  generation are read again instead of dropped.
+- The table stops paging at 500,000 rows. Committing a refresh with 20,000 selected rows went from
+  2.30 ms to 0.69 ms.
+- Preview device calls go through the engine's async API. Backups run as cancellable Jobs tasks.
+  Smart collections refuse a query that does not parse.
+- A library upgrade shows as an "Upgrading library …" row in the Jobs panel (backup, migrations, key
+  rebuild, integrity check); names that collided after the upgrade produce one notice naming the
+  library, the count and the pre-upgrade backup.
+
+### CI on GitHub
+
+Run 39254087106 (2026-10-19, commit `7115e88`, the second round; the first run of the Windows legs):
+- The runner installed **clang 22.1.8**, not 23.1.3 (`update: false`, fixed above); cmake 4.4.3,
+  Python 3.14.7, FFmpeg 9.0.2, Qt 6.11.2. The results below are therefore from clang 22.
+- `ci`: release build with `-Werror` passed, `ctest`: `100% tests passed out of 17`, install and the
+  smoke test of the installed app without MSYS2 on `PATH` passed. **The MSI was not built:** the WiX
+  step failed because `choco install wixtoolset --version=3.14.1` refused to downgrade the WiX 3.14.1
+  the image already has (package 3.14.1.20250415). The step now uses the installed toolset.
+- `ci-debug`: build passed, `100% tests passed out of 17`.
+- `ci-sanitize`: build passed, `100% tests passed out of 17` (ASan + UBSan).
+- `fuzz`: failed at configure (`Fuzz target cursor has no seed corpus`), see above. The job is now off.
+- `lint`: passed (55 vendored files match the manifest; clang-format 23.1.3 clean).
+
+Not yet observed on GitHub: a run with clang 23.1.3 (`update: true`) and a built MSI. Until a green
+run is cited here, those two are "configured; not yet run".
+
+### Integration run (third round)
+
+### Integration run of the third round (integrator, 2026-10-19, Windows, MSYS2 CLANG64, clang 23.1.3)
+- Release preset (`-Werror`, GUI on): 0 warnings, 0 errors; `clang-format --dry-run -Werror` clean.
+- `ctest`: `100% tests passed out of 17`. `tests/mso_tests.exe`: `test cases: 423 | 423 passed |
+  0 failed | 3 skipped` (opt-in benchmarks), `assertions: 96068 | 96068 passed`. `mso_ui_tests.exe`
+  (offscreen, null audio): `test cases: 78 | 78 passed | 0 failed | 1 skipped`, `assertions: 963 | 963
+  passed`.
+- Sanitize preset (Debug, ASan + UBSan): `ctest`: `100% tests passed out of 17`; no AddressSanitizer or
+  runtime-error line in the log.
+- CLI end to end on WAV, FLAC, MP3, Opus and AAC files with a Hebrew folder: 6 added; edit, undo, redo;
+  a smart collection created and deleted; `analyze --profile Full` 6 analyzed, 0 failed; `folder:Loops`
+  returns the 3 loops; a rename re-imports as `1 renamed`; `backup` writes a verified backup; `check`
+  reports `integrity: ok; foreign keys: 0 violation(s); search index: ok`.
+- A workspace from the second round opened in the desktop app (`--screenshot`, exit 0): the library took
+  a `pre-rekey` backup, rebuilt its keys, and the Jobs panel showed "Upgrading library My Samples —
+  Done. The library is ready."; `mso check` reports it intact and `folder:Loops` still finds 3 samples.
+- `mso bench --rows 100000 --repetitions 30` (release, medians, now with realistic 46-byte names, so not
+  comparable with the second round's short names), SQLite vs in-memory index: first page 0.64 vs
+  0.33 ms; folder click 9.99 vs 0.57 ms; duration sort 14.36 vs 0.33 ms; `bpm:120..130` 12.85 vs 3.04 ms;
+  folder filter with duration sort 85.67 vs 22.65 ms; ten pages 151.24 vs 1.64 ms; text `kick` 3.71 vs
+  22.41 ms; index load 296 ms; index memory 291 bytes/row after load, 333 with sort orders; a rating edit
+  committed and patched 1.34 ms (index patch alone 0.10 ms); a 1,000-row BPM edit 128 ms.
+- Not run here: fuzzing (deferred to P10); the GitHub CI legs of this round (they run on push).
 
 ## Second review round 2026-10-19 (second CODE_REVIEW.md): what changed
 
@@ -111,7 +265,8 @@ run failed tests (see "Not verified / known gaps"), and no Linux run is current.
   symbolized), plus a `fuzz` job (every target 60 s) and the lint job. ccache is restored and saved per
   leg with `actions/cache/save` under `if: always()`, so failed and cancelled runs still save it; MSYS2
   skips the base-system upgrade (`update: false`); runners pinned to `windows-2025`. The Linux job stays
-  parked and its comment now states its real last result. Not yet run on GitHub at the time of writing.
+  parked and its comment now states its real last result. The first GitHub run of these legs is recorded
+  under "CI on GitHub" in the third round; the fuzz job has been off since (deferred to P10).
 - Installer (`cmake/Packaging.cmake`): `CPACK_WIX_INSTALL_SCOPE perMachine` set explicitly (with CMake
   3.28 policies the WiX 3 default was a per-user registration of a Program Files install). The install
   tree and the MSI now carry `THIRD_PARTY_NOTICES.txt` (generated from the manifest: every shipped
@@ -169,7 +324,7 @@ run failed tests (see "Not verified / known gaps"), and no Linux run is current.
 
 **Analysis and worker** (analysis-worker)
 - `worker::decode_frames()` decodes a byte buffer as a peer reads its pipe (the fuzzing entry point).
-- The worker exits by itself within 2 s of Shutdown even when its task is stuck.
+- The worker exits by itself within 1 s of Shutdown even when its task is stuck (third round; it was 2 s).
 - New self-test faults `foreign-limits` and `excess-waveform-bins`.
 
 **Application and CLI** (app-cli)
@@ -183,8 +338,9 @@ run failed tests (see "Not verified / known gaps"), and no Linux run is current.
   de-duplicates by key. Structure changes still return `STALE_CURSOR`.
 - `Application::rows()` has an error channel (a missing key is omitted; a failure is an error).
 - `LibraryAccessChangedEvent`: a library opened read-only upgrades to writable once the CLI releases
-  its lock. Closing a library while a job or a load holds it waits up to 10 s, then returns a
-  retryable `DB_BUSY`.
+  its lock. Closing a library returns at once; *opening* it again while a job or a load still holds it
+  waits up to 10 s (`ApplicationOptions::close_wait`), then returns a retryable `DB_BUSY`. An index
+  cursor goes stale when rows are added or removed, when the taxonomy changes and on a reload.
 - CLI: `mso collection --delete` use-after-free fixed; see `docs/COMMAND_LINE.md` for exit 3 on a paused
   queue, the 35-minute stall limit and `backup` needing the lock.
 
@@ -196,20 +352,23 @@ run failed tests (see "Not verified / known gaps"), and no Linux run is current.
 - History is read on demand (when shown, after this window's edits, otherwise at most every 2 s while
   visible); navigator reads are coalesced to at most one per second per library.
 - New `AnalysisController` and `LayoutController`; new tests (`tests/ui_application_tests.cpp`).
-- The preview panel has an Output device menu and a Retry notice when the device disappears; actions on
-  a partly loaded huge selection ask the user to wait; the welcome text fits any window size; the
+- The preview panel has an Output device menu and a Retry notice when the device disappears. Since the
+  third round, edits and analysis act on the whole selection even when only part of it is loaded (keys
+  come from every page); only drag and copy need loaded rows. The welcome text fits any window size; the
   navigator menu no longer keeps item pointers across a nested event loop.
 
 **Audio preview** (audio)
 - Every epoch change decays the old level, so a seek while playing does not click.
-- Speed, pitch, mode, loop and seam-fade changes continue from the consumed position, so nothing is
-  replayed.
+- Speed, pitch, mode, loop and seam-fade changes continue from the consumed position instead of the
+  decoded one; the new epoch is published only after its first block is ready, so nothing is skipped;
+  at most one callback period can repeat (third `CODE_REVIEW.md` §4.8, partly fixed in the third round).
 - A lost output device is reported (`output_device_lost`) and re-opened automatically with backoff
   (500 ms doubling up to 10 s); `restart_output_device()` retries at once and resumes playback.
 - Every backend and device call runs on the engine's own output thread, so COM init and uninit are
   balanced.
 
-**Everywhere:** `[[nodiscard]]` on every function returning `mso::Result`.
+**Everywhere:** `[[nodiscard]]` on every public function returning `mso::Result` (the third review
+counted 250 of 252 declarations; the two without it were private `Workspace` members).
 
 ## First review round 2026-10-19 (CODE_REVIEW.md): what changed
 
@@ -297,8 +456,8 @@ run failed tests (see "Not verified / known gaps"), and no Linux run is current.
   | 10 consecutive pages | 119 ms | 0.28 ms |
 
   Loading the index takes 245–320 ms for 100K rows. A rating edit, committed and patched into the
-  index, takes 10 ms, mostly fsync. `folder:Loops` typed as query text takes 86 ms (`RowMatcher`
-  cost; a known follow-up).
+  index, takes 10 ms, mostly fsync. `folder:Loops` typed as query text took 86 ms (`RowMatcher`
+  cost); the second round fixed it (2.6–3.4 ms in memory, see its "Search" entry).
 - Library lock file `library.lock` (`LockFileEx` on Windows, `flock` on POSIX, `app/file_lock.hpp`): a
   library held by another process opens read-only (`OpenLibraryInfo::in_use_elsewhere`), so the CLI
   opens a library read-only while the desktop app holds it. Migrations and crash recovery run only
@@ -450,8 +609,9 @@ final state):
   `cmake --install` produces a folder whose `MusicSampleOrganizer.exe --exit-when-ready` and
   `mso.exe capabilities` run with only `C:\Windows\System32;C:\Windows` on `PATH`.
 - `python deps/update_deps.py --check`: 55 vendored files match the manifest. `--verify-upstream`:
-  every file matched its pinned upstream in content; 46 files differed in line endings only (fixed in
-  the second round by a re-fetch).
+  every file matched its pinned upstream in content; 46 files differed in line endings only (the count
+  of that run). The second round's re-fetch (`7115e88`) converted 44 vendored files to LF;
+  `readerwritercircularbuffer.h` stays CRLF because upstream ships it that way.
 
 ### Before the review round
 
@@ -486,8 +646,9 @@ final state):
 - CI runs on GitHub (`alonohana627/organize`). The Linux job (core, CLI, worker; release and
   ASan/UBSan) has never passed: its last run, 39229983572, failed `include-graph`, `cli` and `worker`
   (see above), and it is parked. The desktop app has never been built on Linux, and
-  `.github/scripts/build-qt-libcxx.sh` has not completed a run. The second round's Windows `ci-debug`,
-  `ci-sanitize`, `fuzz` and MSI steps have not run on GitHub yet.
+  `.github/scripts/build-qt-libcxx.sh` has not completed a run. The Windows legs passed their tests on
+  GitHub in run 39254087106, but with clang 22.1.8 and without the MSI (see "CI on GitHub"); a run
+  with the current toolchain and a built MSI is not recorded yet. The fuzz job is off (P10).
 - The MSI has not been installed and uninstalled on a clean PC, and its size is not recorded. Some of
   the 80 shipped MSYS2 packages (FFmpeg among them) carry no license file; `PACKAGES.txt` names their
   SPDX license (GPL-3.0 is `LICENSE` itself).

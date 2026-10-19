@@ -29,10 +29,19 @@ struct StbVorbisCloser {
     void operator()(stb_vorbis* stream) const noexcept { stb_vorbis_close(stream); }
 };
 
+/// The error for a read that failed part-way through the file, as FileHandle reports it.
+Error read_failure() {
+    return fail(ErrorCode::AccessDenied, "reading the file failed (the drive may have been disconnected)", true)
+        .error();
+}
+
 /// Streams float32 frames from an Ogg Vorbis file.
 class VorbisDecoder final : public Decoder {
 public:
-    explicit VorbisDecoder(std::unique_ptr<stb_vorbis, StbVorbisCloser> stream) : stream_(std::move(stream)) {
+    /// Takes the open stream and the stdio stream it reads (owned by `stream`, kept to check for
+    /// read errors: stb_vorbis treats a failed fread() like the end of the file).
+    VorbisDecoder(std::unique_ptr<stb_vorbis, StbVorbisCloser> stream, std::FILE* file)
+        : stream_(std::move(stream)), file_(file) {
         const stb_vorbis_info info = stb_vorbis_get_info(stream_.get());
         channels_ = info.channels;
         sample_rate_ = static_cast<int>(std::min<unsigned int>(info.sample_rate, std::numeric_limits<int>::max()));
@@ -54,6 +63,9 @@ public:
         const auto request = static_cast<int>(std::min(frames, max_frames) * channel_count);
         const int frames_read = stb_vorbis_get_samples_float_interleaved(stream_.get(), channels_, out, request);
         if (frames_read < 0) return fail(ErrorCode::CorruptAudio, "Vorbis decoding failed");
+        // Frames decoded before a failure are delivered; the next read reports it instead of
+        // ending playback silently, as if the file ended there.
+        if (frames_read == 0 && std::ferror(file_) != 0) return std::unexpected(read_failure());
         position_ += frames_read;
         return static_cast<std::size_t>(frames_read);
     }
@@ -69,7 +81,11 @@ public:
         if (frame > std::numeric_limits<unsigned int>::max()) {
             return fail(ErrorCode::InvalidArgument, "seek position exceeds the Vorbis decoder's range");
         }
+        // stdio keeps its error indicator through fseek(): clear it, so a seek after a transient
+        // failure (a drive that came back) reads afresh and a new failure is told from the old one.
+        std::clearerr(file_);
         if (!stb_vorbis_seek(stream_.get(), static_cast<unsigned int>(frame))) {
+            if (std::ferror(file_) != 0) return std::unexpected(read_failure());
             return fail(ErrorCode::CorruptAudio,
                         std::format("Vorbis seek failed (error {})", stb_vorbis_get_error(stream_.get())));
         }
@@ -79,6 +95,7 @@ public:
 
 private:
     std::unique_ptr<stb_vorbis, StbVorbisCloser> stream_;
+    std::FILE* file_;      ///< the stdio stream stb_vorbis reads (owned by stream_)
     bool at_end_ = false;  ///< positioned at the end by a seek; read() returns 0 until the next seek
     int channels_ = 0;
     int sample_rate_ = 0;
@@ -100,13 +117,15 @@ Result<std::unique_ptr<Decoder>> open_vorbis_decoder(const std::filesystem::path
     auto stream = handle->release_to_stdio();
     if (!stream) return std::unexpected(stream.error());
     int error = 0;
-    // close_on_free = 1: stb_vorbis owns the FILE* from here on, including when opening fails.
-    stb_vorbis* vorbis = stb_vorbis_open_file(*stream, 1, &error, nullptr);
+    // close_on_free = 1: stb_vorbis owns the FILE* from here on, including when opening fails (the
+    // decoder keeps the pointer only to ask ferror() while stb_vorbis holds it open).
+    std::FILE* const stdio_stream = *stream;
+    stb_vorbis* vorbis = stb_vorbis_open_file(stdio_stream, 1, &error, nullptr);
     if (vorbis == nullptr) return fail(ErrorCode::CorruptAudio, std::format("invalid Vorbis stream (error {})", error));
     std::unique_ptr<stb_vorbis, StbVorbisCloser> owned(vorbis);
     const stb_vorbis_info info = stb_vorbis_get_info(vorbis);
     if (info.channels < 1 || info.sample_rate < 1) return fail(ErrorCode::CorruptAudio, "Vorbis stream has no audio");
-    return std::unique_ptr<Decoder>(std::make_unique<VorbisDecoder>(std::move(owned)));
+    return std::unique_ptr<Decoder>(std::make_unique<VorbisDecoder>(std::move(owned), stdio_stream));
 }
 
 }  // namespace mso::media::detail

@@ -13,9 +13,13 @@
 #include <algorithm>
 #include <filesystem>
 #include <map>
+#include <optional>
+#include <set>
 #include <system_error>
+#include <vector>
 
 #include "mso/ui/application_session.hpp"
+#include "mso/ui/detail/parent_cycles.hpp"
 #include "mso/ui/display_format.hpp"
 #include "mso/ui/file_manager.hpp"
 
@@ -134,6 +138,7 @@ NavigatorPanel::LibraryOutline NavigatorPanel::read_outline(app::Application& ap
 void NavigatorPanel::reload() {
     if (!session_.is_ready()) return;
     const std::uint64_t generation = ++reload_generation_;
+    const std::uint64_t order = ++read_order_;
     ++outline_reads_started_;
     // A full read covers every pending per-library change; reads still in flight are superseded.
     for (auto& [library, state] : library_reloads_)
@@ -146,9 +151,21 @@ void NavigatorPanel::reload() {
                 outlines.push_back(read_outline(application, info));
             return outlines;
         },
-        [this, generation](std::vector<LibraryOutline> outlines) {
+        [this, generation, order](std::vector<LibraryOutline> outlines) {
             if (generation != reload_generation_) return;
             populate(outlines);
+            std::set<uuids::uuid> open;
+            for (const LibraryOutline& outline : outlines)
+                open.insert(outline.library);
+            // Closed libraries need no coalescing state any more.
+            std::erase_if(library_reloads_, [&open](const auto& entry) {
+                return !open.contains(entry.first) && !entry.second.in_flight;
+            });
+            // A per-library read that started after this full read and has already been shown was
+            // just replaced by this (older) outline: read that library again.
+            for (auto& [library, state] : library_reloads_)
+                if (state.started_order > order && !state.in_flight) state.dirty = true;
+            start_due_library_reloads();
         });
 }
 
@@ -171,7 +188,9 @@ void NavigatorPanel::start_due_library_reloads() {
         const qint64 remaining = kLibraryReloadIntervalMilliseconds - waited;
         next_due = next_due ? std::min(*next_due, remaining) : remaining;
     }
-    if (next_due && !library_reload_timer_.isActive()) library_reload_timer_.start(static_cast<int>(*next_due));
+    // One timer serves every library: it is moved earlier when another library is due sooner.
+    if (next_due && (!library_reload_timer_.isActive() || library_reload_timer_.remainingTime() > *next_due))
+        library_reload_timer_.start(static_cast<int>(*next_due));
 }
 
 void NavigatorPanel::start_library_read(const uuids::uuid& library) {
@@ -179,6 +198,7 @@ void NavigatorPanel::start_library_read(const uuids::uuid& library) {
     state.dirty = false;
     state.in_flight = true;
     state.last_started.start();
+    state.started_order = ++read_order_;
     ++outline_reads_started_;
     const std::uint64_t generation = reload_generation_;  // a full reload supersedes this one
     session_.run(
@@ -236,7 +256,9 @@ void NavigatorPanel::fill_library(QTreeWidgetItem* library_item, const LibraryOu
     library_item->setText(0, outline.read_only ? tr("%1 (read-only)").arg(outline.name) : outline.name);
     library_item->setData(0, KindRole, LibraryNode);
     library_item->setData(0, LibraryRole, DisplayFormat::from_uuid(outline.library));
-    library_item->setToolTip(0, outline.error.isEmpty() ? QString() : tr("Partly unreadable: %1").arg(outline.error));
+    library_item->setToolTip(0, outline.error.isEmpty()
+                                    ? QString()
+                                    : DisplayFormat::plain_tooltip(tr("Partly unreadable: %1").arg(outline.error)));
 
     auto* roots_group = make_item(library_item, tr("Folders"), RootsGroupNode, outline.library);
     for (const auto& root : outline.roots) {
@@ -262,7 +284,9 @@ void NavigatorPanel::fill_library(QTreeWidgetItem* library_item, const LibraryOu
         auto* item = make_item(collections_group, text, CollectionNode, outline.library);
         item->setData(0, IdRole, static_cast<qlonglong>(collection.id));
         item->setData(0, PathRole, name);
-        if (collection.query) item->setToolTip(0, tr("Query: %1").arg(DisplayFormat::from_utf8(*collection.query)));
+        if (collection.query)
+            item->setToolTip(
+                0, DisplayFormat::plain_tooltip(tr("Query: %1").arg(DisplayFormat::from_utf8(*collection.query))));
     }
 }
 
@@ -285,8 +309,10 @@ void NavigatorPanel::restore_tree_state(const QString& previous_identity, int sc
 void NavigatorPanel::add_taxonomy(QTreeWidgetItem* parent, const LibraryOutline& outline,
                                   const std::vector<catalog::TaxonomyNode>& nodes, int node_kind) {
     std::map<std::int64_t, QTreeWidgetItem*> items;
+    std::map<std::int64_t, std::optional<std::int64_t>> parent_of;
     for (const auto& node : nodes) {
         if (node.alias_of) continue;  // merged tags live on as redirects, not as tree nodes
+        parent_of.emplace(node.id, node.parent_id);
         auto* item = new QTreeWidgetItem(QStringList{
             tr("%1 (%2)").arg(DisplayFormat::from_utf8(node.name), DisplayFormat::count(node.sample_count))});
         item->setData(0, KindRole, node_kind);
@@ -295,10 +321,14 @@ void NavigatorPanel::add_taxonomy(QTreeWidgetItem* parent, const LibraryOutline&
         item->setData(0, PathRole, DisplayFormat::from_utf8(node.path));
         items.emplace(node.id, item);
     }
+    // Members of a parent cycle (a damaged catalog) hang under the group: an item attached only to
+    // the other items of its cycle would never be shown, nor freed with the tree.
+    const std::set<std::int64_t> on_cycle = detail::nodes_on_parent_cycles(parent_of);
     for (const auto& node : nodes) {
         const auto found = items.find(node.id);
         if (found == items.end()) continue;
-        const auto parent_item = node.parent_id ? items.find(*node.parent_id) : items.end();
+        const auto parent_item =
+            node.parent_id && !on_cycle.contains(node.id) ? items.find(*node.parent_id) : items.end();
         (parent_item != items.end() ? parent_item->second : parent)->addChild(found->second);
     }
 }
@@ -306,23 +336,29 @@ void NavigatorPanel::add_taxonomy(QTreeWidgetItem* parent, const LibraryOutline&
 void NavigatorPanel::add_folders(QTreeWidgetItem* root_item, const uuids::uuid& library, std::int64_t root_id,
                                  const std::vector<catalog::FolderRecord>& folders) {
     std::map<std::int64_t, QTreeWidgetItem*> items;
+    std::map<std::int64_t, std::optional<std::int64_t>> parent_of;
     for (const auto& folder : folders) {
         if (folder.relative_path.empty()) {
             items.emplace(folder.id, root_item);  // the root folder itself
             continue;
         }
+        parent_of.emplace(folder.id, folder.parent_id);
         auto* item = new QTreeWidgetItem(QStringList{DisplayFormat::from_utf8(folder.name)});
         item->setData(0, KindRole, FolderNode);
         item->setData(0, LibraryRole, DisplayFormat::from_uuid(library));
         item->setData(0, IdRole, static_cast<qlonglong>(folder.id));
         item->setData(0, RootRole, static_cast<qlonglong>(root_id));
         item->setData(0, PathRole, DisplayFormat::from_utf8(folder.relative_path));
-        item->setToolTip(0, DisplayFormat::from_utf8(folder.relative_path));
+        item->setToolTip(0, DisplayFormat::plain_tooltip(DisplayFormat::from_utf8(folder.relative_path)));
         items.emplace(folder.id, item);
     }
+    // Members of a parent cycle (a damaged catalog) hang under the group: an item attached only to
+    // the other items of its cycle would never be shown, nor freed with the tree.
+    const std::set<std::int64_t> on_cycle = detail::nodes_on_parent_cycles(parent_of);
     for (const auto& folder : folders) {
         if (folder.relative_path.empty()) continue;
-        const auto parent = folder.parent_id ? items.find(*folder.parent_id) : items.end();
+        const auto parent =
+            folder.parent_id && !on_cycle.contains(folder.id) ? items.find(*folder.parent_id) : items.end();
         (parent != items.end() ? parent->second : root_item)->addChild(items.at(folder.id));
     }
 }

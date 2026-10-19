@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <random>
 #include <set>
 
 #include <nlohmann/json.hpp>
 
+#include "mso/search/detail/row_statements.hpp"
 #include "mso/search/query_compiler.hpp"
 #include "mso/search/search_service.hpp"
 #include "test_support.hpp"
@@ -298,6 +300,9 @@ TEST_SUITE("search") {
         CHECK(parse_query("(\"a b\")").has_value());  // a parenthesis may follow a closing quote
         // Folders are addressed from a root down; leading separators are dropped.
         CHECK(parse_query("folder:/Drums")->root->predicate.text == "Drums");
+        CHECK(parse_query("folder:\" / Drums/Kicks \"")->root->predicate.text == "Drums/Kicks");  // spaces too
+        CHECK(parse_query("folder:\"/ / Drums\"")->root->predicate.text == "Drums");
+        CHECK_FALSE(parse_query("folder:\"/ /\"").has_value());
 #ifdef _WIN32
         // '\' is a separator only on Windows (as in path_key).
         CHECK(parse_query("folder:\"\\\\Drums/Kicks\"")->root->predicate.text == "Drums/Kicks");
@@ -656,9 +661,126 @@ TEST_SUITE("search") {
         mutate([](nlohmann::json& document) { document["ranked"] = "x"; });
         mutate([](nlohmann::json& document) { document["ranked"] = {{"library", -3}}; });
         mutate([](nlohmann::json& document) { document["ranked"] = {{"library", "3"}}; });
+        mutate([](nlohmann::json& document) { document["v"] = 3; });  // before hydration retries
+        for (const auto& retry : {nlohmann::json(-1), nlohmann::json(2), nlohmann::json("1"), nlohmann::json()})
+            mutate([&](nlohmann::json& document) {
+                for (auto& [library, state] : document["libraries"].items())
+                    state["retry"] = retry;
+            });
+        mutate([](nlohmann::json& document) {
+            for (auto& [library, state] : document["libraries"].items())
+                state.erase("retry");
+        });
+        mutate([](nlohmann::json& document) { document["retry"] = "x"; });
+        mutate([](nlohmann::json& document) { document["retry"] = {{"library", 2}}; });
         for (const auto& token : malformed) {
             CAPTURE(token);
             expect_stale(one, SearchRequest{.text = "kick", .page_size = 2, .cursor = Cursor{token}});
+        }
+    }
+
+    TEST_CASE("rows that fail to hydrate are retried once, then skipped, so paging always ends") {
+        ScratchDirectory scratch;
+        auto damaged = test::make_library(scratch / "a", paging_fixture(), "A");
+        auto healthy = test::make_library(scratch / "b", paging_fixture(), "B");
+        // Hiding the tag links from a second connection makes every load_rows of library A fail
+        // while its key queries (which never read sample_tags here) keep answering: a persistent
+        // hydration failure, like a damaged page under the rows.
+        const auto set_hydration_failing = [&](bool failing) {
+            auto connection =
+                sqlite::Connection::open(scratch / "a" / std::string(catalog::Library::kCatalogFileName), {});
+            REQUIRE(connection.has_value());
+            auto renamed = connection->execute_script(failing ? "ALTER TABLE sample_tags RENAME TO sample_tags_hidden"
+                                                              : "ALTER TABLE sample_tags_hidden RENAME TO sample_tags");
+            if (!renamed) FAIL(renamed.error().message());
+            connection->close();
+        };
+        catalog::Library* only_damaged[] = {damaged.library.get()};
+        catalog::Library* both[] = {damaged.library.get(), healthy.library.get()};
+        const auto damaged_uuid = damaged.library->uuid();
+        constexpr std::size_t kPageSize = 5;
+
+        struct Walk {
+            std::vector<std::int64_t> healthy_ids;  ///< rows of library B, in delivered order
+            std::vector<std::int64_t> damaged_ids;  ///< rows of library A, in delivered order
+            int pages = 0;
+            int pages_reporting_damage = 0;  ///< pages whose coverage marks A incomplete
+            bool healthy_always_complete = true;
+        };
+        const auto walk = [&](std::span<catalog::Library* const> libraries, SearchRequest request) {
+            Walk result;
+            for (int guard = 0; guard < 100; ++guard) {
+                auto page = SearchService().search(libraries, request);
+                REQUIRE(page.has_value());
+                ++result.pages;
+                for (const auto& row : page->rows) {
+                    if (row.library == damaged_uuid)
+                        result.damaged_ids.push_back(row.sample_id);
+                    else
+                        result.healthy_ids.push_back(row.sample_id);
+                }
+                for (const auto& coverage : page->coverage) {
+                    if (coverage.library == damaged_uuid && !coverage.complete) {
+                        CHECK(coverage.error.has_value());
+                        ++result.pages_reporting_damage;
+                    }
+                    if (coverage.library != damaged_uuid) result.healthy_always_complete &= coverage.complete;
+                }
+                if (!page->next) return result;
+                request.cursor = page->next;
+            }
+            FAIL("paging did not end");
+            return result;
+        };
+
+        set_hydration_failing(true);
+        for (const auto& request :
+             {SearchRequest{.page_size = kPageSize},
+              SearchRequest{.sort = SortField::Duration, .descending = true, .page_size = kPageSize},
+              SearchRequest{.text = "sample", .sort = SortField::Relevance, .page_size = kPageSize}}) {
+            CAPTURE(to_string(request.sort));
+            // Alone: every page fails; each batch of keys is offered twice (once retried), then
+            // skipped, so 12 rows end after 2 × ceil(12 / 5) = 6 pages.
+            const auto alone = walk(only_damaged, request);
+            CHECK(alone.damaged_ids.empty());
+            CHECK(alone.pages == 6);
+            CHECK(alone.pages_reporting_damage == 6);
+            // Federated: the healthy library still delivers every row exactly once, in its own order.
+            SearchRequest healthy_alone = request;
+            healthy_alone.page_size = SearchService::kMaxPageSize;
+            catalog::Library* only_healthy[] = {healthy.library.get()};
+            auto reference = SearchService().search(only_healthy, healthy_alone);
+            REQUIRE(reference.has_value());
+            std::vector<std::int64_t> expected;
+            for (const auto& row : reference->rows)
+                expected.push_back(row.sample_id);
+            const auto federated = walk(both, request);
+            CHECK(federated.damaged_ids.empty());
+            CHECK(federated.healthy_ids == expected);
+            CHECK(federated.healthy_always_complete);
+            CHECK(federated.pages_reporting_damage > 0);
+        }
+        set_hydration_failing(false);
+
+        // A transient failure is retried: the rows of the failed page arrive on the next one.
+        for (const auto& request :
+             {SearchRequest{.page_size = kPageSize},
+              SearchRequest{.text = "sample", .sort = SortField::Relevance, .page_size = kPageSize}}) {
+            CAPTURE(to_string(request.sort));
+            set_hydration_failing(true);
+            auto failed = SearchService().search(only_damaged, request);
+            REQUIRE(failed.has_value());
+            CHECK(failed->rows.empty());
+            CHECK_FALSE(failed->coverage.front().complete);
+            REQUIRE(failed->next.has_value());
+            set_hydration_failing(false);
+            SearchRequest rest = request;
+            rest.cursor = failed->next;
+            const auto recovered = walk(only_damaged, rest);
+            CHECK(recovered.pages_reporting_damage == 0);
+            const auto expected = single_page(*damaged.library, request);
+            CHECK(expected.size() == 12);
+            CHECK(recovered.damaged_ids == expected);
         }
     }
 
@@ -1040,6 +1162,96 @@ TEST_SUITE("search") {
             CHECK(rows.at(row.sample_id).tag_paths == row.tag_paths);  // search pages hydrate the same way
     }
 
+    TEST_CASE("for_each_row stops at its token, ends its snapshot and reports CANCELLED") {
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", paging_fixture());
+        auto& library = *populated.library;
+        std::stop_source stop;
+        int visited = 0;
+        auto streamed = for_each_row(library, stop.get_token(), [&](SampleRow&&) {
+            if (++visited == 3) stop.request_stop();
+        });
+        REQUIRE_FALSE(streamed.has_value());
+        CHECK(streamed.error().code == ErrorCode::Cancelled);
+        CHECK(visited == 3);  // no row after the token fired
+        std::stop_source stopped;
+        stopped.request_stop();
+        visited = 0;
+        auto never = for_each_row(library, stopped.get_token(), [&](SampleRow&&) { ++visited; });
+        REQUIRE_FALSE(never.has_value());
+        CHECK(never.error().code == ErrorCode::Cancelled);
+        CHECK(visited == 0);
+        // The snapshot ended with the call: a checkpoint can truncate the whole log, which an open
+        // read transaction would prevent, and the next stream reads every row.
+        {
+            auto connection =
+                sqlite::Connection::open(scratch / "lib" / std::string(catalog::Library::kCatalogFileName), {});
+            REQUIRE(connection.has_value());
+            auto checkpoint = connection->prepare("PRAGMA wal_checkpoint(TRUNCATE)");
+            REQUIRE(checkpoint.has_value());
+            auto has_row = checkpoint->next_row();
+            REQUIRE(has_row.has_value());
+            REQUIRE(*has_row);
+            CHECK(checkpoint->column_int64(0) == 0);  // not blocked by a reader
+        }
+        visited = 0;
+        REQUIRE(for_each_row(library, std::stop_token(), [&](SampleRow&&) { ++visited; }).has_value());
+        CHECK(visited == 12);
+    }
+
+    TEST_CASE("row hydration reads samples, locations and tags by id, never by a scan (query plans)") {
+        // load_rows of one id must cost the same in a 1M-row library as in a small one; for_each_row
+        // streams in id order without sorting the whole library.
+        ScratchDirectory scratch;
+        auto populated = test::make_library(scratch / "lib", paging_fixture());
+        auto reader = populated.library->acquire_reader();
+        REQUIRE(reader.has_value());
+        const auto plan_of = [&](const std::string& sql) {
+            auto plan = reader->connection().prepare("EXPLAIN QUERY PLAN " + sql);
+            REQUIRE(plan.has_value());
+            std::vector<std::string> lines;
+            while (true) {
+                auto has_row = plan->next_row();
+                REQUIRE(has_row.has_value());
+                if (!*has_row) break;
+                lines.push_back(plan->column_text(3));
+            }
+            return lines;
+        };
+        const auto contains = [](const std::vector<std::string>& lines, std::string_view text) {
+            return std::ranges::any_of(lines, [&](const std::string& line) { return line.contains(text); });
+        };
+        const auto by_id = detail::row_statements(true);
+        const auto samples = plan_of(by_id.samples);
+        CAPTURE(std::format("{}", samples));
+        CHECK(contains(samples, "SEARCH s USING INTEGER PRIMARY KEY"));
+        CHECK_FALSE(contains(samples, "SCAN s"));
+        CHECK_FALSE(contains(samples, "TEMP B-TREE"));
+        const auto locations = plan_of(by_id.locations);
+        CAPTURE(std::format("{}", locations));
+        CHECK(contains(locations, "SEARCH l USING INDEX locations_sample (sample_id=?)"));
+        CHECK_FALSE(contains(locations, "SCAN l"));
+        // Ranking the few locations of each sample is the only sort ("LAST 3 TERMS OF ORDER BY").
+        for (const auto& line : locations)
+            if (line.contains("TEMP B-TREE")) CHECK(line.contains("LAST"));
+        const auto tags = plan_of(by_id.tags);
+        CAPTURE(std::format("{}", tags));
+        CHECK(contains(tags, "SEARCH st USING COVERING INDEX"));
+        CHECK_FALSE(contains(tags, "SCAN st"));
+        CHECK_FALSE(contains(tags, "TEMP B-TREE"));
+
+        const auto whole = detail::row_statements(false);
+        const auto all_samples = plan_of(whole.samples);
+        CAPTURE(std::format("{}", all_samples));
+        CHECK(contains(all_samples, "SCAN s"));  // in rowid order: the stream's own order
+        CHECK_FALSE(contains(all_samples, "TEMP B-TREE"));
+        const auto all_tags = plan_of(whole.tags);
+        CAPTURE(std::format("{}", all_tags));
+        CHECK_FALSE(contains(all_tags, "TEMP B-TREE"));
+        for (const auto& line : plan_of(whole.locations))
+            if (line.contains("TEMP B-TREE")) CHECK(line.contains("LAST"));
+    }
+
     TEST_CASE("matching_ids returns exactly the matches in ascending id order") {
         ScratchDirectory scratch;
         auto rich = make_rich_library(scratch / "lib");
@@ -1103,9 +1315,16 @@ TEST_SUITE("search") {
             REQUIRE(sql.has_value());
             std::vector<std::int64_t> memory;
             RowMatcher matcher(*query, std::span(&*aliases, 1));
+            // Tags and a category without ids yet (added optimistically) are decided by path, once.
+            RowMatcher path_matcher(*query, std::span(&*aliases, 1));
             for (const auto& [id, row] : rows) {
                 if (matcher(row)) memory.push_back(id);
                 CHECK(matches(*query, row, std::span(&*aliases, 1)) == matcher(row));
+                SampleRow without_ids = row;
+                std::ranges::fill(without_ids.tag_ids, 0);
+                without_ids.category_id.reset();
+                CHECK(path_matcher(without_ids) == matcher(row));
+                CHECK(path_matcher(without_ids) == matcher(row));  // the remembered decision
             }
             CHECK(memory == *sql);
         }
@@ -1172,6 +1391,107 @@ TEST_SUITE("search") {
             const auto ordered = single_page(library, SearchRequest{.text = text});  // paged, name order
             CHECK(ordered.size() == memory.size());
         }
+
+        // With the library's revision the plan is chosen once per revision, library size and
+        // condition. Locations changed behind the cache's back (no new revision) keep the
+        // remembered plan, and the results stay exact; the next committed change chooses again.
+        const auto compiled_at_revision = [&](std::string_view text) {
+            auto reader = library.acquire_reader();
+            REQUIRE(reader.has_value());
+            const LibraryRevision revision{library.uuid(), library.identity().catalog_revision};
+            auto compiled = compile_query(*parse_query(text), reader->connection(), revision);
+            REQUIRE(compiled.has_value());
+            return compiled->sql;
+        };
+        CHECK(compiled_at_revision("folder:Rare").starts_with("s.id IN ("));
+        {
+            auto connection =
+                sqlite::Connection::open(scratch / "lib" / std::string(catalog::Library::kCatalogFileName), {});
+            REQUIRE(connection.has_value());
+            // Keys keep the stored spelling ("RARE/..." on this case-insensitive root).
+            REQUIRE(connection
+                        ->execute_script("UPDATE locations SET path_key=(SELECT substr(path_key,1,5) FROM locations "
+                                         "WHERE path_key LIKE 'rare/%')||path_key WHERE path_key LIKE 'common/%'")
+                        .has_value());
+            connection->close();
+        }
+        CHECK(compiled_sql("folder:Rare").starts_with("EXISTS("));            // counted again: broad now
+        CHECK(compiled_at_revision("folder:Rare").starts_with("s.id IN ("));  // remembered
+        CHECK(count_of(library, "folder:Rare") == 64);                        // either plan is exact
+        CHECK(count_of(library, "", {.root_id = populated.root_id, .folder = "rare"}) == 64);
+        catalog::EditCommand rate;
+        rate.sample_ids = {1};
+        rate.rating = 3;
+        REQUIRE(library.apply_edit(rate).has_value());
+        CHECK(compiled_at_revision("folder:Rare").starts_with("EXISTS("));  // a new revision counts again
+        CHECK(count_of(library, "folder:Rare") == 64);
+    }
+
+    TEST_CASE("location conditions read locations through their indexes, never by a scan (query plans)") {
+        // The partial index locations_live_path is used only when a statement repeats its
+        // `state<>'retired'` predicate (CODE_REVIEW §6 theme 1): every location condition the
+        // compiler emits is explained here.
+        ScratchDirectory scratch;
+        std::vector<catalog::ScannedFile> files;
+        for (int index = 0; index < 64; ++index)
+            files.push_back(test::synthetic_file(
+                std::format("{}/file {:02}.wav", index == 0 ? "Rare" : "Common", index), 100 + index, 1000));
+        auto populated = test::make_library(scratch / "lib", files);
+        auto& library = *populated.library;
+        auto reader = library.acquire_reader();
+        REQUIRE(reader.has_value());
+        auto& connection = reader->connection();
+        const auto plan_of = [&](const std::string& sql) {
+            auto plan = connection.prepare("EXPLAIN QUERY PLAN " + sql);
+            REQUIRE(plan.has_value());
+            std::vector<std::string> lines;
+            while (true) {
+                auto has_row = plan->next_row();
+                REQUIRE(has_row.has_value());
+                if (!*has_row) break;
+                lines.push_back(plan->column_text(3));
+            }
+            return lines;
+        };
+        const auto explain_filter = [&](std::string_view text, Scope scope, std::string_view expected_index) {
+            CAPTURE(text);
+            const auto query = parse_query(text);
+            REQUIRE(query.has_value());
+            auto compiled = compile_query(*query, connection);
+            REQUIRE(compiled.has_value());
+            std::string sql = std::format(
+                "SELECT s.id FROM samples s LEFT JOIN effective_metadata e ON e.sample_id=s.id WHERE s.deleted=0 AND "
+                "({})",
+                compiled->sql);
+            if (scope.root_id) {
+                SqlPredicate condition{"fl.root_id=?", {*scope.root_id}};
+                if (scope.folder) {
+                    condition.sql += " AND fl.path_key>=? AND fl.path_key<?";
+                    condition.parameters.emplace_back(path_key(*scope.folder + '/', false));
+                    condition.parameters.emplace_back(path_key(*scope.folder + '0', false));
+                }
+                auto filtered = primary_location_filter(connection, condition);
+                REQUIRE(filtered.has_value());
+                sql += std::format(" AND ({})", filtered->sql);
+            }
+            const auto lines = plan_of(sql);
+            CAPTURE(sql);
+            CHECK_MESSAGE(
+                std::ranges::any_of(lines, [&](const std::string& line) { return line.contains(expected_index); }),
+                std::format("{}", lines));
+            for (const auto& line : lines) {
+                CAPTURE(line);
+                CHECK_FALSE((line.starts_with("SCAN fl") || line.starts_with("SCAN l ") || line == "SCAN l" ||
+                             line.starts_with("SCAN al") || line.starts_with("SCAN locations")));
+            }
+        };
+        explain_filter("folder:Rare", {}, "locations_live_path");  // index-driven: a range of the partial index
+        explain_filter("NOT folder:Rare", {}, "locations_live_path");
+        explain_filter("folder:Common", {}, "locations_sample");  // streaming: the primary location per sample
+        explain_filter("", {.root_id = populated.root_id, .folder = "Rare"}, "locations_live_path");
+        explain_filter("", {.root_id = populated.root_id}, "locations_sample");
+        explain_filter("available:true", {}, "locations_sample");
+        explain_filter("available:false folder:Rare", {}, "locations_live_path");
     }
 
     TEST_CASE("a merged tag keeps matching by its old name, in queries and smart collections") {
@@ -1317,10 +1637,13 @@ TEST_SUITE("search") {
         std::mt19937_64 random(20261019);
         static constexpr std::string_view kFolders[] = {"Drums/Kicks", "Drums/Snares", "Loops/House", "FX/Risers"};
         static constexpr std::string_view kWords[] = {"kick", "snare", "hat", "clap", "bass", "pad"};
-        constexpr std::int64_t kRows = 100'000;
+        // MSO_SEARCH_BENCHMARK_ROWS overrides the size (a multiple of 500), e.g. 1000000 for D1M.
+        const char* const rows_override = std::getenv("MSO_SEARCH_BENCHMARK_ROWS");
+        const std::int64_t row_count =
+            rows_override != nullptr ? std::max<std::int64_t>(500, std::atoll(rows_override) / 500 * 500) : 100'000;
         auto session = library.begin_scan(root->id);
         REQUIRE(session.has_value());
-        for (std::int64_t first = 0; first < kRows; first += 500) {
+        for (std::int64_t first = 0; first < row_count; first += 500) {
             std::vector<catalog::ScannedFile> batch;
             for (std::int64_t index = first; index < first + 500; ++index) {
                 auto file = test::synthetic_file(
@@ -1336,7 +1659,7 @@ TEST_SUITE("search") {
         }
         REQUIRE(library.finish_scan(*session, false).has_value());
         catalog::EditCommand tag;
-        for (std::int64_t id = 1; id <= kRows; id += 3)
+        for (std::int64_t id = 1; id <= row_count; id += 3)
             tag.sample_ids.push_back(id);
         tag.tags_add = {"Drums/Kick", "Bench"};
         tag.category = std::optional<std::string>("Drums/Kicks");
@@ -1350,11 +1673,30 @@ TEST_SUITE("search") {
         std::int64_t streamed = 0;
         const double stream_ms =
             time([&] { REQUIRE(for_each_row(library, [&](SampleRow&&) { ++streamed; }).has_value()); });
-        CHECK(streamed == kRows);
+        CHECK(streamed == row_count);
         std::vector<std::int64_t> page_ids;
         for (std::int64_t id = 1; id <= 200; ++id)
-            page_ids.push_back(id * 397 % kRows + 1);
+            page_ids.push_back(id * 397 % row_count + 1);
         const double load_ms = time([&] { REQUIRE(load_rows(library, page_ids)->size() == 200); });
+        // One edited row, as the application's index re-reads it after an edit.
+        const std::int64_t edited_id[] = {row_count / 2};
+        std::array<double, 5> single_runs{};
+        for (auto& run : single_runs)
+            run = time([&] { REQUIRE(load_rows(library, edited_id)->size() == 1); });
+        std::ranges::sort(single_runs);
+        const double load_one_ms = single_runs[single_runs.size() / 2];
+        // matching_ids, which the application uses for full-text queries: a text term, and a
+        // selective metadata condition.
+        const auto ids_ms = [&](std::string text) {
+            std::array<double, 5> runs{};
+            for (auto& run : runs)
+                run = time([&] { REQUIRE(matching_ids(library, SearchRequest{.text = text}).has_value()); });
+            std::ranges::sort(runs);
+            return runs[runs.size() / 2];
+        };
+        const double text_ids_ms = ids_ms("kick");
+        const double bpm_ids_ms = ids_ms("bpm:120");
+        const double rare_text_ids_ms = ids_ms(std::format("{:07}", row_count / 2));  // one file name
         catalog::Library* scope[] = {&library};
         const double page_ms =
             time([&] { REQUIRE(SearchService().search(scope, SearchRequest{})->rows.size() == 200); });
@@ -1401,9 +1743,30 @@ TEST_SUITE("search") {
         };
         const double broad_count_ms = median_ms([&] { CHECK(count_of(library, "folder:Loops") > 0); });
         const double selective_count_ms =
-            median_ms([&] { CHECK(count_of(library, "folder:Packs/Goa") == kRows / 100); });
+            median_ms([&] { CHECK(count_of(library, "folder:Packs/Goa") == row_count / 100); });
         const double broad_page_ms = sql_page_ms("folder:Loops");
         const double selective_page_ms = sql_page_ms("folder:Packs/Goa");
+        // The second page of the same folder: what scrolling through a large folder pays per page.
+        const auto sql_second_page_ms = [&](std::string text) {
+            auto first_page = SearchService().search(scope, SearchRequest{.text = text});
+            REQUIRE(first_page.has_value());
+            REQUIRE(first_page->next.has_value());
+            const SearchRequest second{.text = text, .cursor = first_page->next};
+            return median_ms([&] { CHECK_FALSE(SearchService().search(scope, second)->rows.empty()); });
+        };
+        const double broad_second_page_ms = sql_second_page_ms("folder:Loops");
+        const double selective_second_page_ms = sql_second_page_ms("folder:Packs/Goa");
+        // Compiling alone (no plan cache): the candidate count that picks the folder plan.
+        const auto compile_ms = [&](std::string_view text) {
+            auto parsed = parse_query(text);
+            REQUIRE(parsed.has_value());
+            return median_ms([&] {
+                auto reader = library.acquire_reader();
+                REQUIRE(reader.has_value());
+                CHECK(compile_query(*parsed, reader->connection()).has_value());
+            });
+        };
+        const double broad_compile_ms = compile_ms("folder:Loops");
         // docs/06: a filtered first page within 150 ms p95 (D1M). In memory at 100K rows the filters
         // must stay far inside it; this is a release-build benchmark (see SKILLS/add-search-field).
         CHECK(page_ms < 150.0);
@@ -1414,12 +1777,16 @@ TEST_SUITE("search") {
         CHECK(broad_page_ms < 150.0);
         CHECK(selective_page_ms < 150.0);
         MESSAGE(std::format(
-            "for_each_row {} rows: {:.0f} ms; load_rows 200: {:.1f} ms; first page: {:.1f} ms; RowMatcher over {} "
+            "for_each_row {} rows: {:.0f} ms; load_rows 200: {:.1f} ms; load_rows 1: {:.2f} ms; matching_ids one name "
+            "{:.2f} ms, kick "
+            "{:.1f} ms, bpm:120 {:.1f} ms; first page: {:.1f} ms; "
+            "RowMatcher over {} "
             "rows: {:.1f} ms; in memory: folder:Loops {:.2f} ms, tag:Kick {:.2f} ms, codec:pcm {:.2f} ms; SQL "
-            "folder:Loops count {:.1f} ms, first page {:.1f} ms; SQL folder:Packs/Goa (1%) count {:.1f} ms, first page "
-            "{:.1f} ms",
-            streamed, stream_ms, load_ms, page_ms, rows.size(), match_ms, folder_memory_ms, tag_memory_ms,
-            codec_memory_ms, broad_count_ms, broad_page_ms, selective_count_ms, selective_page_ms));
+            "folder:Loops compile {:.2f} ms, count {:.1f} ms, first page {:.1f} ms, second page {:.1f} ms; SQL "
+            "folder:Packs/Goa (1%) count {:.1f} ms, first page {:.1f} ms, second page {:.1f} ms",
+            streamed, stream_ms, load_ms, load_one_ms, rare_text_ids_ms, text_ids_ms, bpm_ids_ms, page_ms, rows.size(),
+            match_ms, folder_memory_ms, tag_memory_ms, codec_memory_ms, broad_compile_ms, broad_count_ms, broad_page_ms,
+            broad_second_page_ms, selective_count_ms, selective_page_ms, selective_second_page_ms));
     }
 
 }  // TEST_SUITE("search")

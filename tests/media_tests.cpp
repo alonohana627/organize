@@ -666,6 +666,149 @@ bool memory_not_measurable() {
     return unmeasurable;
 }
 
+// ---------------------------------------------------------------- hand-built Vorbis streams
+
+/// An Ogg Vorbis stream at 44.1 kHz: the identification and comment headers, `setup` (the setup
+/// header's fields after its "\x05vorbis" prefix), then `audio_packets` copies of `audio_packet`,
+/// one packet per page. Each short-block packet adds 128 frames after the first, so the last
+/// granule is (audio_packets - 1) * 128.
+Bytes vorbis_stream_with_setup(std::uint8_t channels, const Bytes& setup, const Bytes& audio_packet,
+                               int audio_packets) {
+    ByteWriter comment_packet;
+    comment_packet.u8(3).text("vorbis").bytes(vorbis_comment_block({})).u8(1);
+    ByteWriter setup_packet;
+    setup_packet.u8(5).text("vorbis").bytes(setup);
+    std::vector<Bytes> packets{vorbis_identification(channels, 44100), comment_packet.result(), setup_packet.result()};
+    for (int packet = 0; packet < audio_packets; ++packet)
+        packets.push_back(audio_packet);
+    return ogg_stream(packets, 0x5AB, static_cast<std::uint64_t>(audio_packets - 1) * 128);
+}
+
+/// Appends the setup fields every hand-built stream shares after its codebooks and floors: one
+/// unused time-domain transform before them is written by the caller; this writes one residue that
+/// covers nothing (type 0, one classification, class book 0).
+void write_empty_residue(BitWriter& setup) {
+    setup.bits(0, 6);                                       // one residue
+    setup.bits(0, 16).bits(0, 24).bits(0, 24).bits(0, 24);  // type 0, begin 0, end 0, partition size 1
+    setup.bits(0, 6).bits(0, 8).bits(0, 3).bits(0, 1);      // one classification, book 0, no cascade
+}
+
+/// Appends one mode (short blocks, mapping 0) and the framing bit.
+void write_mode_and_framing(BitWriter& setup) {
+    setup.bits(0, 6).bits(0, 1).bits(0, 16).bits(0, 16).bits(0, 8);
+    setup.bits(1, 1);
+}
+
+/// A stereo stream whose mapping has sixteen submaps, the most the format allows: channel 0 in
+/// submap 0, channel 1 in submap 15, and submap 15 using floor 1 while every other submap uses
+/// floor 0. Unpatched stb_vorbis kept only fifteen submaps: submap 15's floor (1) overwrote submap
+/// 0's residue, which then named residue 1 of a stream that has one. Every floor is unused in every
+/// packet, so the stream decodes to silence.
+Bytes sixteen_submap_stream(int audio_packets) {
+    BitWriter setup;
+    setup.bits(0, 8);                                   // one codebook
+    setup.bits(0x42, 8).bits(0x43, 8).bits(0x56, 8);    // "BCV"
+    setup.bits(1, 16).bits(2, 24);                      // one dimension, two entries
+    setup.bits(0, 1).bits(0, 1).bits(0, 5).bits(0, 5);  // not ordered, not sparse, two 1-bit codewords
+    setup.bits(0, 4);                                   // no lookup table
+    setup.bits(0, 6).bits(0, 16);                       // one time-domain transform (unused)
+    setup.bits(1, 6);                                   // two floors
+    for (int floor = 0; floor < 2; ++floor)
+        setup.bits(1, 16).bits(0, 5).bits(1, 2).bits(8, 4);  // floor 1, no partitions, multiplier 2, 8 range bits
+    write_empty_residue(setup);
+    setup.bits(0, 6);                          // one mapping
+    setup.bits(0, 16).bits(1, 1).bits(15, 4);  // type 0, sixteen submaps
+    setup.bits(0, 1).bits(0, 2);               // no coupling, reserved bits
+    setup.bits(0, 4).bits(15, 4);              // channel 0 in submap 0, channel 1 in submap 15
+    for (int submap = 0; submap < 16; ++submap)
+        setup.bits(0, 8).bits(submap == 15 ? 1 : 0, 8).bits(0, 8);  // time (unused), floor, residue
+    write_mode_and_framing(setup);
+    return vorbis_stream_with_setup(2, setup.result(), Bytes{0x00}, audio_packets);  // audio, mode 0, floors unused
+}
+
+/// A mono stream whose floor decodes its one partition with a sparse codebook that has no used
+/// entry. Such a codebook has no sorted value table, and every packet sets the floor's "used" bit,
+/// so the decode fails (-1); unpatched stb_vorbis then looked up sorted_values[-1] through a null
+/// pointer (GHSL-2023-172).
+Bytes empty_sparse_codebook_stream(int audio_packets) {
+    BitWriter setup;
+    setup.bits(0, 8).bits(0x42, 8).bits(0x43, 8).bits(0x56, 8);  // one codebook, "BCV"
+    setup.bits(1, 16).bits(8, 24);                               // one dimension, eight entries
+    setup.bits(0, 1).bits(1, 1);                                 // not ordered, sparse
+    for (int entry = 0; entry < 8; ++entry)
+        setup.bits(0, 1);                      // no entry used (eight, so stb_vorbis keeps the codebook sparse)
+    setup.bits(0, 4);                          // no lookup table
+    setup.bits(0, 6).bits(0, 16);              // one time-domain transform (unused)
+    setup.bits(0, 6);                          // one floor
+    setup.bits(1, 16).bits(1, 5).bits(0, 4);   // floor 1, one partition of class 0
+    setup.bits(0, 3).bits(0, 2).bits(1, 8);    // class 0: one dimension, no subclasses, codebook 0
+    setup.bits(1, 2).bits(8, 4).bits(128, 8);  // multiplier 2, 8 range bits, X = 128
+    write_empty_residue(setup);
+    setup.bits(0, 6).bits(0, 16).bits(0, 1).bits(0, 1).bits(0, 2);  // one mapping, one submap, no coupling
+    setup.bits(0, 8).bits(0, 8).bits(0, 8);                         // submap 0: floor 0, residue 0
+    write_mode_and_framing(setup);
+    return vorbis_stream_with_setup(1, setup.result(), Bytes{0x02, 0x00, 0x00, 0x00}, audio_packets);
+}
+
+/// True when every sample is exactly zero.
+bool all_silent(const std::vector<float>& samples) {
+    return std::ranges::all_of(samples, [](float sample) { return sample == 0.0f; });
+}
+
+#ifdef _WIN32
+/// Locks a byte range of a file through a handle of its own, so reads of that range through any
+/// other handle fail (ERROR_LOCK_VIOLATION) the way reads fail when a drive drops out part-way,
+/// until the lock is released.
+class LockedRange {
+public:
+    LockedRange(const fs::path& file, std::uint64_t offset, std::uint64_t length) {
+        handle_ = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        overlapped_.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFu);
+        overlapped_.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        length_ = length;
+        held_ = LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0,
+                           static_cast<DWORD>(length & 0xFFFFFFFFu), static_cast<DWORD>(length >> 32),
+                           &overlapped_) != FALSE;
+    }
+    LockedRange(const LockedRange&) = delete;
+    LockedRange& operator=(const LockedRange&) = delete;
+    ~LockedRange() { release(); }
+
+    /// True while the range is locked.
+    bool held() const { return held_; }
+    /// Unlocks the range and closes the handle.
+    void release() {
+        if (held_) {
+            UnlockFileEx(handle_, 0, static_cast<DWORD>(length_ & 0xFFFFFFFFu), static_cast<DWORD>(length_ >> 32),
+                         &overlapped_);
+            held_ = false;
+        }
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+    }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    OVERLAPPED overlapped_{};
+    std::uint64_t length_ = 0;
+    bool held_ = false;
+};
+
+/// Reads until the decoder fails or ends; returns the failure (or nullopt at a clean end) and
+/// adds the frames read to `frames`.
+std::optional<mso::Error> read_until_failure(Decoder& decoder, std::int64_t& frames) {
+    std::vector<float> block(4096 * static_cast<std::size_t>(decoder.channels()));
+    while (true) {
+        const auto count = decoder.read(std::span<float>(block));
+        if (!count) return count.error();
+        if (*count == 0) return std::nullopt;
+        frames += static_cast<std::int64_t>(*count);
+    }
+}
+#endif
+
 }  // namespace
 
 TEST_SUITE("media") {
@@ -2255,6 +2398,182 @@ TEST_SUITE("media") {
         REQUIRE(probe.has_value());
         CHECK(probe->codec == "pcm_s16");
         CHECK(probe->bit_depth == 16);
+    }
+
+    // ---------------------------------------------------------------- third review round
+
+    TEST_CASE("stb_vorbis keeps all sixteen submaps of a mapping and decodes the stream cleanly") {
+        // patches/miniaudio/0001 (GHSL-2023-168): Mapping held fifteen submaps. The sanitize preset
+        // turns the old out-of-bounds write and the residue_config[1] read into failures; every
+        // build checks that the stream decodes completely, as the silence it is.
+        constexpr int kAudioPackets = 8;
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("sixteen_submaps.ogg");
+        write_bytes(file, sixteen_submap_stream(kAudioPackets));
+        auto decoder = detail::open_vorbis_decoder(file, ProbeResult{});
+        REQUIRE_MESSAGE(decoder.has_value(), (decoder ? std::string() : decoder.error().message()));
+        CHECK((*decoder)->channels() == 2);
+        CHECK((*decoder)->total_frames() == (kAudioPackets - 1) * 128);
+        const std::vector<float> samples = read_all(**decoder);
+        CHECK(samples.size() == static_cast<std::size_t>((kAudioPackets - 1) * 128 * 2));
+        CHECK(all_silent(samples));
+        // Through the public entry points too.
+        const auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        CHECK(probe->codec == "vorbis");
+        auto opened = open_decoder(file);
+        REQUIRE(opened.has_value());
+        CHECK((*opened)->codec() == "vorbis");
+        CHECK(all_silent(read_all(**opened)));
+    }
+
+    TEST_CASE("A sparse Vorbis codebook with no used entry decodes as silence, not through a null table") {
+        // patches/miniaudio/0001 (GHSL-2023-172): DECODE looked up sorted_values[-1] after a failed
+        // decode, and this codebook has no sorted_values at all (an access violation in release).
+        constexpr int kAudioPackets = 8;
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("empty_sparse_codebook.ogg");
+        write_bytes(file, empty_sparse_codebook_stream(kAudioPackets));
+        auto decoder = detail::open_vorbis_decoder(file, ProbeResult{});
+        REQUIRE_MESSAGE(decoder.has_value(), (decoder ? std::string() : decoder.error().message()));
+        const std::vector<float> samples = read_all(**decoder);
+        CHECK(samples.size() == static_cast<std::size_t>((kAudioPackets - 1) * 128));
+        CHECK(all_silent(samples));
+    }
+
+#ifdef _WIN32
+    TEST_CASE("A Vorbis read that fails part-way is reported, and a seek afterwards reads afresh") {
+        // stb_vorbis treats a failed fread() as the end of the file; the decoder checks ferror() so a
+        // drive that drops out is not mistaken for the end of the sample, and clears the stdio error
+        // on seek so the file reads again once the drive is back.
+        constexpr int kAudioPackets = 20'000;  // about 600 KB, far beyond stdio's buffer
+        constexpr std::int64_t kFrames = (kAudioPackets - 1) * 128;
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("long.ogg");
+        write_bytes(file, sixteen_submap_stream(kAudioPackets));
+        auto decoder = detail::open_vorbis_decoder(file, ProbeResult{});
+        REQUIRE(decoder.has_value());
+        REQUIRE((*decoder)->total_frames() == kFrames);
+        const std::uint64_t size = fs::file_size(file);
+        {
+            LockedRange locked(file, size / 2, size - size / 2);
+            REQUIRE(locked.held());
+            std::int64_t frames = 0;
+            const std::optional<mso::Error> failure = read_until_failure(**decoder, frames);
+            REQUIRE(failure.has_value());
+            CHECK(failure->code == ErrorCode::AccessDenied);
+            CHECK(failure->retryable);
+            CHECK(frames > 0);
+            CHECK(frames < kFrames);
+        }
+        REQUIRE((*decoder)->seek(0).has_value());
+        CHECK(read_all(**decoder).size() == static_cast<std::size_t>(kFrames * 2));
+    }
+
+#ifdef MSO_HAVE_FFMPEG
+    TEST_CASE("An FFmpeg read that fails part-way is reported, and is forgotten after a seek") {
+        // FfmpegInput kept its last read error forever, so after one failure every later end of the
+        // stream reported it again; a seek now starts afresh.
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("long.wav");
+        mso::test::write_sine_wav(file, 10.0, 440.0);
+        const auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        REQUIRE(probe->frames.has_value());
+        // Without the probe's exact count the decoder reads on to the demuxer's end of file, where a
+        // stale error used to resurface.
+        auto decoder = detail::open_ffmpeg_decoder(file, ProbeResult{});
+        REQUIRE_MESSAGE(decoder.has_value(), (decoder ? std::string() : decoder.error().message()));
+        REQUIRE_FALSE((*decoder)->frames_exact());
+        const std::uint64_t size = fs::file_size(file);
+        {
+            LockedRange locked(file, size / 2, size - size / 2);
+            REQUIRE(locked.held());
+            std::int64_t frames = 0;
+            const std::optional<mso::Error> failure = read_until_failure(**decoder, frames);
+            REQUIRE(failure.has_value());
+            CHECK(failure->code == ErrorCode::AccessDenied);
+            CHECK(frames < *probe->frames);
+        }
+        REQUIRE((*decoder)->seek(0).has_value());
+        CHECK(static_cast<std::int64_t>(read_all(**decoder).size()) ==
+              *probe->frames * static_cast<std::int64_t>((*decoder)->channels()));
+    }
+#endif
+#endif
+
+#ifdef MSO_HAVE_FFMPEG
+    TEST_CASE("Vorbis decoded by FFmpeg reports its length as an estimate" *
+              doctest::skip(skip_without_ffmpeg_backend())) {
+        // FFmpeg's Vorbis decoder delivers 128 frames fewer than the granule count, so the probe's
+        // exact count is not exact on this backend.
+        REQUIRE_MESSAGE(executable_on_path("ffmpeg"), "MSO_REQUIRE_FFMPEG=1 but ffmpeg is not on PATH");
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("ffmpeg_vorbis.ogg");
+        REQUIRE(render_with_ffmpeg(file, "-c:a libvorbis"));
+        const auto probe = probe_file(file);
+        REQUIRE(probe.has_value());
+        REQUIRE(probe->frames == 44100);
+        CHECK(probe->duration_exact);
+        auto decoder = detail::open_ffmpeg_decoder(file, *probe);
+        REQUIRE(decoder.has_value());
+        CHECK_FALSE((*decoder)->frames_exact());
+        CHECK((*decoder)->total_frames() == 44100);
+        const auto frames = static_cast<std::int64_t>(read_all(**decoder).size() / 2);
+        CHECK(frames < 44100);
+        CHECK(frames >= 44100 - 2048);
+    }
+
+    TEST_CASE("A rate change part-way keeps the samples the old resampler still held" *
+              doctest::skip(skip_without_ffmpeg_backend())) {
+        // convert_frame() drains the resampler before replacing it; without that its conversion
+        // delay (dozens of frames) was lost at every change. Each part decoded on its own gives the
+        // exact count to expect.
+        REQUIRE_MESSAGE(executable_on_path("ffmpeg"), "MSO_REQUIRE_FFMPEG=1 but ffmpeg is not on PATH");
+        ScratchDirectory directory("media");
+        const fs::path at_44100 = directory.file("at_44100.aac");
+        const fs::path at_48000 = directory.file("at_48000.aac");
+        REQUIRE(render_with_ffmpeg(at_44100, "-c:a aac -b:a 128k", 44100, 2));
+        REQUIRE(render_with_ffmpeg(at_48000, "-c:a aac -b:a 128k", 48000, 2));
+        const fs::path joined = directory.file("rate_change.aac");
+        mso::test::write_file(joined, mso::test::read_file(at_44100) + mso::test::read_file(at_48000));
+        const auto frames_of = [](const fs::path& file) {
+            auto decoder = open_decoder(file);
+            REQUIRE(decoder.has_value());
+            return static_cast<std::int64_t>(read_all(**decoder).size() / 2);
+        };
+        const std::int64_t first = frames_of(at_44100);
+        const std::int64_t second = frames_of(at_48000);
+        const auto expected =
+            first + static_cast<std::int64_t>(std::llround(static_cast<double>(second) * 44100 / 48000));
+        const std::int64_t frames = frames_of(joined);
+        CAPTURE(first);
+        CAPTURE(second);
+        CHECK(std::abs(frames - expected) <= 2);
+    }
+#endif
+
+    TEST_CASE("BoundedFileReader's read-ahead stays within the byte budget however scattered the reads are") {
+        ScratchDirectory directory("media");
+        const fs::path file = directory.file("scattered.bin");
+        Bytes content(1 << 20);
+        for (std::size_t index = 0; index < content.size(); ++index)
+            content[index] = static_cast<std::uint8_t>(index * 7);
+        write_bytes(file, content);
+        constexpr std::uint64_t kBudget = 64 * 1024;
+        auto reader = detail::BoundedFileReader::open(file, ProbeLimits{kBudget, std::chrono::milliseconds(5000)});
+        REQUIRE(reader.has_value());
+        // 4-byte reads 20 KiB apart: each misses the last window and would refill a whole one.
+        int reads = 0;
+        for (std::uint64_t offset = 0; offset + 4 <= content.size(); offset += 20 * 1024) {
+            const auto bytes = reader->read_exact(offset, 4);
+            REQUIRE(bytes.has_value());
+            CHECK(std::equal(bytes->begin(), bytes->end(), content.begin() + static_cast<std::ptrdiff_t>(offset)));
+            ++reads;
+        }
+        CHECK(reader->bytes_read() == static_cast<std::uint64_t>(reads) * 4);
+        CHECK(reader->bytes_fetched() <= 2 * kBudget);
+        CHECK(reader->bytes_fetched() >= reader->bytes_read());
     }
 
 }  // TEST_SUITE("media")

@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <condition_variable>
-#include <deque>
 #include <format>
 #include <fstream>
 #include <iterator>
@@ -17,6 +16,8 @@
 #include <nlohmann/json.hpp>
 
 #include "mso/app/analysis_supervisor.hpp"
+#include "mso/app/detail/index_maintainer.hpp"
+#include "mso/app/detail/open_progress_relay.hpp"
 #include "mso/app/file_lock.hpp"
 #include "mso/app/metadata_export.hpp"
 #include "mso/catalog/root_paths.hpp"
@@ -27,17 +28,9 @@ namespace mso::app {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
-
 constexpr auto kRootPollInterval = std::chrono::seconds(2);
-/// Catch-up interval of the index maintenance thread when nobody asked for an update.
-constexpr auto kIndexPollInterval = std::chrono::seconds(1);
-/// Above this many changed rows an event asks for a full reload instead of listing them.
-constexpr std::size_t kMaximumEventSampleIds = 4096;
 constexpr std::string_view kAutomaticProfilePreference = "analysis.automatic_profile";
 constexpr std::string_view kDefaultAutomaticProfile = "Full";
-/// Runs listed in an AnalysisProgressEvent.
-constexpr std::size_t kRunsPerProgressEvent = 20;
 
 /// Depth of event-handler calls on this thread (set_event_handler must not wait for itself).
 thread_local int event_handler_depth = 0;
@@ -75,49 +68,9 @@ std::string safe_folder_name(std::string_view name) {
     return folder;
 }
 
-/// An INTERNAL error for an exception caught by a thread barrier.
-Error internal_error(std::string_view where, const std::exception& exception) {
-    return Error{ErrorCode::Internal, true, std::format("{}: {}", where, exception.what()), std::nullopt, std::nullopt};
-}
-
 }  // namespace
 
-/// One open library: its lock, catalog, index and announcement state. Shared by everything that
-/// works on it, so close_library() never destroys it under running work.
-struct Application::LibraryEntry {
-    /// Changes of this library waiting to be announced (coalescing state).
-    struct PendingAnnouncement {
-        std::vector<std::int64_t> sample_ids;
-        bool structure_changed = false;
-        bool full_reload = false;
-        bool catalog_pending = false;
-        std::optional<std::string> analysis_status;
-        Clock::time_point last_catalog_event{};
-        Clock::time_point last_analysis_event{};
-        std::string last_reported_error;  ///< repeated identical background errors are reported once
-    };
-
-    FileLock lock;  ///< first member: released last, after the catalog is closed
-    std::unique_ptr<catalog::Library> library;
-    std::unique_ptr<SampleIndex> index;  ///< null when ApplicationOptions::in_memory_index is off
-    /// The library did not fit the index budget: it is answered from SQLite (index stays cleared).
-    std::atomic<bool> index_disabled{false};
-    uuids::uuid uuid;
-    std::string name;  ///< cached: identity() takes the writer mutex, which imports hold for long
-    bool in_use_elsewhere = false;
-    std::stop_source closing;  ///< cancels an index load when the library closes
-    std::atomic<bool> update_requested{false};
-    std::mutex announcement_mutex;
-    PendingAnnouncement pending;
-
-    /// True when searches and rows of this library can be answered from its index right now.
-    bool index_usable() const { return index && !index_disabled.load(std::memory_order_acquire) && index->ready(); }
-
-    ~LibraryEntry() {
-        index.reset();
-        library.reset();  // close the catalog before the lock is released
-    }
-};
+using detail::LibraryEntry;
 
 struct Application::State {
     /// A queued or running background operation.
@@ -157,20 +110,19 @@ struct Application::State {
 
     std::unique_ptr<AnalysisSupervisor> supervisor;
 
-    std::mutex maintenance_mutex;
-    std::condition_variable_any maintenance_wake;
-    bool maintenance_requested = false;
-    std::mutex loads_mutex;
-    std::condition_variable_any loads_wake;
-    std::deque<std::weak_ptr<LibraryEntry>> load_queue;
+    /// Index maintenance and loading threads, with the coalesced announcements. Started by
+    /// Application::start() and stopped explicitly by ~Application().
+    detail::IndexMaintainer indexes;
 
     // Threads last: they start after everything above exists and are joined explicitly.
-    std::jthread index_loader;
-    std::jthread index_maintainer;
     std::jthread root_monitor;
 
     State(ApplicationOptions application_options, Workspace loaded)
-        : options(std::move(application_options)), workspace(std::move(loaded)) {}
+        : options(std::move(application_options)),
+          workspace(std::move(loaded)),
+          indexes(detail::IndexMaintainer::Services{[this] { return entry_snapshot(); },
+                                                    [this](const ApplicationEvent& event) { emit(event); }},
+                  options.index_row_limit) {}
 
     // ------------------------------------------------------------ events
 
@@ -281,226 +233,6 @@ struct Application::State {
             return fail(ErrorCode::SourceOffline, "the drive or folder holding this sample is not connected");
         return fail(ErrorCode::FileMissing, "the file is no longer at its recorded location");
     }
-
-    // ------------------------------------------------------------ index maintenance
-
-    void wake_maintainer() {
-        {
-            std::lock_guard lock(maintenance_mutex);
-            maintenance_requested = true;
-        }
-        maintenance_wake.notify_all();
-    }
-
-    void request_update(LibraryEntry& entry) {
-        entry.update_requested.store(true, std::memory_order_release);
-        wake_maintainer();
-    }
-
-    void queue_load(const std::shared_ptr<LibraryEntry>& entry) {
-        {
-            std::lock_guard lock(loads_mutex);
-            load_queue.push_back(entry);
-        }
-        loads_wake.notify_all();
-    }
-
-    /// Marks changes for the next coalesced CatalogChangedEvent.
-    void note_catalog_change(LibraryEntry& entry, const std::vector<std::int64_t>& sample_ids, bool structure_changed,
-                             bool full_reload) {
-        {
-            std::lock_guard lock(entry.announcement_mutex);
-            auto& pending = entry.pending;
-            pending.catalog_pending = true;
-            pending.structure_changed = pending.structure_changed || structure_changed;
-            pending.full_reload = pending.full_reload || full_reload;
-            if (!pending.full_reload) {
-                pending.sample_ids.insert(pending.sample_ids.end(), sample_ids.begin(), sample_ids.end());
-                if (pending.sample_ids.size() > kMaximumEventSampleIds) pending.full_reload = true;
-            }
-            if (pending.full_reload) pending.sample_ids.clear();
-        }
-        wake_maintainer();
-    }
-
-    void note_analysis_status(LibraryEntry& entry, std::string status) {
-        {
-            std::lock_guard lock(entry.announcement_mutex);
-            entry.pending.analysis_status = std::move(status);
-        }
-        wake_maintainer();
-    }
-
-    /// Reports a background error once per distinct message and library.
-    void report_once(LibraryEntry& entry, std::string context, const Error& error) {
-        {
-            std::lock_guard lock(entry.announcement_mutex);
-            const auto message = context + ": " + error.message();
-            if (entry.pending.last_reported_error == message) return;
-            entry.pending.last_reported_error = message;
-        }
-        report(entry.uuid, std::move(context), error);
-    }
-
-    /// Rows the indexes of the other open libraries hold (their share of the row budget).
-    std::size_t indexed_rows_except(const LibraryEntry& excluded) const {
-        std::size_t rows = 0;
-        for (const auto& entry : entry_snapshot())
-            if (entry.get() != &excluded && entry->index_usable()) rows += entry->index->size();
-        return rows;
-    }
-
-    /// The index budget left for one library.
-    std::size_t index_allowance(const LibraryEntry& entry) const {
-        const std::size_t others = indexed_rows_except(entry);
-        return options.index_row_limit > others ? options.index_row_limit - others : 0;
-    }
-
-    /// Answers a library from SQLite from now on: frees its index and tells views to re-query.
-    void disable_index(LibraryEntry& entry, const Error& reason) {
-        entry.index_disabled.store(true, std::memory_order_release);
-        entry.index->clear();
-        report_once(entry, "keeping the library in memory (searching it in the database instead)", reason);
-        note_catalog_change(entry, {}, true, true);
-    }
-
-    /// Brings one index up to date with its library's outbox (any thread).
-    void update_index(const std::shared_ptr<LibraryEntry>& entry) {
-        if (!entry->index || entry->index_disabled.load(std::memory_order_acquire)) {
-            // Without an index nothing knows which rows changed: ask views to re-query.
-            note_catalog_change(*entry, {}, true, true);
-            return;
-        }
-        if (!entry->index->ready()) return;  // the loader catches up after the load
-        auto change = entry->index->synchronize(*entry->library);
-        if (!change) {
-            report_once(*entry, "updating the sample index", change.error());
-            return;
-        }
-        if (change->acknowledge_error)
-            report_once(*entry, "recording the sample index position", *change->acknowledge_error);
-        if (change->reload_required) {
-            queue_load(entry);
-            return;
-        }
-        if (change->rows_added_or_removed && entry->index->size() > index_allowance(*entry)) {
-            disable_index(
-                *entry,
-                Error{
-                    ErrorCode::ResourceLimit, false, "the open libraries grew past the in-memory index limit", {}, {}});
-            return;
-        }
-        if (!change->empty())
-            note_catalog_change(*entry, change->sample_ids, change->structure_changed, change->rows_added_or_removed);
-    }
-
-    /// Emits the coalesced events of one library that are due; returns when the next one is due.
-    std::optional<Clock::time_point> announce(LibraryEntry& entry, Clock::time_point now) {
-        std::optional<CatalogChangedEvent> catalog_event;
-        std::optional<std::string> analysis_status;
-        std::optional<Clock::time_point> next_due;
-        {
-            std::lock_guard lock(entry.announcement_mutex);
-            auto& pending = entry.pending;
-            if (pending.catalog_pending) {
-                if (now - pending.last_catalog_event >= Application::kEventInterval) {
-                    catalog_event = CatalogChangedEvent{entry.uuid, std::move(pending.sample_ids),
-                                                        pending.structure_changed, pending.full_reload};
-                    pending.sample_ids = {};
-                    pending.structure_changed = pending.full_reload = pending.catalog_pending = false;
-                    pending.last_catalog_event = now;
-                } else {
-                    next_due = pending.last_catalog_event + Application::kEventInterval;
-                }
-            }
-            if (pending.analysis_status) {
-                if (now - pending.last_analysis_event >= Application::kEventInterval) {
-                    analysis_status = std::move(pending.analysis_status);
-                    pending.analysis_status.reset();
-                    pending.last_analysis_event = now;
-                } else {
-                    const auto due = pending.last_analysis_event + Application::kEventInterval;
-                    next_due = next_due ? std::min(*next_due, due) : due;
-                }
-            }
-        }
-        if (catalog_event) {
-            std::ranges::sort(catalog_event->sample_ids);
-            catalog_event->sample_ids.erase(std::ranges::unique(catalog_event->sample_ids).begin(),
-                                            catalog_event->sample_ids.end());
-            emit(*catalog_event);
-        }
-        if (analysis_status) {
-            AnalysisProgressEvent event{entry.uuid, {}, std::move(*analysis_status)};
-            if (auto runs = entry.library->list_analysis_runs(kRunsPerProgressEvent))
-                event.runs = std::move(*runs);
-            else
-                report_once(entry, "listing analysis runs", runs.error());
-            emit(event);
-        }
-        return next_due;
-    }
-
-    /// Body of the index maintenance thread: incremental updates and coalesced announcements.
-    void maintain_indexes(std::stop_token stop) {
-        auto next_poll = Clock::now() + kIndexPollInterval;
-        while (!stop.stop_requested()) {
-            std::optional<Clock::time_point> next_due;
-            // Exception barrier per pass: report and keep maintaining.
-            try {
-                auto now = Clock::now();
-                const bool poll = now >= next_poll;
-                if (poll) next_poll = now + kIndexPollInterval;
-                for (const auto& entry : entry_snapshot()) {
-                    if (entry->update_requested.exchange(false, std::memory_order_acq_rel) ||
-                        (poll && entry->index && entry->index->ready()))
-                        update_index(entry);
-                    if (auto due = announce(*entry, Clock::now()); due)
-                        next_due = next_due ? std::min(*next_due, *due) : *due;
-                }
-            } catch (const std::exception& exception) {
-                report(std::nullopt, "maintaining the sample indexes", internal_error("index maintenance", exception));
-            }
-            const auto wake_at = next_due ? std::min(*next_due, next_poll) : next_poll;
-            std::unique_lock lock(maintenance_mutex);
-            maintenance_wake.wait_until(lock, stop, wake_at, [&] { return maintenance_requested; });
-            maintenance_requested = false;
-        }
-    }
-
-    /// Body of the index loader thread: full loads (at open and when the outbox asks for one).
-    void load_indexes(std::stop_token stop) {
-        while (!stop.stop_requested()) {
-            std::shared_ptr<LibraryEntry> entry;
-            {
-                std::unique_lock lock(loads_mutex);
-                loads_wake.wait(lock, stop, [&] { return !load_queue.empty(); });
-                if (stop.stop_requested()) return;
-                entry = load_queue.front().lock();
-                load_queue.pop_front();
-            }
-            if (!entry || !entry->index || entry->index_disabled.load(std::memory_order_acquire))
-                continue;  // closed meanwhile, or answered from SQLite
-            try {
-                auto loaded = entry->index->load(*entry->library, entry->closing.get_token(), index_allowance(*entry));
-                if (!loaded) {
-                    if (loaded.error().code == ErrorCode::ResourceLimit)
-                        disable_index(*entry, loaded.error());
-                    else if (loaded.error().code != ErrorCode::Cancelled)
-                        report(entry->uuid, "loading the sample index", loaded.error());
-                    continue;
-                }
-                if (entry->index_disabled.load(std::memory_order_acquire)) {
-                    entry->index->clear();  // disabled while it loaded: SQLite answers, free the rows
-                    continue;
-                }
-                update_index(entry);  // catch up with what was committed during the load
-                note_catalog_change(*entry, {}, true, true);
-            } catch (const std::exception& exception) {
-                report(entry->uuid, "loading the sample index", internal_error("index loader", exception));
-            }
-        }
-    }
 };
 
 // ---------------------------------------------------------------- lifetime
@@ -526,8 +258,7 @@ Application::~Application() {
     // 4. Index maintenance; abort loads in progress.
     for (const auto& entry : state.entry_snapshot())
         entry->closing.request_stop();
-    state.index_loader = {};
-    state.index_maintainer = {};
+    state.indexes.stop();
     // 5. Libraries (each closes its catalog, then releases its lock).
     std::lock_guard lock(state.libraries_mutex);
     state.libraries.clear();
@@ -539,10 +270,10 @@ Result<std::unique_ptr<Application>> Application::start(const ApplicationOptions
     auto state = std::make_unique<State>(options, std::move(*workspace));
     std::unique_ptr<Application> application(new Application(std::move(state)));
     auto& shared = *application->state_;
+    if (options.event_handler) application->set_event_handler(options.event_handler);
 
     shared.import_pool = std::make_unique<BS::thread_pool<>>(std::max<std::size_t>(1, options.import_threads));
-    shared.index_loader = std::jthread([&shared](std::stop_token stop) { shared.load_indexes(stop); });
-    shared.index_maintainer = std::jthread([&shared](std::stop_token stop) { shared.maintain_indexes(stop); });
+    shared.indexes.start();
 
     // The supervisor exists before any library opens, so the paused-after-crash check in
     // open_library() applies to every library, including the ones reopened here.
@@ -559,8 +290,8 @@ Result<std::unique_ptr<Application>> Application::start(const ApplicationOptions
             },
             [&shared](catalog::Library& library, const std::string& status) {
                 if (auto entry = shared.find(library.uuid())) {
-                    shared.note_analysis_status(*entry, status);
-                    shared.request_update(*entry);
+                    shared.indexes.note_analysis_status(*entry, status);
+                    shared.indexes.request_update(*entry);
                 }
             },
             [&shared](catalog::Library* library, const std::string& context, const Error& error) {
@@ -587,7 +318,7 @@ Result<std::unique_ptr<Application>> Application::start(const ApplicationOptions
                 shared.report(std::nullopt, "creating the default library", created.error());
         for (const auto& entry : shared.entry_snapshot()) {
             if (entry->library->read_only()) continue;
-            auto roots = entry->library->list_roots();
+            auto roots = entry->library->list_roots(catalog::RootListing::WithoutSampleCounts);
             if (!roots) {
                 shared.report(entry->uuid, "listing sample folders", roots.error());
                 continue;
@@ -608,7 +339,7 @@ Result<std::unique_ptr<Application>> Application::start(const ApplicationOptions
                     owner->refresh_root_availability();
                 } catch (const std::exception& exception) {
                     owner->state_->report(std::nullopt, "checking sample folders",
-                                          internal_error("root monitor", exception));
+                                          detail::internal_error("root monitor", exception));
                 }
                 std::unique_lock lock(sleep_mutex);
                 sleeper.wait_for(lock, stop, kRootPollInterval, [] { return false; });
@@ -635,8 +366,17 @@ namespace {
 /// The OpenLibraryInfo of an open library.
 OpenLibraryInfo describe(const catalog::Library& library, const uuids::uuid& uuid, const std::string& name,
                          bool in_use_elsewhere, std::int64_t root_count) {
-    return OpenLibraryInfo{uuid, name, library.directory(), library.read_only(), in_use_elsewhere, root_count};
+    const auto& recovery = library.recovery_report();
+    return OpenLibraryInfo{uuid,
+                           name,
+                           library.directory(),
+                           library.read_only(),
+                           in_use_elsewhere,
+                           root_count,
+                           recovery.key_conflicts,
+                           recovery.pre_rekey_backup};
 }
+
 }  // namespace
 
 std::shared_ptr<catalog::Library> Application::hold_library(const uuids::uuid& library) const {
@@ -647,7 +387,7 @@ std::shared_ptr<catalog::Library> Application::hold_library(const uuids::uuid& l
 }
 
 void Application::request_index_update(const uuids::uuid& library) const {
-    if (auto entry = state_->find(library)) state_->request_update(*entry);
+    if (auto entry = state_->find(library)) state_->indexes.request_update(*entry);
 }
 
 Result<OpenLibraryInfo> Application::create_library(const std::filesystem::path& directory, std::string_view name) {
@@ -720,6 +460,8 @@ Result<OpenLibraryInfo> Application::open_library(const std::filesystem::path& d
     auto entry = std::make_shared<LibraryEntry>();
     entry->uuid = *manifest_uuid;
     catalog::OpenOptions open_options;
+    open_options.on_progress = detail::open_progress_relay(
+        [&state](const ApplicationEvent& event) { state.emit(event); }, *manifest_uuid, folder);
     const auto lock_file = folder / FileLock::kLibraryLockFileName;
     std::error_code exists_error;
     const bool lock_file_existed = std::filesystem::exists(lock_file, exists_error);
@@ -763,7 +505,7 @@ Result<OpenLibraryInfo> Application::open_library(const std::filesystem::path& d
     entry->library = std::move(*opened);
     entry->name = entry->library->identity().name;
     if (state.options.in_memory_index) entry->index = std::make_unique<SampleIndex>(entry->uuid);
-    auto roots = entry->library->list_roots();
+    auto roots = entry->library->list_roots(catalog::RootListing::WithoutSampleCounts);
     const auto info = describe(*entry->library, entry->uuid, entry->name, entry->in_use_elsewhere,
                                roots ? static_cast<std::int64_t>(roots->size()) : 0);
 
@@ -784,9 +526,9 @@ Result<OpenLibraryInfo> Application::open_library(const std::filesystem::path& d
                 state.workspace.remember_library(KnownLibrary{info.uuid, info.name, info.directory, true});
             !remembered)
             state.report(info.uuid, "remembering the library in the workspace", remembered.error());
-    if (entry->index) state.queue_load(entry);
-    state.note_catalog_change(*entry, {}, true, true);
-    if (interrupted_analysis) state.note_analysis_status(*entry, "paused after an unclean shutdown");
+    if (entry->index) state.indexes.queue_load(entry);
+    state.indexes.note_catalog_change(*entry, {}, true, true);
+    if (interrupted_analysis) state.indexes.note_analysis_status(*entry, "paused after an unclean shutdown");
     if (state.supervisor) state.supervisor->notify();
     return info;
 }
@@ -809,6 +551,8 @@ Result<void> Application::close_library(const uuids::uuid& uuid) {
             if (operation->library == uuid) operation->stop.request_stop();
     }
     entry.reset();  // destroyed here unless running work still holds it
+    // Its rows no longer count against the index budget: a library answered from SQLite may fit now.
+    state_->indexes.request_budget_recheck();
     if (!state_->options.persist_open_libraries) return {};
     return state_->workspace.set_library_open(uuid, false);
 }
@@ -816,7 +560,7 @@ Result<void> Application::close_library(const uuids::uuid& uuid) {
 std::vector<OpenLibraryInfo> Application::libraries() const {
     std::vector<OpenLibraryInfo> infos;
     for (const auto& entry : state_->entry_snapshot()) {
-        auto roots = entry->library->list_roots();
+        auto roots = entry->library->list_roots(catalog::RootListing::WithoutSampleCounts);
         infos.push_back(describe(*entry->library, entry->uuid, entry->name, entry->in_use_elsewhere,
                                  roots ? static_cast<std::int64_t>(roots->size()) : 0));
     }
@@ -860,7 +604,7 @@ Result<catalog::RootRecord> Application::add_root(const uuids::uuid& library_uui
         root->availability = catalog::Availability::Online;
         state_->emit(RootAvailabilityEvent{library_uuid, root->id, catalog::Availability::Online});
     }
-    state_->request_update(*entry);
+    state_->indexes.request_update(*entry);
     return root;
 }
 
@@ -876,9 +620,12 @@ void Application::retry_read_only_libraries() {
         auto upgraded = std::make_shared<LibraryEntry>();
         upgraded->uuid = entry->uuid;
         upgraded->lock = std::move(*lock);
-        auto opened = catalog::Library::open(folder, catalog::OpenOptions{});
+        catalog::OpenOptions open_options;
+        open_options.on_progress = detail::open_progress_relay(
+            [&state](const ApplicationEvent& event) { state.emit(event); }, entry->uuid, folder);
+        auto opened = catalog::Library::open(folder, open_options);
         if (!opened) {
-            state.report_once(*entry, "opening the library for changes", opened.error());
+            state.indexes.report_once(*entry, "opening the library for changes", opened.error());
             continue;
         }
         if ((*opened)->uuid() != entry->uuid) continue;  // the folder now holds another library
@@ -894,14 +641,14 @@ void Application::retry_read_only_libraries() {
         entry->closing.request_stop();  // its index load, if any, is no longer needed
         const bool interrupted_analysis = upgraded->library->recovery_report().interrupted_jobs > 0;
         if (interrupted_analysis && state.supervisor) state.supervisor->set_paused(true);
-        if (upgraded->index) state.queue_load(upgraded);
-        state.note_catalog_change(*upgraded, {}, true, true);
-        if (interrupted_analysis) state.note_analysis_status(*upgraded, "paused after an unclean shutdown");
+        if (upgraded->index) state.indexes.queue_load(upgraded);
+        state.indexes.note_catalog_change(*upgraded, {}, true, true);
+        if (interrupted_analysis) state.indexes.note_analysis_status(*upgraded, "paused after an unclean shutdown");
         state.emit(LibraryAccessChangedEvent{upgraded->uuid, false, false});
         if (state.supervisor) state.supervisor->notify();
         // Desktop: what changed while the other process held the library is picked up now.
         if (state.options.automatic_mode)
-            if (auto roots = upgraded->library->list_roots())
+            if (auto roots = upgraded->library->list_roots(catalog::RootListing::WithoutSampleCounts))
                 for (const auto& root : *roots)
                     if (auto started = start_import(upgraded->uuid, root.id);
                         !started && started.error().code != ErrorCode::DbBusy)
@@ -913,7 +660,7 @@ Result<void> Application::rebind_root(const uuids::uuid& library_uuid, std::int6
                                       const std::filesystem::path& folder) {
     auto entry = state_->find(library_uuid);
     if (!entry) return fail(ErrorCode::NotFound, "library is not open");
-    auto roots = entry->library->list_roots();
+    auto roots = entry->library->list_roots(catalog::RootListing::WithoutSampleCounts);
     if (!roots) return std::unexpected(roots.error());
     const auto root = std::ranges::find(*roots, root_id, &catalog::RootRecord::id);
     if (root == roots->end()) return fail(ErrorCode::NotFound, "no such root");
@@ -946,9 +693,9 @@ void Application::refresh_root_availability() {
     if (auto reloaded = state.workspace.reload_if_changed(); !reloaded) state.report_workspace_once(reloaded.error());
     for (const auto& entry : state.entry_snapshot()) {
         if (entry->library->read_only()) continue;
-        auto roots = entry->library->list_roots();
+        auto roots = entry->library->list_roots(catalog::RootListing::WithoutSampleCounts);
         if (!roots) {
-            state.report_once(*entry, "listing sample folders", roots.error());
+            state.indexes.report_once(*entry, "listing sample folders", roots.error());
             continue;
         }
         for (const auto& root : *roots) {
@@ -959,11 +706,12 @@ void Application::refresh_root_availability() {
             if (now == root.availability || (root.availability == catalog::Availability::Unknown && reachable))
                 continue;
             if (auto changed = entry->library->set_root_availability(root.id, now); !changed) {
-                state.report_once(*entry, std::format("updating the availability of '{}'", root.name), changed.error());
+                state.indexes.report_once(*entry, std::format("updating the availability of '{}'", root.name),
+                                          changed.error());
                 continue;
             }
             state.emit(RootAvailabilityEvent{entry->uuid, root.id, now});
-            state.request_update(*entry);
+            state.indexes.request_update(*entry);
             // Desktop: a folder that comes back is rescanned (files may have changed while away).
             if (state.options.automatic_mode && now == catalog::Availability::Online)
                 if (auto started = start_import(entry->uuid, root.id);
@@ -980,7 +728,7 @@ Result<files::ImportSummary> Application::import_now(const uuids::uuid& library_
                                                      const files::ImportProgressCallback& progress) {
     auto entry = state_->find(library_uuid);
     if (!entry) return fail(ErrorCode::NotFound, "library is not open");
-    auto roots = entry->library->list_roots();
+    auto roots = entry->library->list_roots(catalog::RootListing::WithoutSampleCounts);
     if (!roots) return std::unexpected(roots.error());
     const auto root = std::ranges::find(*roots, root_id, &catalog::RootRecord::id);
     if (root == roots->end()) return fail(ErrorCode::NotFound, std::format("the library has no root {}", root_id));
@@ -990,9 +738,9 @@ Result<files::ImportSummary> Application::import_now(const uuids::uuid& library_
     auto summary =
         files::import_root(*entry->library, root_id, *folder, stop, [&](const files::ImportProgress& current) {
             if (progress) progress(current);
-            state->request_update(*entry);  // committed batches reach the index
+            state->indexes.request_update(*entry);  // committed batches reach the index
         });
-    state->request_update(*entry);
+    state->indexes.request_update(*entry);
     return summary;
 }
 
@@ -1033,7 +781,7 @@ Result<OperationId> Application::start_import(const uuids::uuid& library_uuid, s
                     queue_automatic_analysis(library_uuid, root_id);
             }
         } catch (const std::exception& exception) {
-            finished.error = internal_error("import", exception);
+            finished.error = detail::internal_error("import", exception);
         }
         {
             std::lock_guard lock(shared.imports_mutex);
@@ -1160,8 +908,12 @@ Result<catalog::MutationReceipt> Application::mutate_and_patch(
     if (!entry) return fail(ErrorCode::NotFound, "library is not open");
     auto receipt = mutate(*entry->library);
     // Patch the index on this thread right after the commit: rows() reflects the edit when this
-    // returns, before the coalesced event goes out.
-    if (receipt) state_->update_index(entry);
+    // returns, before the coalesced event goes out. An edit too large for the outbox waits for
+    // the reload it causes.
+    if (receipt) {
+        state_->indexes.update_index(entry);
+        state_->indexes.bring_index_to(entry, receipt->committed_revision);
+    }
     return receipt;
 }
 

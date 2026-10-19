@@ -62,6 +62,12 @@ bool merge_event(app::ApplicationEvent& pending, const app::ApplicationEvent& in
         *analysis = next;
         return true;
     }
+    if (auto* opening = std::get_if<app::LibraryOpenProgressEvent>(&pending)) {
+        const auto& next = std::get<app::LibraryOpenProgressEvent>(incoming);
+        if (opening->library != next.library) return false;
+        *opening = next;  // only the newest step and count matter
+        return true;
+    }
     if (auto* availability = std::get_if<app::RootAvailabilityEvent>(&pending)) {
         const auto& next = std::get<app::RootAvailabilityEvent>(incoming);
         if (availability->library != next.library || availability->root_id != next.root_id) return false;
@@ -120,7 +126,13 @@ void ApplicationSession::start() {
     using StartResult = Result<Started>;
     run_in_background(
         pool_, this,
-        [options = options_]() -> StartResult {
+        [this, options = options_]() mutable -> StartResult {
+            // Until the full handler is installed below, deliver only the progress of libraries
+            // that upgrade while start-up reopens them (the Jobs panel shows it); everything else
+            // is re-read once the session has started.
+            options.event_handler = [this](const app::ApplicationEvent& event) {
+                if (std::holds_alternative<app::LibraryOpenProgressEvent>(event)) enqueue_event(event);
+            };
             auto application = app::Application::start(options);
             if (!application) return std::unexpected(application.error());
             // The workspace's lock is taken here, off the UI thread, never in the delivery.
@@ -315,6 +327,8 @@ void ApplicationSession::dispatch_event(const app::ApplicationEvent& event) {
             } else if constexpr (std::is_same_v<Event, app::LibraryAccessChangedEvent>) {
                 emit libraryAccessChanged(specific);
                 refresh_libraries();  // read_only in libraries() changes: panels re-enable editing
+            } else if constexpr (std::is_same_v<Event, app::LibraryOpenProgressEvent>) {
+                emit libraryOpenProgressed(specific);
             }
         },
         event);

@@ -113,7 +113,8 @@ QString DisplayFormat::source_label(std::string_view source) {
 QString DisplayFormat::provenance(std::string_view source, std::optional<double> confidence) {
     QString text = source_label(source);
     if (confidence && std::isfinite(*confidence))
-        text = tr("%1, %2% confidence").arg(text).arg(std::lround(*confidence * 100.0));
+        // One multi-argument arg(): a "%2" in the source label is never substituted.
+        text = tr("%1, %2% confidence").arg(text, QString::number(std::lround(*confidence * 100.0)));
     return text;
 }
 
@@ -172,6 +173,41 @@ QString DisplayFormat::location_state(catalog::LocationState state) {
             return tr("Retired");
     }
     return tr("Unknown");
+}
+
+QString DisplayFormat::open_step(catalog::OpenStep step) {
+    switch (step) {
+        case catalog::OpenStep::BackingUp:
+            return tr("Backing up before the upgrade");
+        case catalog::OpenStep::Migrating:
+            return tr("Updating the catalog");
+        case catalog::OpenStep::RebuildingKeys:
+            return tr("Rebuilding name and path keys");
+        case catalog::OpenStep::CheckingIntegrity:
+            return tr("Checking the catalog");
+    }
+    return tr("Upgrading");
+}
+
+QString DisplayFormat::run_state(std::string_view state) {
+    if (state == "preparing") return tr("preparing");
+    if (state == "queued") return tr("queued");
+    if (state == "running") return tr("running");
+    if (state == "pausing") return tr("pausing");
+    if (state == "paused") return tr("paused");
+    if (state == "cancelling") return tr("cancelling");
+    if (state == "cancelled") return tr("cancelled");
+    if (state == "completed") return tr("completed");
+    if (state == "completed_with_errors") return tr("completed with errors");
+    return from_utf8(state);
+}
+
+QString DisplayFormat::plain_tooltip(const QString& text) {
+    if (text.isEmpty()) return text;
+    // <qt> forces rich text, in which the escaped text renders literally; line breaks are kept.
+    QString escaped = text.toHtmlEscaped();
+    escaped.replace(QLatin1Char('\n'), QStringLiteral("<br>"));
+    return QStringLiteral("<qt>%1</qt>").arg(escaped);
 }
 
 QString DisplayFormat::analysis_flags(std::int64_t flags) {

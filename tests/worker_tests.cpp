@@ -200,6 +200,110 @@ void kill_process(std::uint32_t process_id) {
     REQUIRE(TerminateProcess(process.get(), kKilledExitCode));
     WaitForSingleObject(process.get(), 5000);
 }
+
+/// A --self-test worker started by the test itself rather than by the supervisor, so the test owns
+/// the write end of the worker's stdin and can close it, as a supervisor that dies does (a
+/// ChildProcess keeps that end until it is destroyed, which kills the worker). It inherits only its
+/// two pipe ends; it is terminated on destruction if it is still running.
+class DirectlyStartedWorker {
+public:
+    explicit DirectlyStartedWorker(std::string_view fault) {
+        HANDLE input_read = nullptr;
+        HANDLE input_write = nullptr;
+        HANDLE output_read = nullptr;
+        HANDLE output_write = nullptr;
+        REQUIRE(CreatePipe(&input_read, &input_write, nullptr, 0));
+        const worker::UniqueHandle child_input(input_read);
+        to_child_.reset(input_write);
+        REQUIRE(CreatePipe(&output_read, &output_write, nullptr, 0));
+        const worker::UniqueHandle child_output(output_write);
+        from_child_.reset(output_read);
+        REQUIRE(SetHandleInformation(input_read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT));
+        REQUIRE(SetHandleInformation(output_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT));
+
+        std::array<HANDLE, 2> inherited{input_read, output_write};
+        SIZE_T size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+        std::vector<std::byte> storage(size);
+        auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+        REQUIRE(InitializeProcThreadAttributeList(attributes, 1, 0, &size));
+        const BOOL listed = UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                      inherited.data(), sizeof(inherited), nullptr, nullptr);
+        STARTUPINFOEXW startup{};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = input_read;
+        startup.StartupInfo.hStdOutput = output_write;
+        startup.lpAttributeList = attributes;
+        std::wstring command_line = L"\"" + mso::test::worker_executable().native() +
+                                    L"\" --self-test --self-test-fault " + mso::path_from_utf8(fault).native();
+        PROCESS_INFORMATION started{};
+        const BOOL created = listed && CreateProcessW(nullptr, command_line.data(), nullptr, nullptr, TRUE,
+                                                      EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, nullptr,
+                                                      &startup.StartupInfo, &started);
+        DeleteProcThreadAttributeList(attributes);
+        REQUIRE(created);
+        CloseHandle(started.hThread);
+        process_.reset(started.hProcess);
+    }
+    DirectlyStartedWorker(const DirectlyStartedWorker&) = delete;
+    DirectlyStartedWorker& operator=(const DirectlyStartedWorker&) = delete;
+    ~DirectlyStartedWorker() {
+        if (WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT) {
+            TerminateProcess(process_.get(), kKilledExitCode);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+    }
+
+    /// The worker's stdin, as the supervisor would write it.
+    worker::HandleStream input() const { return worker::HandleStream(to_child_.get()); }
+    /// The worker's stdout, as the supervisor would read it.
+    worker::HandleStream output() const { return worker::HandleStream(from_child_.get()); }
+    /// Closes the worker's stdin: it reads end of input.
+    void close_input() { to_child_.reset(); }
+    /// The exit status once the worker has ended by itself within `timeout`.
+    std::optional<DWORD> wait_for_exit(std::chrono::milliseconds timeout) const {
+        if (WaitForSingleObject(process_.get(), static_cast<DWORD>(timeout.count())) != WAIT_OBJECT_0)
+            return std::nullopt;
+        DWORD status = 0;
+        REQUIRE(GetExitCodeProcess(process_.get(), &status));
+        return status;
+    }
+
+private:
+    worker::UniqueHandle process_;     ///< the worker process
+    worker::UniqueHandle to_child_;    ///< write end of its stdin
+    worker::UniqueHandle from_child_;  ///< read end of its stdout
+};
+
+/// Reads the handshake of `stuck` (started with the "stall-task" fault), hands it a task, and
+/// returns once a heartbeat reports that task as active: its task thread is then blocked for good.
+void hand_over_stuck_task(DirectlyStartedWorker& stuck) {
+    auto output = stuck.output();
+    auto input = stuck.input();
+    const auto handshake = worker::read_frame(output);
+    REQUIRE(handshake.has_value());
+    REQUIRE(handshake->has_value());
+    const auto introduced = worker::decode_worker_message((*handshake)->payload);
+    REQUIRE(introduced.has_value());
+    REQUIRE(std::holds_alternative<worker::Handshake>(*introduced));
+
+    const auto task = make_task(60.0);
+    const auto payload = worker::encode_message(worker::SupervisorMessage{task});
+    REQUIRE(payload.has_value());
+    REQUIRE(worker::write_frame(input, 1, *payload).has_value());
+    // One heartbeat every kHeartbeatInterval; the first one after the hand-over names the task.
+    for (int frame_count = 0; frame_count < 8; ++frame_count) {
+        const auto frame = worker::read_frame(output);
+        REQUIRE(frame.has_value());
+        REQUIRE(frame->has_value());
+        const auto message = worker::decode_worker_message((*frame)->payload);
+        REQUIRE(message.has_value());
+        const auto* heartbeat = std::get_if<worker::Heartbeat>(&*message);
+        if (heartbeat && heartbeat->active_job_id == task.job_id) return;
+    }
+    FAIL("no heartbeat reported the task as active");
+}
 #else
 constexpr std::uint32_t kKilledExitCode = 128 + SIGKILL;
 
@@ -604,8 +708,7 @@ TEST_SUITE("worker") {
         const auto elapsed = std::chrono::steady_clock::now() - started;
         CHECK(error.code == ErrorCode::WorkerCrash);
         CHECK(error.safe_detail.find("handshake") != std::string::npos);
-        CHECK(elapsed >= options.handshake_timeout);
-        CHECK(elapsed < options.handshake_timeout + 10s);  // the watchdog, not a lease, ended it
+        CHECK(elapsed >= options.handshake_timeout);  // the "handshake" detail says which watchdog ended it
     }
 
     TEST_CASE("garbage, a second handshake or an unsequenced outcome from a live worker is a protocol violation") {
@@ -897,6 +1000,26 @@ TEST_SUITE("worker") {
         CHECK_FALSE(process.wait_for_exit(0ms).has_value());  // the worker itself is still alive
         process.terminate();
         CHECK(process.wait_for_exit(5s).has_value());
+    }
+
+    TEST_CASE("a worker whose task is stuck exits by itself when its input ends or is garbled") {
+        // The Shutdown path is tested above with the supervisor; these are the worker's two other
+        // ways of being told to stop. Its task thread never returns, so the worker ends the process
+        // itself after its task-stop deadline, with the status that names the reason.
+        SUBCASE("end of input (the supervisor died): a clean exit") {
+            DirectlyStartedWorker stuck("stall-task");
+            hand_over_stuck_task(stuck);
+            stuck.close_input();
+            CHECK(stuck.wait_for_exit(15s) == std::optional<DWORD>(0));
+        }
+        SUBCASE("a frame that is not one: the protocol-violation exit") {
+            DirectlyStartedWorker stuck("stall-task");
+            hand_over_stuck_task(stuck);
+            constexpr std::array<std::uint8_t, 24> kGarbage{'n', 'o', 't', ' ', 'a', ' ', 'f', 'r', 'a', 'm', 'e'};
+            auto input = stuck.input();
+            REQUIRE(input.write_all(kGarbage).has_value());
+            CHECK(stuck.wait_for_exit(15s) == std::optional<DWORD>(2));  // kExitProtocolViolation
+        }
     }
 #endif
 

@@ -105,8 +105,9 @@ void register_import(CLI::App& root, CommandContext& context, int& exit_code) {
         auto library = context.open_library(path_from_utf8(options.directory), Access::Write);
         if (!library) return void(exit_code = context.report(library.error()));
         auto* application = *context.application();
-        auto roots =
-            application->with_library(library->uuid, [](catalog::Library& opened) { return opened.list_roots(); });
+        auto roots = application->with_library(library->uuid, [](catalog::Library& opened) {
+            return opened.list_roots(catalog::RootListing::WithoutSampleCounts);
+        });
         if (!roots) return void(exit_code = context.report(roots.error()));
         if (root_id && std::ranges::find(*roots, *root_id, &catalog::RootRecord::id) == roots->end())
             return void(exit_code = context.report(Error{
@@ -134,7 +135,9 @@ void register_import(CLI::App& root, CommandContext& context, int& exit_code) {
             incomplete = incomplete || !summary->finish.complete_coverage;
             context.print("  {} added, {} changed, {} renamed, {} marked missing, {} unreadable{}", progress.added,
                           progress.updated, progress.relinked, summary->finish.marked_missing, progress.probe_failures,
-                          summary->finish.complete_coverage ? "" : "  (some folders could not be read)");
+                          summary->finish.complete_coverage
+                              ? ""
+                              : "  (some folders were skipped or could not be read; their samples are kept)");
         }
         if (exit_code == kExitSuccess && incomplete) exit_code = kExitPartial;
     });
@@ -192,9 +195,15 @@ void register_maintenance(CLI::App& root, CommandContext& context, int& exit_cod
             // lock like any other write (never while the desktop app owns the folder).
             auto library = context.open_library(path_from_utf8(directory), Access::Write);
             if (!library) return void(exit_code = context.report(library.error()));
-            auto backup = (*context.application())->with_library(library->uuid, [](catalog::Library& opened) {
-                return opened.create_backup("manual");
+            // Ctrl+C stops the backup; the catalog removes the partial file.
+            InterruptScope interrupt;
+            auto backup = (*context.application())->with_library(library->uuid, [&](catalog::Library& opened) {
+                return opened.create_backup("manual", interrupt.token());
             });
+            if (!backup && backup.error().code == ErrorCode::Cancelled && interrupt.interrupted()) {
+                context.print("cancelled; no backup was written");
+                return void(exit_code = kExitInterrupted);
+            }
             if (!backup) return void(exit_code = context.report(backup.error()));
             context.print("verified backup: {}", path_to_utf8(*backup));
         });

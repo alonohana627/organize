@@ -1,6 +1,6 @@
 // Metadata export (CSV/JSON): spreadsheet safety, raw mode, absolute paths, filters, paging past
-// one SearchService page, atomic replacement and the CSV manifest. Application tests live in
-// app_tests.cpp.
+// one SearchService page, atomic replacement, the CSV manifest and the streamed JSON envelope.
+// Application tests live in app_tests.cpp.
 #include <doctest.h>
 
 #include <algorithm>
@@ -93,6 +93,29 @@ TEST_SUITE("export") {
         CHECK(document["samples"][0].contains("location"));
         CHECK_FALSE(document["samples"][0]["location"].contains("absolute_path"));
         CHECK_FALSE(std::filesystem::exists(scratch / "out.json.manifest.json"));
+    }
+
+    TEST_CASE("the JSON envelope stays valid for awkward library names and an empty result") {
+        ScratchDirectory scratch;
+        const std::string name = "Quote \" back\\slash éè \U0001F941";
+        auto populated = test::make_library(scratch / "lib", {test::synthetic_file("Kick.wav", 10, 1'000)}, name);
+        app::ExportOptions options{
+            .format = app::ExportFormat::Json, .include_absolute_paths = true, .query = "no-such-sample"};
+        auto json = app::write_metadata_export(*populated.library, scratch / "empty.json", options, unbound, {});
+        REQUIRE(json.has_value());
+        CHECK(json->rows == 0);
+        const auto document = nlohmann::json::parse(test::read_file(scratch / "empty.json"), nullptr, false);
+        REQUIRE_FALSE(document.is_discarded());
+        CHECK(document["library"]["name"] == name);
+        CHECK(document["absolute_paths"] == true);
+        CHECK(document["samples"].is_array());
+        CHECK(document["samples"].empty());
+        std::vector<std::string> keys;
+        for (const auto& [key, value] : document.items())
+            keys.push_back(key);
+        std::ranges::sort(keys);
+        CHECK(keys == std::vector<std::string>{"absolute_paths", "catalog_revision_at_end", "consistent", "exported_at",
+                                               "library", "samples", "schema_version"});
     }
 
     TEST_CASE("raw mode keeps formula-like cells exactly") {

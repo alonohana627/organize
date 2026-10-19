@@ -109,6 +109,7 @@ void LibraryController::open_library() {
                 this, [path](app::Application& application) { return application.open_library(path); },
                 [this](Result<app::OpenLibraryInfo> opened) {
                     if (!opened) {
+                        emit libraryOpenFailed(DisplayFormat::error(opened.error()));
                         emit failed(tr("Could not open the library"), DisplayFormat::error(opened.error()));
                         return;
                     }

@@ -249,10 +249,19 @@ Result<void> verify_lease(sqlite::Connection& connection, const Library::JobLeas
     return {};
 }
 
+/// A job that goes back to waiting (`queued` or `interrupted`) while its run is paused waits as
+/// `paused` instead, outside the jobs_ready lease index, until Resume (as in unblock_reachable_jobs).
+/// `{}` is the SQL expression of the waiting state.
+constexpr std::string_view kWaitingStateSql =
+    "CASE WHEN {0} IN ('queued','interrupted') AND (SELECT run.state FROM analysis_runs run "
+    "WHERE run.id=jobs.run_id)='paused' THEN 'paused' ELSE {0} END";
+
 Result<void> set_job_state(sqlite::Connection& connection, std::int64_t job_id, std::string_view state,
                            std::optional<std::string_view> error_code, std::optional<std::int64_t> not_before) {
-    auto update = connection.prepare(
-        "UPDATE jobs SET state=?2, error_code=?3, lease_token=NULL, lease_expires_at=?4 WHERE id=?1");
+    static const std::string kUpdateSql =
+        std::format("UPDATE jobs SET state={}, error_code=?3, lease_token=NULL, lease_expires_at=?4 WHERE id=?1",
+                    std::format(kWaitingStateSql, "?2"));
+    auto update = connection.prepare(kUpdateSql);
     if (!update) return std::unexpected(update.error());
     update->bind(1, job_id).bind(2, state);
     if (error_code)
@@ -530,11 +539,13 @@ Result<std::optional<Library::JobLease>> Library::lease_next_job(std::chrono::mi
     const auto now = now_unix_ms();
 
     // Reclaim expired leases (a worker died without reporting). A job whose lease expired on its
-    // last allowed attempt fails instead of looping forever.
-    auto reclaim = writer_.prepare(
-        "UPDATE jobs SET state=CASE WHEN attempt>=?2 THEN 'failed' ELSE 'interrupted' END, "
+    // last allowed attempt fails instead of looping forever; one of a paused run waits as `paused`.
+    static const std::string kReclaimSql = std::format(
+        "UPDATE jobs SET state=CASE WHEN attempt>=?2 THEN 'failed' ELSE {} END, "
         "error_code=CASE WHEN attempt>=?2 THEN 'WORKER_CRASH' ELSE error_code END, lease_token=NULL, "
-        "lease_expires_at=NULL WHERE state='running' AND lease_expires_at<?1 RETURNING run_id");
+        "lease_expires_at=NULL WHERE state='running' AND lease_expires_at<?1 RETURNING run_id",
+        std::format(kWaitingStateSql, "'interrupted'"));
+    auto reclaim = writer_.prepare(kReclaimSql);
     if (!reclaim) return std::unexpected(reclaim.error());
     reclaim->bind(1, now).bind(2, kMaximumJobAttempts);
     std::set<std::int64_t> reclaimed_runs;
@@ -552,14 +563,15 @@ Result<std::optional<Library::JobLease>> Library::lease_next_job(std::chrono::mi
     // first qualifying row ends the walk; INDEXED BY makes a plan without it fail to prepare
     // instead of silently sorting every queued job on each lease. Jobs of paused runs are `paused`
     // and never in the index.
-    auto next = writer_.prepare(std::format(
+    static const std::string kNextJobSql = std::format(
         "SELECT jobs.id, jobs.run_id, jobs.uuid, jobs.sample_id, jobs.content_revision, jobs.checkpoint_json, "
         "jobs.attempt, run.cancel_epoch, jobs.stage FROM jobs INDEXED BY jobs_ready "
         "JOIN analysis_runs run ON run.id=jobs.run_id "
         "WHERE jobs.state IN ('queued','interrupted') AND run.state IN ('queued','running') "
         "AND (jobs.lease_expires_at IS NULL OR jobs.lease_expires_at<=?1) AND {} "
         "ORDER BY jobs.run_id, jobs.priority DESC, jobs.id LIMIT 1",
-        detail::kJobSampleReachableSql));
+        detail::kJobSampleReachableSql);
+    auto next = writer_.prepare(kNextJobSql);
     if (!next) return std::unexpected(next.error());
     std::optional<JobLease> lease;
     std::set<std::int64_t> runs_with_corrupt_jobs;
@@ -704,9 +716,11 @@ Result<void> Library::fail_job(const JobLease& lease, ErrorCode code, bool trans
 Result<void> Library::release_job(const JobLease& lease) {
     if (auto writable = ensure_writable(); !writable) return writable;
     const std::lock_guard lock(writer_mutex_);
-    auto release = writer_.prepare(
-        "UPDATE jobs SET state='queued', lease_token=NULL, lease_expires_at=NULL, attempt=max(attempt-1,0) "
-        "WHERE id=?1 AND lease_token=?2 AND state='running'");
+    static const std::string kReleaseSql = std::format(
+        "UPDATE jobs SET state={}, lease_token=NULL, lease_expires_at=NULL, attempt=max(attempt-1,0) "
+        "WHERE id=?1 AND lease_token=?2 AND state='running'",
+        std::format(kWaitingStateSql, "'queued'"));
+    auto release = writer_.prepare(kReleaseSql);
     if (!release) return std::unexpected(release.error());
     release->bind(1, lease.job_id).bind(2, lease.lease_token);
     return release->run();

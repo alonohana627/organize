@@ -21,6 +21,28 @@ constexpr std::string_view kStagingDirectory = "staging";
 constexpr std::size_t kMaximumBackupReasonLength = 48;
 constexpr std::array<std::string_view, 5> kLibrarySubdirectories = {"media", "derived/waveforms", "derived/features",
                                                                     "backups", "staging"};
+/// Pages copied per backup step; a stop request is noticed between steps (4 MiB at 4 KiB pages).
+constexpr int kBackupPagesPerStep = 1024;
+/// Rows a normalization_conflict review item names (the item also counts all of them).
+constexpr std::size_t kMaximumListedKeyConflicts = 50;
+
+/// A table whose stored key sits under a unique index, and how refresh_normalized_keys rebuilds it.
+struct KeyedTable {
+    std::string_view table;
+    std::string_view key_column;
+    std::string_view key_expression;  ///< the key each row has under kFoldVersion
+    std::string_view indexed_rows;    ///< the rows the unique index covers (its partial-index condition)
+    std::string_view label_column;    ///< what a review item shows for a row
+};
+constexpr std::array<KeyedTable, 4> kUniqueKeyedTables = {{
+    {"categories", "name_key", "fold_key(name)", "deleted=0", "name"},
+    {"tags", "name_key", "fold_key(name)", "deleted=0", "name"},
+    {"folders", "path_key", "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=folders.root_id))",
+     "1", "relative_path"},
+    {"locations", "path_key",
+     "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=locations.root_id))", "state<>'retired'",
+     "relative_path"},
+}};
 
 /// The identity manifest stored next to the database.
 struct LibraryManifest {
@@ -59,13 +81,13 @@ Result<void> write_manifest(const std::filesystem::path& file, const LibraryMani
 }
 
 /// Verifies a backup copy: integrity check, foreign keys and identity.
-Result<void> verify_backup(const std::filesystem::path& file, const uuids::uuid& expected) {
+Result<void> verify_backup(const std::filesystem::path& file, const uuids::uuid& expected, std::stop_token stop) {
     auto connection = sqlite::Connection::open(file, {.read_only = true, .write_ahead_log = false});
     if (!connection) return std::unexpected(connection.error());
-    auto integrity = connection->integrity_check();
+    auto integrity = connection->integrity_check(stop);
     if (!integrity) return std::unexpected(integrity.error());
     if (*integrity != "ok") return fail(ErrorCode::DbCorrupt, std::format("backup integrity check: {}", *integrity));
-    auto violations = connection->foreign_key_violations();
+    auto violations = connection->foreign_key_violations(stop);
     if (!violations) return std::unexpected(violations.error());
     if (!violations->empty())
         return fail(ErrorCode::DbCorrupt, std::format("backup has {} foreign key violations", violations->size()));
@@ -309,6 +331,7 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& dire
     library->uuid_ = manifest->uuid;
     library->read_only_ = options.read_only;
     library->readers_ = std::make_shared<detail::ReaderPool>(library->catalog_file_, options.max_readers);
+    library->open_progress_ = options.on_progress;
 
     auto connection = sqlite::Connection::open(library->catalog_file_, {.read_only = options.read_only});
     if (!connection) return std::unexpected(connection.error());
@@ -322,7 +345,12 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& dire
         if (auto rekeyed = library->refresh_normalized_keys(); !rekeyed) return std::unexpected(rekeyed.error());
     }
     if (auto identity = library->load_cached_identity(); !identity) return std::unexpected(identity.error());
+    library->open_progress_ = nullptr;  // the caller's callback is not kept beyond open()
     return library;
+}
+
+void Library::report_open_progress(OpenStep step, int completed, int total) const {
+    if (open_progress_) open_progress_(OpenProgress{.step = step, .completed = completed, .total = total});
 }
 
 Result<void> Library::verify_and_migrate() {
@@ -349,16 +377,25 @@ Result<void> Library::verify_and_migrate() {
                     std::format("this library uses catalog schema {} and must be opened writable once to upgrade to {}",
                                 *version, latest_schema_version()));
 
+    report_open_progress(OpenStep::BackingUp, 0, 1);
     auto backup = create_backup(std::format("pre-migration-v{}", *version));
     if (!backup) return std::unexpected(backup.error());
     recovery_.pre_migration_backup = *backup;
+    report_open_progress(OpenStep::BackingUp, 1, 1);
+    const int pending = latest_schema_version() - *version;
+    int applied_count = 0;
     for (const auto& migration : migrations()) {
         if (migration.version <= *version) continue;
+        report_open_progress(OpenStep::Migrating, applied_count, pending);
         if (auto applied = apply_migration(writer_, migration); !applied) return applied;
+        ++applied_count;
     }
+    report_open_progress(OpenStep::Migrating, applied_count, pending);
+    report_open_progress(OpenStep::CheckingIntegrity, 0, 1);
     auto integrity = writer_.integrity_check();
     if (!integrity) return std::unexpected(integrity.error());
     if (*integrity != "ok") return fail(ErrorCode::DbCorrupt, std::format("post-migration integrity: {}", *integrity));
+    report_open_progress(OpenStep::CheckingIntegrity, 1, 1);
     recovery_.migrated = true;
     return {};
 }
@@ -407,71 +444,103 @@ Result<void> Library::recover_after_crash() {
 }
 
 Result<void> Library::refresh_normalized_keys() {
-    const std::lock_guard lock(writer_mutex_);
-    auto statement = writer_.prepare("SELECT normalization_version FROM library_state WHERE singleton=1");
-    if (!statement) return std::unexpected(statement.error());
-    auto has_row = statement->next_row();
-    if (!has_row) return std::unexpected(has_row.error());
-    if (!*has_row) return fail(ErrorCode::DbCorrupt, "library_state row is missing");
-    const std::string stored_version = statement->column_text(0);
-    statement->reset();
+    std::string stored_version;
+    {
+        const std::lock_guard lock(writer_mutex_);
+        auto statement = writer_.prepare("SELECT normalization_version FROM library_state WHERE singleton=1");
+        if (!statement) return std::unexpected(statement.error());
+        auto has_row = statement->next_row();
+        if (!has_row) return std::unexpected(has_row.error());
+        if (!*has_row) return fail(ErrorCode::DbCorrupt, "library_state row is missing");
+        stored_version = statement->column_text(0);
+        statement->reset();
+    }
     if (stored_version == kFoldVersion) return {};
 
-    // Keys under a unique index move in two passes: changing rows first get a unique placeholder
-    // ('\x01' and the row id, which no folded name or path produces), so swapping two keys never
-    // trips the index; a collision in the second pass is real.
-    constexpr std::array<std::string_view, 12> kRekeyStatements = {
-        "UPDATE samples SET name_key=fold_key(display_name) WHERE name_key IS NOT fold_key(display_name)",
-        "UPDATE categories SET name_key=char(1)||id WHERE name_key IS NOT fold_key(name)",
-        "UPDATE categories SET name_key=fold_key(name) WHERE name_key IS NOT fold_key(name)",
-        "UPDATE tags SET name_key=char(1)||id WHERE name_key IS NOT fold_key(name)",
-        "UPDATE tags SET name_key=fold_key(name) WHERE name_key IS NOT fold_key(name)",
-        "UPDATE folders SET path_key=char(1)||id WHERE path_key IS NOT "
-        "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=folders.root_id))",
-        "UPDATE folders SET path_key=path_key(relative_path,(SELECT case_sensitive FROM roots "
-        "WHERE roots.id=folders.root_id)) WHERE substr(path_key,1,1)=char(1)",
-        "UPDATE locations SET path_key=char(1)||id WHERE path_key IS NOT "
-        "path_key(relative_path,(SELECT case_sensitive FROM roots WHERE roots.id=locations.root_id))",
-        "UPDATE locations SET path_key=path_key(relative_path,(SELECT case_sensitive FROM roots "
-        "WHERE roots.id=locations.root_id)) WHERE substr(path_key,1,1)=char(1)",
-        "UPDATE scan_frontier SET directory_key=path_key(relative_directory,(SELECT root.case_sensitive FROM "
-        "scan_sessions session JOIN roots root ON root.id=session.root_id WHERE session.id=scan_frontier.scan_id)) "
-        "WHERE directory_key IS NOT NULL",
-        "UPDATE review_items SET state='resolved' WHERE kind='normalization_conflict' AND state='open'",
-        "UPDATE library_state SET normalization_version=?1 WHERE singleton=1",
-    };
-    std::optional<Error> collision;
-    {
-        sqlite::WriteTransaction transaction(writer_);
-        if (auto began = transaction.begin(); !began) return began;
-        for (const auto sql : kRekeyStatements) {
-            auto rekey = writer_.prepare(sql);
-            if (!rekey) return std::unexpected(rekey.error());
-            if (sql.find("?1") != std::string_view::npos) rekey->bind(1, kFoldVersion);
-            if (auto ran = rekey->run(); !ran) {
-                if (!rekey->failed_on_unique_constraint()) return ran;
-                collision = ran.error();
-                break;
-            }
-        }
-        if (!collision) return transaction.commit();
-    }  // the collided attempt rolls back here: the old keys stay consistent with each other
+    // Every stored key is rewritten: a verified backup first, unless this open just took one before
+    // migrating (nothing has changed since but crash recovery).
+    if (!recovery_.pre_migration_backup) {
+        report_open_progress(OpenStep::BackingUp, 0, 1);
+        auto backup = create_backup("pre-rekey");
+        if (!backup) return std::unexpected(backup.error());
+        recovery_.pre_rekey_backup = *backup;
+        report_open_progress(OpenStep::BackingUp, 1, 1);
+    }
 
-    // Two names or paths that the stored keys kept apart would share a key now. Nothing is merged
-    // silently: the old keys stay (the next open tries again) and one open review item says why.
+    constexpr int kParts = static_cast<int>(kUniqueKeyedTables.size()) + 2;
+    int completed_parts = 0;
+    const std::lock_guard lock(writer_mutex_);
     sqlite::WriteTransaction transaction(writer_);
     if (auto began = transaction.begin(); !began) return began;
-    auto existing =
-        writer_.query_int64("SELECT count(*) FROM review_items WHERE kind='normalization_conflict' AND state='open'");
-    if (!existing) return std::unexpected(existing.error());
-    if (*existing == 0)
-        if (auto reviewed = detail::add_review_item(
-                writer_, "normalization_conflict", std::nullopt,
-                nlohmann::json{
-                    {"stored_version", stored_version}, {"version", kFoldVersion}, {"detail", collision->safe_detail}});
+    auto run = [this](std::string_view sql) -> Result<void> {
+        auto statement = writer_.prepare(sql);
+        if (!statement) return std::unexpected(statement.error());
+        return statement->run();
+    };
+
+    report_open_progress(OpenStep::RebuildingKeys, completed_parts++, kParts);
+    if (auto rekeyed =
+            run("UPDATE samples SET name_key=fold_key(display_name) WHERE name_key IS NOT fold_key(display_name)");
+        !rekeyed)
+        return rekeyed;
+
+    // Keys under a unique index: each row moves once, and a row whose new key is still held (by a
+    // row that moves later, or for good by a row that already has it) is skipped by OR IGNORE. The
+    // skipped rows then take a placeholder ('\x01' and the row id, which no name or path key
+    // produces) and try again, so swapped keys settle; a row still on its placeholder afterwards
+    // collides for real. It stays apart (never merged) and the review item below lists it.
+    nlohmann::json conflicts = nlohmann::json::array();
+    std::int64_t conflict_count = 0;
+    for (const auto& keyed : kUniqueKeyedTables) {
+        report_open_progress(OpenStep::RebuildingKeys, completed_parts++, kParts);
+        const auto& [table, key, expression, indexed_rows, label] = keyed;
+        for (const auto& sql : {
+                 std::format("UPDATE OR IGNORE {0} SET {1}={2} WHERE {1} IS NOT {2}", table, key, expression),
+                 std::format("UPDATE {0} SET {1}=char(1)||id WHERE {1} IS NOT {2} AND substr({1},1,1)<>char(1)", table,
+                             key, expression),
+                 std::format("UPDATE OR IGNORE {0} SET {1}={2} WHERE substr({1},1,1)=char(1)", table, key, expression),
+             })
+            if (auto rekeyed = run(sql); !rekeyed) return rekeyed;
+
+        auto collided = writer_.prepare(std::format(
+            "SELECT id, {} FROM {} WHERE substr({},1,1)=char(1) AND {} ORDER BY id", label, table, key, indexed_rows));
+        if (!collided) return std::unexpected(collided.error());
+        auto walked = detail::for_each_row(*collided, [&](sqlite::PreparedStatement& row) -> Result<void> {
+            if (conflicts.size() < kMaximumListedKeyConflicts)
+                conflicts.push_back({{"table", table}, {"id", row.column_int64(0)}, {"name", row.column_text(1)}});
+            ++conflict_count;
+            return {};
+        });
+        if (!walked) return walked;
+    }
+
+    report_open_progress(OpenStep::RebuildingKeys, completed_parts++, kParts);
+    if (auto rekeyed = run("UPDATE scan_frontier SET directory_key=path_key(relative_directory,(SELECT "
+                           "root.case_sensitive FROM scan_sessions session JOIN roots root ON root.id=session.root_id "
+                           "WHERE session.id=scan_frontier.scan_id)) WHERE directory_key IS NOT NULL");
+        !rekeyed)
+        return rekeyed;
+    // Conflicts of an earlier rebuild are settled or listed again by this one.
+    if (auto resolved =
+            run("UPDATE review_items SET state='resolved' WHERE kind='normalization_conflict' AND state='open'");
+        !resolved)
+        return resolved;
+    if (conflict_count > 0)
+        if (auto reviewed = detail::add_review_item(writer_, "normalization_conflict", std::nullopt,
+                                                    nlohmann::json{{"stored_version", stored_version},
+                                                                   {"version", kFoldVersion},
+                                                                   {"conflict_count", conflict_count},
+                                                                   {"conflicts", std::move(conflicts)}});
             !reviewed)
             return reviewed;
-    return transaction.commit();
+    auto version = writer_.prepare("UPDATE library_state SET normalization_version=?1 WHERE singleton=1");
+    if (!version) return std::unexpected(version.error());
+    version->bind(1, kFoldVersion);
+    if (auto stored = version->run(); !stored) return stored;
+    if (auto committed = transaction.commit(); !committed) return committed;
+    recovery_.key_conflicts = conflict_count;
+    report_open_progress(OpenStep::RebuildingKeys, completed_parts, kParts);
+    return {};
 }
 
 Result<void> Library::load_cached_identity() {
@@ -527,24 +596,34 @@ Result<ReaderLease> Library::acquire_reader(std::chrono::milliseconds timeout) {
 
 // ---------------------------------------------------------------- maintenance
 
-Result<std::filesystem::path> Library::create_backup(std::string_view reason) {
+Result<std::filesystem::path> Library::create_backup(std::string_view reason, std::stop_token stop) {
+    if (stop.stop_requested()) return fail(ErrorCode::Cancelled, "the backup was cancelled");
     const auto directory = directory_ / kBackupDirectory;
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     if (error) return fail(ErrorCode::AccessDenied, std::format("cannot create backups folder: {}", error.message()));
     const auto file = directory / std::format("{:013}-{}-{}.sqlite", now_unix_ms(), sanitized_backup_reason(reason),
                                               uuids::to_string(new_uuid()).substr(0, 8));
+    // Removes the incomplete or unverified copy on every failure, cancellation included.
+    auto discard = [&](Error failure) -> Result<std::filesystem::path> {
+        std::error_code remove_error;
+        std::filesystem::remove(file, remove_error);
+        return std::unexpected(std::move(failure));
+    };
     {
-        const std::lock_guard lock(writer_mutex_);
-        if (auto copied = writer_.backup_to(file); !copied) {
-            std::filesystem::remove(file, error);
-            return std::unexpected(copied.error());
-        }
+        // One reader snapshot for the whole copy: the writer stays free (imports and edits go on),
+        // and their commits never restart the copy, because every step reads the same snapshot.
+        auto reader = acquire_reader();
+        if (!reader) return std::unexpected(reader.error());
+        auto& source = reader->connection();
+        sqlite::ReadTransaction snapshot(source);
+        if (auto began = snapshot.begin(); !began) return std::unexpected(began.error());
+        if (auto pinned = source.query_int64("SELECT count(*) FROM sqlite_schema"); !pinned)  // starts the snapshot
+            return std::unexpected(pinned.error());
+        if (auto copied = source.backup_to(file, kBackupPagesPerStep, std::chrono::seconds(30), stop); !copied)
+            return discard(copied.error());
     }
-    if (auto verified = verify_backup(file, uuid_); !verified) {
-        std::filesystem::remove(file, error);
-        return std::unexpected(verified.error());
-    }
+    if (auto verified = verify_backup(file, uuid_, stop); !verified) return discard(verified.error());
     prune_backups(directory, kMaximumBackups);
     return file;
 }

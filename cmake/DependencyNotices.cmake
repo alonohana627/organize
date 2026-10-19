@@ -74,7 +74,7 @@ Music Sample Organizer is free software under the GNU General Public License v3 
       set_property(DIRECTORY "${PROJECT_SOURCE_DIR}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${license_path}")
     endif()
     _mso_append_notice(entries "${name}" "${version}" "${license}" "${purpose}" "${homepage}" "${license_text}" false)
-    string(REPLACE "" "" license_text "${license_text}")
+    string(REPLACE "\r" "" license_text "${license_text}")
     string(APPEND notices "
 ================================================================================
 ")

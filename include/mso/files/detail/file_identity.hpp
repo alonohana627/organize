@@ -40,6 +40,7 @@ enum class LinkKind {
     CloudPlaceholder,  ///< a cloud-sync entry (OneDrive, iCloud...) that is available locally
     CloudOnly,         ///< a cloud-sync file whose data is not on this device: reading it would download it
     Deduplicated,      ///< a Windows data-deduplication file: reads like an ordinary file
+    Compressed,  ///< a Windows Overlay Filter compressed file (compact /EXE, CompactGUI): reads like an ordinary file
     OtherReparsePoint  ///< another Windows reparse point whose behaviour is unknown
 };
 
@@ -58,5 +59,12 @@ struct EntryClassification {
 
 /// classify_entry(path).kind.
 [[nodiscard]] LinkKind classify_link(const std::filesystem::path& path) noexcept;
+
+/// The Windows rule behind classify_entry() for an entry that is a reparse point: what reparse
+/// `tag` (WIN32_FIND_DATAW::dwReserved0) and file `attributes` mean for the importer. Data that
+/// is elsewhere (offline or recall attributes on a cloud entry) is CloudOnly; deduplicated and
+/// WOF-compressed files are ordinary files to read; an unknown tag is OtherReparsePoint. Plain
+/// numbers, so the rule is testable on every platform.
+[[nodiscard]] LinkKind classify_reparse_tag(std::uint32_t tag, std::uint32_t attributes, bool is_directory) noexcept;
 
 }  // namespace mso::files::detail

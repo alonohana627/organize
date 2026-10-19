@@ -125,6 +125,8 @@ QFrame* separator(QWidget* parent) {
 }  // namespace
 
 InspectorPanel::InspectorPanel(ApplicationSession& session, QWidget* parent) : QWidget(parent), session_(session) {
+    choices_timer_.setSingleShot(true);
+    connect(&choices_timer_, &QTimer::timeout, this, &InspectorPanel::start_due_choices_read);
     build_ui();
     show_selection({}, 0);
 }
@@ -500,10 +502,11 @@ void InspectorPanel::build_collection_fields(QFormLayout& form, QWidget& content
 
 // ---------------------------------------------------------------- selection and details
 
-void InspectorPanel::show_selection(std::vector<search::SampleRow> rows, std::size_t total_selected) {
+void InspectorPanel::show_selection(std::vector<search::SampleRow> rows, std::size_t total_selected,
+                                    std::optional<std::set<uuids::uuid>> all_libraries) {
     const std::set<SampleKey> keys = keys_of(rows);
-    const bool same_samples = keys == selected_keys_;
-    const std::set<uuids::uuid> libraries = libraries_of(rows);
+    const bool same_samples = keys == selected_keys_ && total_selected == total_selected_;
+    const std::set<uuids::uuid> libraries = all_libraries ? std::move(*all_libraries) : libraries_of(rows);
     const bool same_libraries = libraries == selected_libraries_;
     rows_ = std::move(rows);
     total_selected_ = total_selected;
@@ -516,7 +519,7 @@ void InspectorPanel::show_selection(std::vector<search::SampleRow> rows, std::si
         reset_drafts();
     }
     update_summary();
-    if (rows_.size() == 1 && !same_samples) load_detail(rows_.front());
+    if (rows_.size() == 1 && whole_selection_loaded() && !same_samples) load_detail(rows_.front());
     if (!same_libraries) reload_library_choices();
     update_enabled();
 }
@@ -553,27 +556,54 @@ void InspectorPanel::show_row_overrides() {
         return;
     }
     // A blank mode (MixedChoice) when the rows differ: Apply waits for an explicit choice.
+    // Manual values that differ are mixed too: "Value" with one sample's number would offer to
+    // write that number to all of them.
     const auto bpm_mode = common_value(rows_, [](const auto& row) { return choice_of_source(row.bpm_source); });
-    bpm_mode_combo_->setCurrentIndex(bpm_mode ? *bpm_mode : MixedChoice);
-    if (const auto bpm = common_value(rows_, [](const auto& row) { return row.bpm_milli; }); bpm && *bpm)
-        bpm_spin_->setValue(static_cast<double>(**bpm) / 1000.0);
+    const auto bpm = common_value(rows_, [](const auto& row) { return row.bpm_milli; });
+    const bool bpm_mixed = !bpm_mode || (*bpm_mode == ValueChoice && !bpm);
+    bpm_mode_combo_->setCurrentIndex(bpm_mixed ? MixedChoice : *bpm_mode);
+    if (bpm && *bpm) bpm_spin_->setValue(static_cast<double>(**bpm) / 1000.0);
     const auto key_mode = common_value(rows_, [](const auto& row) { return choice_of_source(row.key_source); });
-    key_mode_combo_->setCurrentIndex(key_mode ? *key_mode : MixedChoice);
-    if (const auto key = common_value(rows_, [](const auto& row) { return row.key; });
-        key && *key && (*key)->mode != KeyMode::Unknown)
+    const auto key = common_value(rows_, [](const auto& row) { return row.key; });
+    const bool key_mixed = !key_mode || (*key_mode == ValueChoice && !key);
+    key_mode_combo_->setCurrentIndex(key_mixed ? MixedChoice : *key_mode);
+    if (key && *key && (*key)->mode != KeyMode::Unknown)
         key_combo_->setCurrentIndex(key_combo_->findData(key_code(**key)));
 }
 
 void InspectorPanel::reload_detail() {
-    if (rows_.size() == 1) load_detail(rows_.front());
+    if (rows_.size() == 1 && whole_selection_loaded()) load_detail(rows_.front());
+}
+
+void InspectorPanel::library_structure_changed(const uuids::uuid& library) {
+    // Other libraries' imports and edits never re-read these lists.
+    if (selected_libraries_.size() != 1 || *selected_libraries_.begin() != library) return;
+    choices_dirty_ = true;
+    start_due_choices_read();
+}
+
+void InspectorPanel::start_due_choices_read() {
+    if (!choices_dirty_ || choice_reads_in_flight_ > 0 || selected_libraries_.size() != 1) return;
+    const qint64 waited =
+        choices_last_started_.isValid() ? choices_last_started_.elapsed() : qint64{kChoicesReloadIntervalMilliseconds};
+    if (waited < kChoicesReloadIntervalMilliseconds) {
+        if (!choices_timer_.isActive())
+            choices_timer_.start(static_cast<int>(kChoicesReloadIntervalMilliseconds - waited));
+        return;
+    }
+    choices_dirty_ = false;
+    load_library_choices(*selected_libraries_.begin());
 }
 
 void InspectorPanel::reload_library_choices() {
-    ++choices_request_;
+    ++choices_request_;  // a read for the previous library is dropped when it arrives
+    choices_dirty_ = false;
+    choices_timer_.stop();
     if (selected_libraries_.size() == 1) {
         load_library_choices(*selected_libraries_.begin());
         return;
     }
+    choices_library_.reset();
     // Categories and collections belong to one library; a selection spanning several (or none)
     // cannot offer a common list.
     category_combo_->clear();
@@ -689,6 +719,9 @@ void InspectorPanel::show_detail(const catalog::SampleDetail& detail) {
 void InspectorPanel::load_library_choices(const uuids::uuid& library) {
     if (!session_.is_ready()) return;
     const std::uint64_t request = choices_request_;
+    ++choice_reads_in_flight_;
+    ++choice_reads_started_;
+    choices_last_started_.start();
     /// The category and manual-collection lists of one library.
     struct Choices {
         std::vector<catalog::TaxonomyNode> categories;
@@ -706,8 +739,17 @@ void InspectorPanel::load_library_choices(const uuids::uuid& library) {
             choices.collections = std::move(*collections);
             return choices;
         },
-        [this, request](Result<Choices> choices) {
-            if (request != choices_request_) return;
+        [this, request, library](Result<Choices> choices) {
+            --choice_reads_in_flight_;
+            if (request != choices_request_) {
+                start_due_choices_read();
+                return;
+            }
+            // Another library's lists are refilled even into a focused combo box: its ids (and a
+            // half-typed category of another library) mean nothing for this selection.
+            const bool library_changed = choices_library_ != library;
+            choices_library_ = library;
+            start_due_choices_read();  // a change that arrived meanwhile is read now (or soon)
             if (!choices) {
                 category_combo_->setToolTip(
                     tr("Categories unavailable: %1").arg(DisplayFormat::error(choices.error())));
@@ -715,15 +757,15 @@ void InspectorPanel::load_library_choices(const uuids::uuid& library) {
             }
             category_combo_->setToolTip({});
             collection_combo_->setToolTip({});
-            if (!category_combo_->hasFocus()) {  // never replace what the user is typing
-                const QString typed = category_combo_->currentText();
+            if (library_changed || !category_combo_->hasFocus()) {  // never replace what the user types
+                const QString typed = library_changed ? QString() : category_combo_->currentText();
                 category_combo_->clear();
                 for (const auto& category : choices->categories)
                     category_combo_->addItem(DisplayFormat::from_utf8(category.path));
                 category_combo_->setEditText(typed);
             }
-            if (!collection_combo_->hasFocus()) {
-                const QVariant chosen = collection_combo_->currentData();
+            if (library_changed || !collection_combo_->hasFocus()) {
+                const QVariant chosen = library_changed ? QVariant() : collection_combo_->currentData();
                 collection_combo_->clear();
                 manual_collection_ids_.clear();
                 for (const auto& collection : choices->collections) {
@@ -740,33 +782,38 @@ void InspectorPanel::load_library_choices(const uuids::uuid& library) {
 
 void InspectorPanel::update_summary() {
     const std::size_t count = rows_.size();
+    // A partly loaded selection is summarized over its loaded rows, always as several samples.
+    const bool single = count == 1 && whole_selection_loaded();
+    const bool several = count > 1 || !whole_selection_loaded();
+    const std::size_t selected = std::max(count, total_selected_);
     partial_label_->setText(
         whole_selection_loaded()
             ? QString()
-            : tr("Only %1 of the %2 selected samples are loaded, so editing is off: an edit would miss the "
-                 "others. Select fewer samples to edit them.")
+            : tr("Showing the values of the %1 loaded of the %2 selected samples. Edits apply to all %2.")
                   .arg(DisplayFormat::count(static_cast<std::int64_t>(count)),
                        DisplayFormat::count(static_cast<std::int64_t>(total_selected_))));
     partial_label_->setVisible(!whole_selection_loaded());
     const QString mixed = tr("Mixed");
 
-    if (count == 0) {
+    if (!whole_selection_loaded()) {
+        heading_label_->setText(tr("%n sample(s) selected", nullptr, static_cast<int>(total_selected_)));
+    } else if (count == 0) {
         heading_label_->setText(tr("No sample selected"));
-    } else if (count == 1) {
+    } else if (single) {
         const auto& row = rows_.front();
         heading_label_->setText(DisplayFormat::from_utf8(row.display_name.empty() ? row.file_name : row.display_name));
     } else {
-        heading_label_->setText(tr("%n sample(s) selected", nullptr, static_cast<int>(count)));
+        heading_label_->setText(tr("%n sample(s) selected", nullptr, static_cast<int>(selected)));
     }
 
-    set_text_unless_edited(name_edit_, count == 1 ? heading_label_->text() : QString());
-    name_edit_->setPlaceholderText(count > 1 ? tr("Select one sample to rename") : QString());
-    if (count != 1 || !detail_) {
+    set_text_unless_edited(name_edit_, single ? heading_label_->text() : QString());
+    name_edit_->setPlaceholderText(several ? tr("Select one sample to rename") : QString());
+    if (!single || !detail_) {
         // A single selection's file name and format come from its detail (show_detail), which a
         // row refresh must not blank; before the detail arrives the row's values stand in.
-        original_name_label_->setText(count == 1  ? DisplayFormat::from_utf8(rows_.front().file_name)
-                                      : count > 1 ? mixed
-                                                  : QString());
+        original_name_label_->setText(single    ? DisplayFormat::from_utf8(rows_.front().file_name)
+                                      : several ? mixed
+                                                : QString());
         const auto format = common_value(rows_, [](const auto& row) { return row.format; });
         format_label_->setText(count == 0 ? QString() : format ? DisplayFormat::from_utf8(*format).toUpper() : mixed);
     }
@@ -778,19 +825,19 @@ void InspectorPanel::update_summary() {
         rating_stars_->set_rating(0);  // nothing selected: no stars left over from the last sample
     else
         rating_stars_->set_mixed(true);
-    rating_label_->setText(count > 1 && !rating ? mixed : QString());
+    rating_label_->setText(several && !rating ? mixed : QString());
 
     const auto favorite = common_value(rows_, [](const auto& row) { return row.favorite; });
     favorite_label_->setText(count == 0 ? QString() : favorite ? (*favorite ? tr("Yes") : tr("No")) : mixed);
 
-    if (count != 1 || !detail_) {
+    if (!single || !detail_) {
         if (!notes_dirty_ && !notes_edit_->toPlainText().isEmpty()) {
             const QSignalBlocker blocker(notes_edit_);
             notes_edit_->clear();
         }
-        notes_edit_->setPlaceholderText(count > 1 ? tr("Mixed — Save notes replaces the notes of all %n sample(s)",
-                                                       nullptr, static_cast<int>(count))
-                                                  : QString());
+        notes_edit_->setPlaceholderText(several ? tr("Mixed — Save notes replaces the notes of all %n sample(s)",
+                                                     nullptr, static_cast<int>(selected))
+                                                : QString());
         // Tag union with counts, from the rows' tag path lists (details exist for single
         // selections only). Paths come from the catalog as a list: never split display text.
         std::map<std::string, int> tag_counts;
@@ -801,7 +848,7 @@ void InspectorPanel::update_summary() {
         for (const auto& [path, tag_count] : tag_counts) {
             const QString tag = DisplayFormat::from_utf8(path);
             // One multi-argument arg(): a "%2" inside a tag name is never substituted.
-            tags.emplace_back(count > 1 && static_cast<std::size_t>(tag_count) < count
+            tags.emplace_back(several && static_cast<std::size_t>(tag_count) < count
                                   ? tr("%1 (%2 of %3)")
                                         .arg(tag, DisplayFormat::count(tag_count),
                                              DisplayFormat::count(static_cast<std::int64_t>(count)))
@@ -810,9 +857,9 @@ void InspectorPanel::update_summary() {
         }
         set_list_entries(tags_list_, tags);
         collections_list_->clear();
-        if (count > 1) collections_list_->addItem(tr("Select one sample to see its collections"));
+        if (several) collections_list_->addItem(tr("Select one sample to see its collections"));
         locations_list_->clear();
-        locations_group_->setVisible(count == 1);
+        locations_group_->setVisible(single);
         const auto bpm = common_value(rows_, [](const auto& row) { return row.bpm_milli; });
         const auto key = common_value(rows_, [](const auto& row) { return row.key; });
         bpm_label_->setText(count == 0 ? QString()
@@ -833,8 +880,8 @@ void InspectorPanel::update_summary() {
 
 void InspectorPanel::update_enabled() {
     const bool has_selection = !rows_.empty();
-    const bool editable = has_selection && !read_only_ && whole_selection_loaded();
-    const bool single = rows_.size() == 1;
+    const bool editable = (has_selection || total_selected_ > 0) && !read_only_;
+    const bool single = rows_.size() == 1 && whole_selection_loaded();
     name_edit_->setEnabled(editable && single);
     rename_button_->setEnabled(editable && single);
     rating_stars_->setEnabled(editable);
@@ -864,7 +911,7 @@ void InspectorPanel::update_enabled() {
 }
 
 void InspectorPanel::request(catalog::EditCommand command) {
-    if (rows_.empty() || read_only_ || !whole_selection_loaded()) return;
+    if ((rows_.empty() && total_selected_ == 0) || read_only_) return;
     emit editRequested(command);
 }
 

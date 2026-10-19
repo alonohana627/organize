@@ -5,17 +5,33 @@ it scans on `import` and analyzes only on `analyze`. It uses the same search syn
 the [README](../README.md#searching)).
 
 ```text
-mso [--workspace DIR] [--worker PATH] [--json] <command>       mso --version
-  create <lib> [--name N]            add-root <lib> <folder>          import <lib> [--root ID]
-  info <lib>                         search -l <lib> [-l <lib2>] "<query>" [--sort F] [--desc] [--count]
-  show <lib> <id>                    edit <lib> <ids...> [--rating N] [--tag P] [--untag P] [--category P]
-                                          [--favorite yes|no] [--notes T] [--bpm X|auto|unknown] [--key K]
-  undo|redo|history <lib>            tag <lib> <id> --rename N | --move-under ID | --merge-into ID
-  collection <lib> --create N [--smart Q] | --id ID --rename N | --delete
-  tags|collections <lib>             analyze <lib> [query] --profile Waveforms|Musical|Duplicates|Full [--timeout S]
-  export <lib> <file> [--format csv|json]    backup|check <lib>    probe <file>    play <file> [--backend null]
-  capabilities                       bench <new-lib> [--rows N] [--repetitions N]   (synthetic benchmark: SQLite and in-memory index)
+mso [--workspace DIR] [--worker PATH] [--json] <command>
+mso --version | --help | <command> --help
+
+  create <lib> [--name N]
+  add-root <lib> <folder> [--name N]
+  import <lib> [--root ID]
+  info|tags|collections|history|undo|redo|backup|check <lib>
+  search -l <lib> [-l <lib2>]... ["<query>"] [--sort name|added|duration|size|rate|bpm|key|rating|format|relevance]
+         [--desc] [--limit N] [--count]
+  show <lib> <id>
+  edit <lib> <ids...> [--rating 0-5] [--favorite yes|no] [--notes T] [--name N] [--tag P]... [--untag P]...
+         [--category P | --clear-category] [--bpm X|auto|unknown] [--key K|auto|unknown]
+         [--add-to ID | --remove-from ID] [--remove | --restore] [--operation UUID]
+  tag <lib> <id> --rename N | --move-under ID | --move-to-top | --merge-into ID
+  collection <lib> --create N [--smart Q] | --id ID --rename N | --id ID --delete
+  analyze <lib> [query] [--profile Waveforms|Musical|Duplicates|Full] [--force] [--timeout S]
+  export <lib> <file> [--format csv|json] [--query Q] [--raw] [--absolute-paths]
+  probe <file>
+  play <file> [--volume DB] [--seconds S] [--backend system|null]
+  capabilities
+  bench <new-lib> [--rows N] [--repetitions N] [--names realistic|short]
 ```
+
+Defaults: `search` sorts by name and prints at most 50 rows (`--limit`, up to 10,000,000); `analyze`
+uses the Musical profile and waits without a time limit (`--timeout 0`); `play` plays the whole
+file (at most an hour) at -6 dB on the default output device; `bench` inserts 100,000 rows with
+realistic file names.
 
 Exit codes:
 
@@ -29,8 +45,11 @@ Exit codes:
 
 Output and waiting:
 
-- `--json` is a global option, so it goes before the command. `mso --json search ... --count` prints
-  one JSON document.
+- `--json` is a global option, so it goes before the command. `mso --json search ...` prints one
+  JSON array of rows, one row per line as they are found; with `--count` it prints one JSON object
+  (`{"rows": [...], "total": n, "complete": true}`).
+- A library that cannot be searched (for example its drive is offline) is reported once on stderr,
+  and the exit code is 3.
 - Progress lines are printed only to a terminal, never with `--json`.
 - `analyze` waits for its runs, but it cannot hang. It stops on any of these:
   - a paused queue, including a missing worker or a worker that keeps failing to start (a single

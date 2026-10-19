@@ -22,10 +22,16 @@ PlaybackRenderer::PlaybackRenderer(PcmRing& ring, SharedPlaybackState& shared) n
 void PlaybackRenderer::configure(std::uint32_t output_rate, std::uint32_t latency_frames) noexcept {
     // The previous device's output frames and latency mean nothing to this one. Until this device
     // has played through its own latency, the position last heard on the previous one stands.
-    playhead_history_.restart(playhead_history_.audible(output_frames_, latency_frames_));
+    playhead_history_.restart(
+        playhead_history_.audible(output_frames_, latency_frames_.load(std::memory_order_relaxed)));
+    // What was rendered for the previous device continues from its consumed position, not from what
+    // the listener heard: drop it all, including epochs published but not adopted yet. The decoder
+    // thread re-anchors at the audible position for the new configuration.
+    superseded_through_epoch_ =
+        std::max(epoch_, TransportGate::unpacked(shared_.transport_gate.load(std::memory_order_acquire)).epoch);
 
     output_rate_ = output_rate;
-    latency_frames_ = latency_frames;
+    latency_frames_.store(latency_frames, std::memory_order_relaxed);
     transport_gain_.set_step(LinearRamp::step_for(output_rate, kTransportFadeMilliseconds));
     volume_gain_.set_step(LinearRamp::step_for(output_rate, kVolumeGlideMilliseconds));
     decay_length_ = std::max<std::uint32_t>(
@@ -38,6 +44,10 @@ void PlaybackRenderer::configure(std::uint32_t output_rate, std::uint32_t latenc
     if (output_enabled_) {
         transport_gain_.restart_from(0.0f);
     }
+}
+
+void PlaybackRenderer::update_latency(std::uint32_t latency_frames) noexcept {
+    latency_frames_.store(latency_frames, std::memory_order_relaxed);
 }
 
 void PlaybackRenderer::render(std::span<float> stereo_output) noexcept {
@@ -85,7 +95,8 @@ void PlaybackRenderer::render(std::span<float> stereo_output) noexcept {
     output_frames_ += frame_count;
 
     publish_progress();
-    const bool primed = position_epoch_ == epoch_ && epoch_ != 0;
+    // Waiting for the decoder thread's first epoch on a new device is not a starved stream.
+    const bool primed = position_epoch_ == epoch_ && epoch_ > superseded_through_epoch_;
     const bool ended = shared_.ended_epoch.load(std::memory_order_relaxed) == epoch_;
     if (starved && primed && !ended && !dropped_foreign_rate_) {
         shared_.underrun_count.fetch_add(1, std::memory_order_relaxed);
@@ -124,7 +135,7 @@ void PlaybackRenderer::adopt_gate(TransportGate gate) noexcept {
 }
 
 bool PlaybackRenderer::is_superseded(const PcmBlockHeader& header) const noexcept {
-    return header.epoch < epoch_ || header.output_rate != output_rate_;
+    return header.epoch < epoch_ || header.epoch <= superseded_through_epoch_ || header.output_rate != output_rate_;
 }
 
 bool PlaybackRenderer::read_frame(float& left, float& right) noexcept {
@@ -212,7 +223,7 @@ void PlaybackRenderer::publish_progress() noexcept {
     progress.consumed_epoch = position_epoch_;
     progress.consumed_frames = epoch_frames_played_;
     progress.consumed_position = position_frame_;
-    if (const auto heard = playhead_history_.audible(output_frames_, latency_frames_)) {
+    if (const auto heard = playhead_history_.audible(output_frames_, latency_frames_.load(std::memory_order_relaxed))) {
         progress.audible_epoch = heard->epoch;
         progress.audible_frame = heard->position;
     }

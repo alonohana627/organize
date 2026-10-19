@@ -29,8 +29,9 @@ namespace mso {
 /// output can change: a library stores it (library_state.normalization_version), and opening a
 /// library written with another version rebuilds every stored name and path key.
 /// Version 2: fold_key folds the valid parts of malformed UTF-8; case-insensitive path keys use the
-/// simple uppercase mapping without normalization (version 1: NFC plus lowercase).
-inline constexpr std::string_view kFoldVersion = "utf8proc-2.12-nfkc-casefold-2;path-simple-uppercase-1";
+/// simple uppercase mapping without normalization (version 1: NFC plus lowercase). Path version 2:
+/// only Basic Multilingual Plane letters whose case pair round-trips are mapped, as NTFS does.
+inline constexpr std::string_view kFoldVersion = "utf8proc-2.12-nfkc-casefold-2;path-simple-uppercase-2";
 
 /// Normalized comparison key: Unicode NFKC + case folding (deps/utf8proc) with whitespace runs
 /// collapsed to one space and trimmed. Used for sort keys, sibling uniqueness and lookups;
@@ -41,7 +42,11 @@ inline constexpr std::string_view kFoldVersion = "utf8proc-2.12-nfkc-casefold-2;
 /// On a case-insensitive root (`case_sensitive == false`) each code point is mapped with the simple
 /// 1:1 Unicode uppercase mapping and nothing is normalized, which is how NTFS compares names (its
 /// $UpCase table): composed and decomposed spellings, "İ" and "i", or the Kelvin sign and "k" are
-/// different files and keep different keys, while "Kick.WAV" and "kick.wav" share one. APFS also
+/// different files and keep different keys, while "Kick.WAV" and "kick.wav" share one. Like NTFS,
+/// only Basic Multilingual Plane letters whose case pair round-trips are mapped ("ſ" and "S", or "ς"
+/// and "Σ", stay apart); letters whose case pair is newer than the volume's table (Georgian
+/// Mtavruli, Cherokee small letters) are still mapped, so two files differing only in one of them,
+/// side by side, share a key. APFS also
 /// ignores normalization, but a file whose name changes normalization between scans is relinked
 /// by its file identity, so one scheme serves every platform and a library stays portable. On a
 /// case-sensitive root the path is kept exactly. On Windows `\` also becomes `/` (it is a separator
@@ -57,6 +62,9 @@ inline constexpr std::string_view kFoldVersion = "utf8proc-2.12-nfkc-casefold-2;
 [[nodiscard]] bool is_valid_utf8(std::string_view text) noexcept;
 /// Number of Unicode code points; malformed bytes count as one each.
 [[nodiscard]] std::size_t count_code_points(std::string_view utf8) noexcept;
+/// The longest prefix of at most `maximum_bytes` bytes that does not end inside a UTF-8 sequence
+/// (for shortening text in messages without producing malformed UTF-8).
+[[nodiscard]] std::string_view utf8_prefix(std::string_view utf8, std::size_t maximum_bytes) noexcept;
 /// True when the text contains at least one Unicode letter or digit (general category L* or N*).
 /// Text without one (e.g. "!!!") produces no full-text tokens.
 [[nodiscard]] bool has_letter_or_digit(std::string_view utf8) noexcept;

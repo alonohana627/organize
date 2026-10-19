@@ -150,11 +150,11 @@ struct SharedPlaybackState {
     /// Callbacks that starved while playing.
     std::atomic<std::uint64_t> underrun_count{0};
 
-    // ---- set by the device notification thread, cleared by the output thread
+    // ---- set and cleared by the output thread (OutputSupervisor::on_device_lost() may set it anywhere)
 
-    /// The endpoint stopped unexpectedly, or none could be opened. Sticky until the output thread
-    /// opens another device (only then, with no device left to notify, is it cleared), so writers
-    /// never overlap. While it is set the output thread re-opens an endpoint with backoff.
+    /// The endpoint is lost (the output thread's watchdog found it stopped or stalled), or none could
+    /// be opened. Sticky until the output thread opens another endpoint or finds the lost one working
+    /// again. While it is set the output thread re-opens an endpoint with backoff.
     alignas(kCacheLineBytes) std::atomic<bool> device_lost{false};
 
     // ---- set by the output thread, taken by the decoder thread

@@ -95,9 +95,12 @@ void register_play(CLI::App& root, CommandContext& context, int& exit_code) {
                 exit_code = context.report(Error{*snapshot.last_error, false, "playback stopped", {}, {}});
                 break;
             }
-            // Once the length is known, a Play that never takes effect (or an end the 50 ms polls
-            // never saw) still ends shortly after the file would have.
-            if (!length_applied && snapshot.total_frames && snapshot.source_sample_rate > 0) {
+            // Once the exact length is known, a Play that never takes effect (or an end the 50 ms
+            // polls never saw) still ends shortly after the file would have. An estimated length
+            // (a VBR MP3 without a seek header) can be far too short, so it never cuts playback:
+            // then only Stopped or the one-hour cap ends it.
+            if (!length_applied && snapshot.total_frames && snapshot.total_frames_exact &&
+                snapshot.source_sample_rate > 0) {
                 length_applied = true;
                 const double file_seconds = static_cast<double>(*snapshot.total_frames) / snapshot.source_sample_rate;
                 limit = std::min(limit, file_seconds + kPlayEndGrace);

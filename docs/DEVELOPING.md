@@ -13,20 +13,25 @@ is C++23 (clang + libc++), Qt 6 and SQLite, licensed under the GNU GPL v3.
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds with warnings as errors and runs every
-CTest entry, using only prebuilt packages for the toolchain, Qt and FFmpeg. The owner's focus is
-Windows, so every build runs there (MSYS2 CLANG64: clang + libc++, Qt 6, FFmpeg), covering the whole
-project including the desktop app and its UI tests:
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is configured to build with warnings as errors
+and run every CTest entry, using only prebuilt packages for the toolchain, Qt and FFmpeg. The owner's
+focus is Windows, so every build runs there (MSYS2 CLANG64: clang + libc++, Qt 6, FFmpeg), covering the
+whole project including the desktop app and its UI tests. **Status:** the legs below are configured; a
+leg counts as verified only once a run of it is green, and `IMPLEMENTATION_STATUS.md` ("CI on GitHub")
+cites that run. The first run of the Windows legs, 39254087106, passed every test in `ci`, `ci-debug`
+and `ci-sanitize` (17 of 17 CTest entries each) and the install check, but it installed an outdated
+clang (22.1.8) and failed before building the `.msi`; the workflow now upgrades MSYS2 first
+(`update: true`) and uses the WiX Toolset the runner already has. A run with those fixes is not
+recorded yet.
 
 - **`ci`**: release build and tests, then an install-and-launch check without MSYS2 on `PATH` and the
   `.msi` (kept as a run artifact for 7 days).
 - **`ci-debug`**: Debug build with libc++'s debug hardening (bounds, iterator and comparator checks).
 - **`ci-sanitize`**: Debug build with AddressSanitizer and UndefinedBehaviorSanitizer; reports are
   symbolized (file:line).
-- **`fuzz`**: every libFuzzer target in `tests/fuzz/` for 60 s from its seed corpus
-  (`tools/run_fuzzers.py`); a crashing input is kept as a run artifact. The targets crash-proof the
-  code that reads damaged or unusual input: audio files and tags, the worker's pipe, query text and
-  paging cursors.
+- **`fuzz`**: **off.** Fuzzing is deferred by the owner to priority P10 (2026-10-19). The job stays in
+  the workflow behind `if: ${{ false }}`; the libFuzzer targets in `tests/fuzz/`, their seed corpus and
+  `tools/run_fuzzers.py` stay in the repository and can still be run by hand (`docs/BUILDING.md`).
 - **Lint** checks the vendored-dependency digests and `clang-format`.
 
 Each Windows leg keeps its own ccache, saved even when a run fails or is cancelled. **The Linux job is
@@ -116,15 +121,17 @@ text relevance and still-loading indexes fall back to `SearchService`). Its curs
 keyset cursors (sort key, library, sample id; version 102), and the federated merge finds each
 library's position by binary search, so value edits never skip rows. A row whose own sort value changes
 across the cursor can reappear, as with `SearchService`, and the UI de-duplicates rows by key. A
-cursor becomes `STALE_CURSOR` only when rows are added or removed. The indexes of all open libraries
+cursor becomes `STALE_CURSOR` when rows are added or removed, when the taxonomy (tags, categories,
+collections) changes, and when the index is reloaded. The indexes of all open libraries
 hold at most 1,000,000 rows together (`ApplicationOptions::index_row_limit`); a library beyond that is
 searched in SQLite (`IMPLEMENTATION_STATUS.md` records the memory decision). `apply_edit`, `undo` and
 `redo` patch the index before returning, and `rows(keys)` returns current rows for specific
 `SampleKey`s (library UUID + sample id): a missing key is omitted, a real failure is an error. Libraries
 are reached only through `with_library(uuid, work)`, which keeps the library open while `work` runs.
 `LibraryAccessChangedEvent` reports a library opened read-only becoming writable once the CLI releases
-its lock; closing a library that a job or an index load still holds waits up to 10 s, then returns a
-retryable `DB_BUSY`.
+its lock. `close_library` returns at once (a job or an index load still holding the library finishes
+in the background); *opening* that library again while it is still closing waits up to 10 s
+(`ApplicationOptions::close_wait`), then returns a retryable `DB_BUSY`.
 
 `CatalogChangedEvent` is coalesced to at most one per 150 ms per library and carries the changed sample
 ids, `structure_changed` (reload navigator trees) and `full_reload` (re-run the query; imports set it).

@@ -11,9 +11,23 @@
 #
 # Output: <package>/ (a copy of each package's share/licenses/<package>/) and PACKAGES.txt (every package with its version and SPDX license, and where its text is).
 
+# THIRD_PARTY_NOTICES.txt points every reader at PACKAGES.txt, so it is written on every path, also when
+# the license files cannot be collected.
+function(mso_write_package_summary summary)
+  file(MAKE_DIRECTORY "${MSO_LICENSE_DIRECTORY}")
+  file(WRITE "${MSO_LICENSE_DIRECTORY}/PACKAGES.txt" "${summary}")
+  list(APPEND CMAKE_INSTALL_MANIFEST_FILES "${MSO_LICENSE_DIRECTORY}/PACKAGES.txt")
+  set(CMAKE_INSTALL_MANIFEST_FILES "${CMAKE_INSTALL_MANIFEST_FILES}" PARENT_SCOPE)
+endfunction()
+
 if(NOT MSO_PACMAN OR NOT EXISTS "${MSO_PACMAN}")
   message(WARNING "MSO install: pacman not found next to the toolchain; the license texts of the shipped "
                   "DLLs are not installed. Build the installer from MSYS2 CLANG64 (docs/BUILDING.md).")
+  set(mso_summary "The license files of the prebuilt libraries shipped with Music Sample Organizer could not be\n")
+  string(APPEND mso_summary "collected for this installation (it was not built from MSYS2 CLANG64). The libraries are MSYS2\n")
+  string(APPEND mso_summary "CLANG64 packages; their sources and licenses are at https://repo.msys2.org/mingw/sources/\n")
+  string(APPEND mso_summary "and https://packages.msys2.org/.\n")
+  mso_write_package_summary("${mso_summary}")
   return()
 endif()
 
@@ -27,9 +41,14 @@ foreach(mso_library IN LISTS mso_installed_libraries)
   endif()
 endforeach()
 if(NOT mso_origins)
+  mso_write_package_summary("This installation ships no prebuilt library from MSYS2 packages.\n")
   return()
 endif()
 
+# pacman's field labels ("Name", "Version", "Licenses") are translated under a non-English locale; the
+# parsing below needs the English ones.
+set(ENV{LC_ALL} C)
+set(ENV{LANG} C)
 execute_process(COMMAND "${MSO_PACMAN}" -Qoq ${mso_origins}
                 OUTPUT_VARIABLE mso_owners ERROR_VARIABLE mso_owner_errors RESULT_VARIABLE mso_result)
 if(NOT mso_result EQUAL 0)
@@ -83,6 +102,4 @@ if(mso_count GREATER 0)
     string(APPEND mso_summary "${mso_name} ${mso_version}\n    License: ${mso_license}\n    Texts: ${mso_texts}\n")
   endforeach()
 endif()
-file(MAKE_DIRECTORY "${MSO_LICENSE_DIRECTORY}")
-file(WRITE "${MSO_LICENSE_DIRECTORY}/PACKAGES.txt" "${mso_summary}")
-list(APPEND CMAKE_INSTALL_MANIFEST_FILES "${MSO_LICENSE_DIRECTORY}/PACKAGES.txt")
+mso_write_package_summary("${mso_summary}")

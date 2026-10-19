@@ -162,8 +162,9 @@ Result<std::vector<OutputDeviceInfo>> OutputContext::list_devices() {
 /// The miniaudio device and what its callbacks reach through pUserData. Fixed heap address:
 /// ma_device holds pointers into itself and miniaudio holds a pointer to this object.
 struct OutputDevice::Engine {
-    Engine(PlaybackRenderer& playback_renderer, DeviceLossListener& device_loss_listener) noexcept
-        : renderer(playback_renderer), loss_listener(device_loss_listener) {}
+    Engine(PlaybackRenderer& playback_renderer, OutputDeviceListener& device_listener,
+           bool opened_as_system_default) noexcept
+        : renderer(playback_renderer), listener(device_listener), follows_system_default(opened_as_system_default) {}
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
     ~Engine() {
@@ -173,28 +174,45 @@ struct OutputDevice::Engine {
         }
     }
 
-    /// Real-time callback: renders straight into miniaudio's output buffer.
+    /// Real-time callback: renders straight into miniaudio's output buffer and counts itself for
+    /// the output thread's watchdog (one relaxed, lock-free increment).
     static void on_audio(ma_device* device, void* output, const void* /*input*/, ma_uint32 frame_count) {
         auto* engine = static_cast<Engine*>(device->pUserData);
         engine->renderer.render(
             std::span<float>(static_cast<float*>(output), std::size_t{frame_count} * kOutputChannels));
+        engine->callback_count.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// Device events: an unexpected stop means the endpoint went away.
+    /// Device events, passed on to the listener. A stop this object asked for is not an event.
     static void on_notification(const ma_device_notification* notification) {
         auto* engine = static_cast<Engine*>(notification->pDevice->pUserData);
-        if (notification->type == ma_device_notification_type_stopped &&
-            !engine->expecting_stop.load(std::memory_order_acquire)) {
-            engine->loss_listener.on_device_lost();
+        switch (notification->type) {
+            case ma_device_notification_type_started:
+                engine->listener.on_output_device_event(OutputDeviceEvent::Started);
+                break;
+            case ma_device_notification_type_stopped:
+                if (!engine->expecting_stop.load(std::memory_order_acquire)) {
+                    engine->listener.on_output_device_event(OutputDeviceEvent::Stopped);
+                }
+                break;
+            case ma_device_notification_type_rerouted:
+                engine->listener.on_output_device_event(OutputDeviceEvent::Rerouted);
+                break;
+            default:
+                break;  // interruptions and unlocks concern mobile platforms only
         }
     }
 
-    PlaybackRenderer& renderer;              ///< what the callback runs
-    DeviceLossListener& loss_listener;       ///< told about an unexpected stop
-    std::atomic<bool> expecting_stop{true};  ///< our own stop/close: do not report it as a loss
-    bool initialized = false;                ///< ma_device_init succeeded
-    ma_device device{};                      ///< the endpoint
+    PlaybackRenderer& renderer;                    ///< what the callback runs
+    OutputDeviceListener& listener;                ///< told about the backend's events
+    const bool follows_system_default;             ///< opened without an explicit endpoint id
+    std::atomic<bool> expecting_stop{true};        ///< our own stop/close: not an event
+    std::atomic<std::uint64_t> callback_count{0};  ///< data callbacks run so far
+    bool initialized = false;                      ///< ma_device_init succeeded
+    ma_device device{};                            ///< the endpoint
 };
+
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free, "the callback counts itself lock-free");
 
 OutputDevice::OutputDevice() = default;
 
@@ -202,8 +220,7 @@ OutputDevice::~OutputDevice() = default;
 
 Result<std::unique_ptr<OutputDevice>> OutputDevice::open(OutputContext& context, const OutputDeviceId& device,
                                                          const OutputDeviceSettings& settings,
-                                                         PlaybackRenderer& renderer,
-                                                         DeviceLossListener& loss_listener) {
+                                                         PlaybackRenderer& renderer, OutputDeviceListener& listener) {
     auto native_id = context.engine_->resolve(device);
     if (!native_id) {
         return std::unexpected(native_id.error());
@@ -212,7 +229,7 @@ Result<std::unique_ptr<OutputDevice>> OutputDevice::open(OutputContext& context,
     if (!output) {
         return fail(ErrorCode::ResourceLimit, "out of memory for the output device");
     }
-    output->engine_.reset(new (std::nothrow) Engine(renderer, loss_listener));
+    output->engine_.reset(new (std::nothrow) Engine(renderer, listener, device.is_system_default()));
     if (!output->engine_) {
         return fail(ErrorCode::ResourceLimit, "out of memory for the output device");
     }
@@ -254,6 +271,17 @@ void OutputDevice::stop() noexcept {
     // A failed stop means the device is already stopped or gone; either way no callback runs after
     // this returns, which is all a caller relies on.
     (void)ma_device_stop(&engine_->device);
+}
+
+OutputDeviceHealth OutputDevice::health() const noexcept {
+    OutputDeviceHealth result;
+    result.running = ma_device_get_state(&engine_->device) == ma_device_state_started;
+    result.callback_count = engine_->callback_count.load(std::memory_order_relaxed);
+    return result;
+}
+
+bool OutputDevice::follows_system_default() const noexcept {
+    return engine_->follows_system_default;
 }
 
 OutputFacts OutputDevice::facts() const {

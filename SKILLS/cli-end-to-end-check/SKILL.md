@@ -45,8 +45,12 @@ desktop app has a library open, the CLI opens it read-only (`library.lock`) and 
 fail; use a scratch library.
 
 For scale, `mso bench <new-lib> --rows 100000 --repetitions 30` measures catalog inserts and search
-latency on synthetic metadata (no audio), through SQLite and through the in-memory index, and the
-index's memory per row; use a release build and record results in `IMPLEMENTATION_STATUS.md`.
+latency on synthetic metadata (no audio), through SQLite and through the in-memory index, the
+index's memory per row, and the cost of a rating edit and of a 1,000-row BPM edit patched into the
+index. File names are realistic by default (pack-style, 25-60 bytes, some not ASCII); `--names short`
+repeats the earlier 12-16-byte names, which flatter the memory figure. `--rows` above 1,000,000 lifts
+the index cap for the benchmark only. Use a release build and record results in
+`IMPLEMENTATION_STATUS.md`.
 
 ## 3. Things to look for
 

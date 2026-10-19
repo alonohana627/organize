@@ -164,9 +164,8 @@ void WaveformView::changeEvent(QEvent* event) {
     QWidget::changeEvent(event);
 }
 
-void WaveformView::paintEvent(QPaintEvent* event) {
-    QPainter painter(this);
-    painter.setClipRegion(event->region());
+void WaveformView::paintEvent(QPaintEvent* /*event*/) {
+    QPainter painter(this);  // already clipped to the region being repainted
     const QRect area = content_area();
     painter.fillRect(rect(), palette().color(QPalette::Base));
 

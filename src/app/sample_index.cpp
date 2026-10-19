@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <format>
 #include <functional>
@@ -35,17 +36,29 @@ constexpr std::size_t kSortFieldCount = 10;
 /// Minimum spacing of outbox acknowledgements (each one is a small catalog write).
 constexpr auto kAcknowledgeInterval = std::chrono::seconds(5);
 /// Above this many changed rows a cached sort order is dropped and rebuilt on demand instead of
-/// being patched in place.
-constexpr std::size_t kMaximumPatchedRows = 2048;
+/// being patched in place. A patch costs one pass over the order plus a binary search per changed
+/// row; a rebuild sorts every row with key comparisons, which costs far more up to about this size.
+constexpr std::size_t kMaximumPatchedRows = 32'768;
 /// SQL id sets kept per index (full-text terms, collection membership).
 constexpr std::size_t kCachedIdSets = 4;
 /// Depth limit of tag subtrees, as in the SQL scope compiler.
 constexpr int kMaximumTaxonomyDepth = 16;
 /// Slot map marker of an id without a row.
 constexpr std::uint32_t kNoSlot = std::numeric_limits<std::uint32_t>::max();
-/// Sample ids are dense SQLite row ids, so the id → slot map is a vector indexed by id. Larger ids
-/// than this make the library unsuitable for the index (it is answered from SQLite instead).
-constexpr std::int64_t kMaximumIndexedSampleId = std::int64_t{1} << 31;
+/// Sample ids are dense SQLite row ids, so the id → slot map and the SQL id sets are vectors indexed
+/// by id. Their size is tied to the row limit: ids up to kIdsPerRowLimit times the row limit (and at
+/// least kMinimumIdLimit) are indexed; a library with larger ids (a long history of removed samples)
+/// is answered from SQLite instead, so a sparse or damaged id never commits gigabytes.
+constexpr std::int64_t kIdsPerRowLimit = 4;
+constexpr std::int64_t kMinimumIdLimit = std::int64_t{1} << 20;
+/// Hard ceiling of the id limit (slots are 32-bit).
+constexpr std::int64_t kMaximumIdLimit = std::int64_t{1} << 31;
+
+/// The largest sample id (exclusive) an index loaded with `row_limit` holds.
+std::int64_t id_limit_for(std::size_t row_limit) {
+    const auto rows = static_cast<std::int64_t>(std::min<std::size_t>(row_limit, kMaximumIdLimit / kIdsPerRowLimit));
+    return std::clamp(rows * kIdsPerRowLimit, kMinimumIdLimit, kMaximumIdLimit);
+}
 
 // ---------------------------------------------------------------- shared text
 
@@ -155,6 +168,82 @@ struct SharedTables {
 
 // ---------------------------------------------------------------- compact rows
 
+/// The three texts of one row (display name, name key, file name) in a single heap block. Three
+/// std::string members cost 72 bytes inline plus one allocation each once a name outgrows libc++'s
+/// 22-byte small-string buffer, which real pack names (25-60 bytes, often not ASCII) do; one block
+/// costs a pointer and one allocation. The name key is stored only when it differs from the display
+/// name, and the file name only past the prefix it shares with the display name ("Kick 01" and
+/// "Kick 01.wav" store ".wav").
+class RowText {
+public:
+    RowText() = default;
+    /// Packs the three texts. Each is shorter than 4 GiB (they come from file names and paths).
+    RowText(std::string_view display_name, std::string_view name_key, std::string_view file_name) {
+        const bool key_is_name = name_key == display_name;
+        const auto shared =
+            static_cast<std::size_t>(std::ranges::mismatch(display_name, file_name).in1 - display_name.begin());
+        const Header header{static_cast<std::uint32_t>(display_name.size()),
+                            key_is_name ? kSameAsName : static_cast<std::uint32_t>(name_key.size()),
+                            static_cast<std::uint32_t>(shared), static_cast<std::uint32_t>(file_name.size() - shared)};
+        const std::size_t key_bytes = key_is_name ? 0 : name_key.size();
+        block_ = std::make_unique_for_overwrite<char[]>(sizeof(Header) + display_name.size() + key_bytes +
+                                                        header.file_suffix);
+        char* cursor = block_.get();
+        std::memcpy(cursor, &header, sizeof(Header));
+        cursor += sizeof(Header);
+        std::ranges::copy(display_name, cursor);
+        cursor += display_name.size();
+        if (!key_is_name) std::ranges::copy(name_key, cursor);
+        cursor += key_bytes;
+        std::ranges::copy(file_name.substr(shared), cursor);
+    }
+
+    /// SampleRow::display_name.
+    std::string_view display_name() const {
+        if (!block_) return {};
+        return {block_.get() + sizeof(Header), header().display_name};
+    }
+    /// fold_key(display_name): the catalog's samples.name_key, the Name sort order.
+    std::string_view name_key() const {
+        if (!block_) return {};
+        const auto layout = header();
+        if (layout.name_key == kSameAsName) return display_name();
+        return {block_.get() + sizeof(Header) + layout.display_name, layout.name_key};
+    }
+    /// Appends the file name (or the whole relative path of a row with kVerbatimPath) to `out`.
+    void append_file_name(std::string& out) const {
+        if (!block_) return;
+        const auto layout = header();
+        out.append(display_name().substr(0, layout.file_prefix));
+        const std::size_t key_bytes = layout.name_key == kSameAsName ? 0 : layout.name_key;
+        out.append(block_.get() + sizeof(Header) + layout.display_name + key_bytes, layout.file_suffix);
+    }
+    /// The file name (or verbatim relative path) as a string.
+    std::string file_name() const {
+        std::string name;
+        append_file_name(name);
+        return name;
+    }
+
+private:
+    /// Lengths at the start of the block (copied out with memcpy: the block has no alignment).
+    struct Header {
+        std::uint32_t display_name = 0;
+        std::uint32_t name_key = 0;     ///< kSameAsName when the key equals the display name
+        std::uint32_t file_prefix = 0;  ///< leading bytes the file name shares with the display name
+        std::uint32_t file_suffix = 0;  ///< bytes of the file name stored after the texts
+    };
+    static constexpr std::uint32_t kSameAsName = std::numeric_limits<std::uint32_t>::max();
+
+    Header header() const {
+        Header layout;
+        std::memcpy(&layout, block_.get(), sizeof(Header));
+        return layout;
+    }
+
+    std::unique_ptr<char[]> block_;
+};
+
 /// Presence and boolean bits of a CompactRow.
 enum RowBit : std::uint16_t {
     kHasDuration = 1u << 0,
@@ -169,7 +258,7 @@ enum RowBit : std::uint16_t {
     kHasCategory = 1u << 9,
     kDurationExact = 1u << 10,
     kFavorite = 1u << 11,
-    kVerbatimPath = 1u << 12,  ///< `file_name` holds the whole relative path (it did not split cleanly)
+    kVerbatimPath = 1u << 12,  ///< the row's file name holds the whole relative path (it did not split cleanly)
 };
 
 /// One indexed sample: a search::SampleRow without the text other rows share (that lives in
@@ -188,9 +277,9 @@ struct CompactRow {
     double bpm_confidence = 0;
     double key_confidence = 0;
     uuids::uuid sample_uuid;
-    std::string display_name;
-    std::string name_key;      ///< fold_key(display_name): the catalog's samples.name_key, the Name order
-    std::string file_name;     ///< last path segment (or the whole path with kVerbatimPath)
+    /// Display name, name key (the Name order) and file name: the last path segment, or the whole
+    /// relative path with kVerbatimPath.
+    RowText text;
     std::uint32_t folder = 0;  ///< FolderEntry number (which also gives the root)
     std::uint32_t format = 0;  ///< TextPool numbers
     std::uint32_t codec = 0;
@@ -264,18 +353,13 @@ CompactRow compact(PreparedRow&& prepared, SharedTables& tables) {
     compact.set(kDurationExact, row.duration_exact);
     compact.set(kFavorite, row.favorite);
     compact.sample_uuid = row.sample_uuid;
-    compact.display_name = std::move(row.display_name);
-    compact.name_key = std::move(prepared.name_key);
     const auto root = tables.intern_root(row);
     compact.folder = tables.intern_folder(root, row.folder_path);
     // The path is stored as folder number + file name when it splits back exactly.
     const std::string rebuilt = row.folder_path.empty() ? row.file_name : row.folder_path + '/' + row.file_name;
-    if (rebuilt == row.relative_path) {
-        compact.file_name = std::move(row.file_name);
-    } else {
-        compact.file_name = std::move(row.relative_path);
-        compact.set(kVerbatimPath, true);
-    }
+    const bool splits = rebuilt == row.relative_path;
+    compact.set(kVerbatimPath, !splits);
+    compact.text = RowText(row.display_name, prepared.name_key, splits ? row.file_name : row.relative_path);
     compact.format = tables.texts.intern(row.format);
     compact.codec = tables.texts.intern(row.codec);
     compact.bpm_source = tables.texts.intern(row.bpm_source);
@@ -290,12 +374,13 @@ CompactRow compact(PreparedRow&& prepared, SharedTables& tables) {
 
 /// The file name and relative path of a compact row.
 std::pair<std::string, std::string> file_and_path(const CompactRow& compact, const FolderEntry& folder) {
+    auto stored = compact.text.file_name();
     if (compact.has(kVerbatimPath)) {
-        const auto slash = compact.file_name.rfind('/');
-        return {slash == std::string::npos ? compact.file_name : compact.file_name.substr(slash + 1),
-                compact.file_name};
+        const auto slash = stored.rfind('/');
+        return {slash == std::string::npos ? stored : stored.substr(slash + 1), stored};
     }
-    return {compact.file_name, folder.path.empty() ? compact.file_name : folder.path + '/' + compact.file_name};
+    auto path = folder.path.empty() ? stored : folder.path + '/' + stored;
+    return {std::move(stored), std::move(path)};
 }
 
 /// The full search::SampleRow of a compact row (the inverse of compact()).
@@ -307,7 +392,7 @@ search::SampleRow expand(const CompactRow& compact, const SharedTables& tables, 
     row.library = library;
     row.sample_id = compact.sample_id;
     row.sample_uuid = compact.sample_uuid;
-    row.display_name = compact.display_name;
+    row.display_name = compact.text.display_name();
     auto [file_name, relative_path] = file_and_path(compact, folder);
     row.file_name = std::move(file_name);
     row.root_id = root.root_id;
@@ -422,11 +507,11 @@ void fill_for_matching(search::SampleRow& scratch, const CompactRow& compact, co
         if (root.root_id == 0) {
             scratch.path_key.clear();
         } else if (compact.has(kVerbatimPath)) {
-            scratch.path_key = path_key(compact.file_name, root.case_sensitive);
+            scratch.path_key = path_key(compact.text.file_name(), root.case_sensitive);
         } else {
             scratch.path_key = folder.key;
             if (!folder.key.empty()) scratch.path_key += '/';
-            scratch.path_key += compact.file_name;
+            compact.text.append_file_name(scratch.path_key);
         }
     }
 }
@@ -451,7 +536,7 @@ SortKey sort_key(const CompactRow& row, const SharedTables& tables, SortField fi
     switch (field) {
         case SortField::Name:
         case SortField::Relevance:
-            return SortKey{true, true, 0, row.name_key};
+            return SortKey{true, true, 0, row.text.name_key()};
         case SortField::Added:
             return SortKey{true, false, row.created_at, {}};
         case SortField::Duration:
@@ -472,7 +557,7 @@ SortKey sort_key(const CompactRow& row, const SharedTables& tables, SortField fi
             return format.empty() ? SortKey{} : SortKey{true, true, 0, format};
         }
     }
-    return SortKey{true, true, 0, row.name_key};
+    return SortKey{true, true, 0, row.text.name_key()};
 }
 
 /// Three-way comparison of two present keys of the same field (text compares bytewise, like
@@ -501,6 +586,40 @@ struct SortOrder {
     std::size_t non_null = 0;  ///< slots[0, non_null) have a value; the rest are nulls
 };
 
+/// A sort key that owns its text, kept while the row it came from is overwritten.
+struct StoredKey {
+    bool present = false;
+    bool text = false;
+    std::int64_t number = 0;
+    std::string characters;
+
+    /// A copy of `key`.
+    static StoredKey of(const SortKey& key) {
+        return StoredKey{key.present, key.text, key.number, std::string(key.characters)};
+    }
+    /// True when `key` orders exactly like this one.
+    bool equals(const SortKey& key) const {
+        if (present != key.present) return false;
+        if (!present) return true;
+        return text ? characters == key.characters : number == key.number;
+    }
+};
+
+/// Where a changed row sat in one cached order before its new values were applied.
+struct OldPlacement {
+    std::uint32_t slot = 0;
+    std::int64_t sample_id = 0;
+    std::size_t position = 0;  ///< index in SortOrder::slots
+    StoredKey key;             ///< its key for that order's field
+};
+
+/// What patching the cached orders needs to know from before a change was applied.
+struct OrderPatch {
+    bool rebuild = false;                                               ///< too many rows changed: drop every order
+    std::array<bool, kSortFieldCount> dropped{};                        ///< per order: rebuild it instead of patching
+    std::array<std::vector<OldPlacement>, kSortFieldCount> placements;  ///< per cached order
+};
+
 /// A filtered list of slots in ascending order, cached so later pages cost O(log n + page size).
 struct FilteredResult {
     std::string key;
@@ -513,13 +632,14 @@ struct FilteredResult {
 /// 100K rows costs a bit lookup each instead of a hash probe.
 class SampleIdSet {
 public:
-    explicit SampleIdSet(const std::vector<std::int64_t>& ids) {
+    /// The members of `ids` below `id_limit` (larger ids cannot be rows of the index anyway).
+    SampleIdSet(const std::vector<std::int64_t>& ids, std::int64_t id_limit) {
         std::int64_t largest = -1;
         for (const auto id : ids)
-            largest = std::max(largest, id);
+            if (id < id_limit) largest = std::max(largest, id);
         members_.assign(static_cast<std::size_t>(largest + 1), false);
         for (const auto id : ids)
-            if (id >= 0) members_[static_cast<std::size_t>(id)] = true;
+            if (id >= 0 && id <= largest) members_[static_cast<std::size_t>(id)] = true;
     }
     bool contains(std::int64_t id) const {
         return id >= 0 && static_cast<std::size_t>(id) < members_.size() && members_[static_cast<std::size_t>(id)];
@@ -603,6 +723,7 @@ struct IndexData {
     std::vector<std::uint32_t> free_slots;
     std::vector<std::uint32_t> slot_by_id;  ///< indexed by sample id; kNoSlot = not live
     std::size_t live_rows = 0;
+    std::int64_t id_limit = kMinimumIdLimit;  ///< ids at or above this are not indexed (id_limit_for)
     SharedTables tables;
     Taxonomy taxonomy;
 
@@ -613,7 +734,7 @@ struct IndexData {
         return slot == kNoSlot ? std::nullopt : std::optional(slot);
     }
 
-    /// Adds a row that is not yet present (its id is within kMaximumIndexedSampleId).
+    /// Adds a row that is not yet present (its id is below id_limit).
     std::uint32_t insert(CompactRow&& row) {
         std::uint32_t slot = 0;
         if (!free_slots.empty()) {
@@ -625,7 +746,9 @@ struct IndexData {
             rows.push_back(std::move(row));
         }
         const auto id = static_cast<std::size_t>(rows[slot].sample_id);
-        if (id >= slot_by_id.size()) slot_by_id.resize(std::max(id + 1, slot_by_id.size() * 3 / 2), kNoSlot);
+        if (id >= slot_by_id.size())
+            slot_by_id.resize(std::min(std::max(id + 1, slot_by_id.size() * 3 / 2), static_cast<std::size_t>(id_limit)),
+                              kNoSlot);
         slot_by_id[id] = slot;
         ++live_rows;
         return slot;
@@ -643,7 +766,7 @@ struct IndexData {
             const auto found = fresh_by_id.find(sample_id);
             const auto existing = slot_of(sample_id);
             if (found != fresh_by_id.end()) {
-                if (sample_id < 0 || sample_id >= kMaximumIndexedSampleId)
+                if (sample_id < 0 || sample_id >= id_limit)
                     return fail(ErrorCode::ResourceLimit, "a sample id is too large for the in-memory index");
                 auto row = compact(std::move(*found->second), tables);
                 if (existing) {
@@ -676,6 +799,7 @@ struct IndexData {
 struct SampleIndex::State {
     /// Serializes synchronize() and the catch-up step of load(); also guards the bookkeeping below.
     mutable std::mutex synchronization_mutex;
+    /// True while a load() runs (a second load is refused with DB_BUSY).
     bool loading = false;
     /// While a load runs, acknowledgements never pass the revision it started from, so the outbox
     /// keeps every change the load must catch up with.
@@ -688,6 +812,8 @@ struct SampleIndex::State {
     IndexData data;
     std::atomic<std::uint64_t> structure_generation{0};
     std::atomic<std::uint64_t> data_generation{0};
+    /// data.id_limit, readable without the lock (SQL id sets are built before any lock is taken).
+    std::atomic<std::int64_t> id_limit{kMinimumIdLimit};
 
     /// Lazily built per-field orders. Readers build under orders_mutex while holding data_mutex
     /// shared; writers patch them while holding data_mutex exclusively.
@@ -739,35 +865,112 @@ struct SampleIndex::State {
         return static_cast<std::size_t>(first_null - slots.begin());
     }
 
-    /// Re-sorts the changed slots into every cached order (caller holds data_mutex exclusively).
-    void patch_orders(std::vector<std::uint32_t> changed) {
+    /// Records where the rows of `sample_ids` sit in every cached order, before their new values
+    /// overwrite them (caller holds data_mutex exclusively). patch_orders() needs these positions:
+    /// once a row is overwritten, a binary search can no longer find its old place.
+    OrderPatch plan_order_patch(std::span<const std::int64_t> sample_ids) const {
+        OrderPatch patch;
+        std::lock_guard lock(orders_mutex);
+        if (sample_ids.size() > kMaximumPatchedRows) {
+            patch.rebuild = true;
+            return patch;
+        }
+        for (std::size_t index = 0; index < orders.size(); ++index) {
+            const auto& order = orders[index];
+            if (!order) continue;
+            const auto field = static_cast<SortField>(index);
+            auto& placements = patch.placements[index];
+            for (const auto sample_id : sample_ids) {
+                const auto slot = data.slot_of(sample_id);
+                if (!slot) continue;
+                const auto found = std::ranges::lower_bound(
+                    order->slots, *slot,
+                    [&](std::uint32_t left, std::uint32_t right) { return ascending_before(left, right, field); });
+                if (found == order->slots.end() || *found != *slot) {
+                    patch.dropped[index] = true;  // the order does not hold the row: rebuild it
+                    break;
+                }
+                placements.push_back(OldPlacement{*slot, sample_id,
+                                                  static_cast<std::size_t>(found - order->slots.begin()),
+                                                  StoredKey::of(key_of(*slot, field))});
+            }
+        }
+        return patch;
+    }
+
+    /// Moves the changed rows to their new places in every cached order (caller holds data_mutex
+    /// exclusively; `patch` was planned before the rows changed). A row whose key for an order did
+    /// not change keeps its place in that order; the others are erased in one pass and inserted in
+    /// one pass at positions found by binary search, so a single rating edit costs two block moves
+    /// in the rating order and nothing in the others, instead of a merge of every order.
+    void patch_orders(const OrderPatch& patch, std::vector<std::uint32_t> changed) {
         std::ranges::sort(changed);
         changed.erase(std::ranges::unique(changed).begin(), changed.end());
         std::lock_guard lock(orders_mutex);
-        if (changed.empty()) return;
-        std::vector<bool> is_changed(data.rows.size(), false);
-        for (const auto slot : changed)
-            is_changed[slot] = true;
         for (std::size_t index = 0; index < orders.size(); ++index) {
             auto& order = orders[index];
             if (!order) continue;
-            if (changed.size() > kMaximumPatchedRows) {
+            if (patch.rebuild || patch.dropped[index] || changed.size() > kMaximumPatchedRows) {
                 order.reset();  // rebuilt on next use
                 continue;
             }
             const auto field = static_cast<SortField>(index);
-            auto kept = order->slots;
-            std::erase_if(kept, [&](std::uint32_t slot) { return slot < is_changed.size() && is_changed[slot]; });
+            std::vector<std::size_t> removed_positions;
+            std::vector<std::uint32_t> unmoved;
+            for (const auto& placement : patch.placements[index]) {
+                const auto& row = data.rows[placement.slot];
+                if (row.live && row.sample_id == placement.sample_id &&
+                    placement.key.equals(key_of(placement.slot, field)))
+                    unmoved.push_back(placement.slot);
+                else
+                    removed_positions.push_back(placement.position);
+            }
+            std::ranges::sort(unmoved);
             std::vector<std::uint32_t> inserted;
             for (const auto slot : changed)
-                if (data.rows[slot].live) inserted.push_back(slot);
-            auto before = [&](std::uint32_t left, std::uint32_t right) { return ascending_before(left, right, field); };
-            std::ranges::sort(inserted, before);
-            std::vector<std::uint32_t> merged;
-            merged.reserve(kept.size() + inserted.size());
-            std::ranges::merge(kept, inserted, std::back_inserter(merged), before);
-            order->non_null = count_present(merged, field);
-            order->slots = std::move(merged);
+                if (data.rows[slot].live && !std::ranges::binary_search(unmoved, slot)) inserted.push_back(slot);
+            if (removed_positions.empty() && inserted.empty()) continue;
+            erase_positions(order->slots, std::move(removed_positions));
+            insert_sorted(order->slots, std::move(inserted), field);
+            order->non_null = count_present(order->slots, field);
+        }
+    }
+
+    /// Removes the entries at `positions` from `slots` in one pass.
+    static void erase_positions(std::vector<std::uint32_t>& slots, std::vector<std::size_t> positions) {
+        if (positions.empty()) return;
+        std::ranges::sort(positions);
+        positions.erase(std::ranges::unique(positions).begin(), positions.end());
+        auto write = slots.begin() + static_cast<std::ptrdiff_t>(positions.front());
+        for (std::size_t at = 0; at < positions.size(); ++at) {
+            const auto from = slots.begin() + static_cast<std::ptrdiff_t>(positions[at]) + 1;
+            const auto to = at + 1 < positions.size() ? slots.begin() + static_cast<std::ptrdiff_t>(positions[at + 1])
+                                                      : slots.end();
+            write = std::move(from, to, write);
+        }
+        slots.erase(write, slots.end());
+    }
+
+    /// Inserts `inserted` into the sorted `slots` in one backward pass. Every entry of `slots` must
+    /// be ordered by the current row values (no entry may be stale), so the binary searches agree.
+    void insert_sorted(std::vector<std::uint32_t>& slots, std::vector<std::uint32_t> inserted, SortField field) const {
+        if (inserted.empty()) return;
+        auto before = [&](std::uint32_t left, std::uint32_t right) { return ascending_before(left, right, field); };
+        std::ranges::sort(inserted, before);
+        std::vector<std::size_t> destinations;
+        destinations.reserve(inserted.size());
+        for (const auto slot : inserted)
+            destinations.push_back(
+                static_cast<std::size_t>(std::ranges::lower_bound(slots, slot, before) - slots.begin()));
+        const std::size_t old_size = slots.size();
+        slots.resize(old_size + inserted.size());
+        auto source_end = slots.begin() + static_cast<std::ptrdiff_t>(old_size);
+        auto destination_end = slots.end();
+        for (std::size_t at = inserted.size(); at-- > 0;) {
+            const auto source_begin = slots.begin() + static_cast<std::ptrdiff_t>(destinations[at]);
+            destination_end = std::move_backward(source_begin, source_end, destination_end);
+            *--destination_end = inserted[at];
+            source_end = source_begin;
         }
     }
 
@@ -842,17 +1045,17 @@ struct SampleIndex::State {
             id_sets.pop_back();
     }
 
-    /// Swaps in finished data (caller holds synchronization_mutex). The previous data is destroyed
-    /// after the exclusive lock is released, so readers wait only for the swap.
-    void publish(IndexData&& fresh) {
-        IndexData previous;
-        {
-            std::unique_lock exclusive(data_mutex);
-            previous = std::exchange(data, std::move(fresh));
-            reset_caches();
-            structure_generation.fetch_add(1, std::memory_order_acq_rel);
-            data_generation.fetch_add(1, std::memory_order_acq_rel);
-        }
+    /// Swaps in finished data (caller holds synchronization_mutex) and returns the previous data.
+    /// The caller destroys it after releasing synchronization_mutex too: freeing a million rows
+    /// takes a while, and neither readers nor synchronize() should wait for it.
+    [[nodiscard]] IndexData publish(IndexData&& fresh) {
+        std::unique_lock exclusive(data_mutex);
+        IndexData previous = std::exchange(data, std::move(fresh));
+        reset_caches();
+        id_limit.store(data.id_limit, std::memory_order_release);
+        structure_generation.fetch_add(1, std::memory_order_acq_rel);
+        data_generation.fetch_add(1, std::memory_order_acq_rel);
+        return previous;
     }
 };
 
@@ -888,18 +1091,31 @@ Result<void> SampleIndex::load(catalog::Library& library, std::stop_token stop, 
         return fail(ErrorCode::ResourceLimit,
                     std::format("the library has more than {} samples, the in-memory index limit", row_limit));
     };
+    const auto id_error = [] {
+        return fail(ErrorCode::ResourceLimit, "a sample id is too large for the in-memory index");
+    };
+
+    // A library over the limit is refused before anything is streamed; otherwise the rows are
+    // reserved once (a growing vector would briefly hold 1.5 times the rows while it moves them).
+    auto live_samples = library.sample_count();
+    if (!live_samples) return std::unexpected(live_samples.error());
+    if (*live_samples < 0 || static_cast<std::size_t>(*live_samples) > row_limit) return limit_error();
+    IndexData fresh;
+    fresh.id_limit = id_limit_for(row_limit);
+    fresh.rows.reserve(static_cast<std::size_t>(*live_samples));
 
     // Stream without any index lock: synchronize() keeps serving edits on the previous state.
-    IndexData fresh;
     bool too_many = false;
     bool id_out_of_range = false;
-    auto streamed = search::for_each_row(library, [&](search::SampleRow&& row) {
-        if (stop.stop_requested() || too_many || id_out_of_range) return;
+    // The stream stops as soon as `stop` fires and ends its read snapshot, so closing a library
+    // during its first load releases it promptly.
+    auto streamed = search::for_each_row(library, stop, [&](search::SampleRow&& row) {
+        if (too_many || id_out_of_range) return;
         if (fresh.live_rows >= row_limit) {
             too_many = true;
             return;
         }
-        if (row.sample_id < 0 || row.sample_id >= kMaximumIndexedSampleId) {
+        if (row.sample_id < 0 || row.sample_id >= fresh.id_limit) {
             id_out_of_range = true;
             return;
         }
@@ -907,15 +1123,17 @@ Result<void> SampleIndex::load(catalog::Library& library, std::stop_token stop, 
         auto name_key = fold_key(row.display_name);
         fresh.insert(compact(PreparedRow{std::move(row), std::move(name_key)}, fresh.tables));
     });
-    if (!streamed) return std::unexpected(streamed.error());
     if (stop.stop_requested()) return fail(ErrorCode::Cancelled, "loading the sample index was cancelled");
+    if (!streamed) return std::unexpected(streamed.error());
     if (too_many) return limit_error();
-    if (id_out_of_range) return fail(ErrorCode::ResourceLimit, "a sample id is too large for the in-memory index");
+    if (id_out_of_range) return id_error();
     auto taxonomy = load_taxonomy(library);
     if (!taxonomy) return std::unexpected(taxonomy.error());
     fresh.taxonomy = std::move(*taxonomy);
 
-    // Catch up with what was committed while streaming, then swap the result in.
+    // Catch up with what was committed while streaming, then swap the result in. The previous
+    // data is declared before the lock so it is freed after the mutex is released.
+    IndexData previous;
     std::lock_guard synchronization(state.synchronization_mutex);
     auto changes = library.changes_since(start_revision, kChangesPerSynchronization);
     if (!changes) return std::unexpected(changes.error());
@@ -935,7 +1153,7 @@ Result<void> SampleIndex::load(catalog::Library& library, std::stop_token stop, 
         if (fresh.live_rows > row_limit) return limit_error();
         published_revision = changes->revision;
     }
-    state.publish(std::move(fresh));
+    previous = state.publish(std::move(fresh));
     revision_.store(published_revision, std::memory_order_release);
     ready_.store(true, std::memory_order_release);
     return {};
@@ -969,6 +1187,8 @@ Result<IndexChange> SampleIndex::synchronize(catalog::Library& library) {
 
     if (!changes->sample_ids.empty() || taxonomy) {
         std::unique_lock exclusive(state.data_mutex);
+        // Where the changed rows sit in the cached orders, read before their new values land.
+        const auto order_patch = state.plan_order_patch(changes->sample_ids);
         auto applied = state.data.apply(changes->sample_ids, std::move(loaded));
         if (!applied) {
             // The rows applied so far stay; a reload rebuilds everything consistently.
@@ -983,7 +1203,7 @@ Result<IndexChange> SampleIndex::synchronize(catalog::Library& library) {
             state.data.taxonomy = std::move(*taxonomy);
             change.structure_changed = true;
         }
-        state.patch_orders(std::move(applied->changed_slots));
+        state.patch_orders(order_patch, std::move(applied->changed_slots));
         state.clear_query_caches();
         state.data_generation.fetch_add(1, std::memory_order_acq_rel);
         if (change.rows_added_or_removed || change.structure_changed)
@@ -997,6 +1217,7 @@ Result<IndexChange> SampleIndex::synchronize(catalog::Library& library) {
 
 void SampleIndex::clear() {
     auto& state = *state_;
+    IndexData previous;  // freed after both locks are released
     std::lock_guard synchronization(state.synchronization_mutex);
     {
         // Readiness changes under the exclusive lock, so a search that holds the shared lock
@@ -1004,12 +1225,7 @@ void SampleIndex::clear() {
         std::unique_lock exclusive(state.data_mutex);
         ready_.store(false, std::memory_order_release);
     }
-    state.publish(IndexData{});
-}
-
-bool SampleIndex::loading() const noexcept {
-    std::lock_guard synchronization(state_->synchronization_mutex);
-    return state_->loading;
+    previous = state.publish(IndexData{});
 }
 
 IndexGenerations SampleIndex::generations() const noexcept {
@@ -1247,7 +1463,8 @@ Result<std::vector<IndexedSearch::Participant>> IndexedSearch::prepare(std::span
                     participant.coverage.complete = false;
                     participant.coverage.error = ids.error();
                 } else {
-                    participant.ids = std::make_shared<const SampleIdSet>(*ids);
+                    participant.ids = std::make_shared<const SampleIdSet>(
+                        *ids, participant.state->id_limit.load(std::memory_order_acquire));
                     participant.state->remember_ids(
                         IdSet{plan.id_set_key, participant.ids_generation, participant.ids});
                 }
@@ -1389,9 +1606,13 @@ IndexedSearch::CursorKey IndexedSearch::key_of(const SortKey& key, std::int64_t 
 
 std::string IndexedSearch::encode_cursor(const Plan& plan, const std::vector<Participant>& participants,
                                          const ResumeKeys& keys) {
+    // Only libraries that answered this page are recorded: one that was missing and answers on a
+    // later page has no position to resume from, so the cursor must go stale rather than restart
+    // that library at its first row.
     nlohmann::json generations = nlohmann::json::object();
     for (const auto& participant : participants)
-        generations[uuids::to_string(participant.coverage.library)] = participant.structure_generation;
+        if (participant.coverage.complete)
+            generations[uuids::to_string(participant.coverage.library)] = participant.structure_generation;
     nlohmann::json positions = nlohmann::json::object();
     for (const auto& [library, key] : keys) {
         nlohmann::json value;         // null for the null partition
@@ -1416,8 +1637,11 @@ Result<IndexedSearch::ResumeKeys> IndexedSearch::decode_cursor(const Plan& plan,
         return stale();
     const auto* generations = json_fields::object_field(document, "g");
     const auto* positions = json_fields::object_field(document, "p");
-    if (generations == nullptr || positions == nullptr || generations->size() != participants.size()) return stale();
+    const auto answering = static_cast<std::size_t>(std::ranges::count_if(
+        participants, [](const Participant& participant) { return participant.coverage.complete; }));
+    if (generations == nullptr || positions == nullptr || generations->size() != answering) return stale();
     for (const auto& participant : participants) {
+        if (!participant.coverage.complete) continue;  // excluded from this page, as from the earlier ones
         const auto library = uuids::to_string(participant.coverage.library);
         const auto stored = json_fields::integer_field(*generations, library);
         if (!stored || static_cast<std::uint64_t>(*stored) != participant.structure_generation) return stale();

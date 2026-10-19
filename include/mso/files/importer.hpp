@@ -18,6 +18,8 @@
 namespace mso::files {
 
 /// Monotonic progress counters, delivered at most ~10 times per second and once more at the end.
+/// The skip counters count directories and candidate audio files; other skipped files (documents
+/// on a cloud root, for example) are not counted.
 struct ImportProgress {
     std::int64_t directories_scanned = 0;       ///< directories listed completely
     std::int64_t files_discovered = 0;          ///< candidate audio files found by enumeration
@@ -63,9 +65,10 @@ struct ImportSummary {
 /// progress callback still receives a final report (finished and cancelled set) on every exit path.
 /// Errors from the catalog abort the scan; per-file probe errors only mark that file.
 /// Entries skipped on purpose (cloud-only files, links that are not followed, link cycles,
-/// unsupported entries) exist, so their catalogued locations never become missing: a skipped file
-/// is marked seen with its stored stat, and a skipped directory is recorded as a gap (its subtree
-/// unknown, so ScanFinishOutcome::complete_coverage is false).
+/// unsupported entries) exist, so their catalogued locations never become missing: a skipped
+/// candidate audio file is marked seen with its stored stat, and a skipped directory is recorded as
+/// a gap (its subtree unknown, so ScanFinishOutcome::complete_coverage is false). Skipped files
+/// without an audio extension are ignored, as the scan ignores every non-audio file.
 /// Errors: SourceOffline when the root is unreachable (the root is marked offline), catalog
 /// errors, Cancelled, Internal when enumeration itself failed unexpectedly or the scan could not
 /// be set up (the session is then closed with its resume point).

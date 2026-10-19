@@ -79,6 +79,22 @@ constexpr utf8proc_int32_t native_separator_to_slash(utf8proc_int32_t code_point
 #endif
 }
 
+/// The case-insensitive key of one code point, as close to NTFS's $UpCase table as utf8proc allows.
+/// That table covers only the Basic Multilingual Plane, and maps a letter to its uppercase only when
+/// the pair round-trips: "ſ" (long s), dotless "ı", the micro sign "µ", final "ς" and title-case
+/// digraphs such as "ǅ" keep their own keys, because NTFS keeps such files apart (checked on
+/// Windows 11 with real files, tests/domain_tests.cpp). Letters whose case pair is newer than the
+/// volume's table (Georgian Mtavruli, Cherokee small letters, some Latin Extended-D letters) are
+/// still mapped: two files that differ only in such a letter, side by side, share one key.
+utf8proc_int32_t case_insensitive_key(utf8proc_int32_t code_point) noexcept {
+    constexpr utf8proc_int32_t kLastBasicMultilingualPlaneCodePoint = 0xFFFF;
+    const utf8proc_int32_t upper = utf8proc_toupper(code_point);
+    if (upper == code_point || code_point > kLastBasicMultilingualPlaneCodePoint ||
+        upper > kLastBasicMultilingualPlaneCodePoint || utf8proc_tolower(upper) != code_point)
+        return code_point;
+    return upper;
+}
+
 }  // namespace
 
 std::string fold_key(std::string_view utf8) {
@@ -112,7 +128,7 @@ std::string path_key(std::string_view relative_path, bool case_sensitive) {
 #endif
         return key;
     }
-    // Simple (1:1) uppercase mapping per code point and no normalization, like NTFS's $UpCase
+    // Simple (1:1) uppercase mapping per code point (case_insensitive_key), no normalization, like NTFS's $UpCase
     // comparison: "Cafe\u0301" and "Caf\u00e9", "İ" and "i", or the Kelvin sign and "k" are
     // different files there, so they keep different keys.
     std::string key;
@@ -129,7 +145,7 @@ std::string path_key(std::string_view relative_path, bool case_sensitive) {
         }
         offset += consumed;
         utf8proc_uint8_t encoded[4];
-        const auto written = utf8proc_encode_char(utf8proc_toupper(native_separator_to_slash(code_point)), encoded);
+        const auto written = utf8proc_encode_char(case_insensitive_key(native_separator_to_slash(code_point)), encoded);
         key.append(reinterpret_cast<const char*>(encoded), static_cast<std::size_t>(written));
     }
     return key;
@@ -150,6 +166,18 @@ bool is_valid_utf8(std::string_view text) noexcept {
         offset += consumed;
     }
     return true;
+}
+
+std::string_view utf8_prefix(std::string_view utf8, std::size_t maximum_bytes) noexcept {
+    if (utf8.size() <= maximum_bytes) return utf8;
+    std::size_t end = maximum_bytes;
+    const auto is_continuation_byte = [&](std::size_t index) {
+        return (static_cast<unsigned char>(utf8[index]) & 0xC0U) == 0x80U;
+    };
+    // Back up over the continuation bytes of the sequence that the cut would split (at most three).
+    for (int step = 0; step < 3 && end > 0 && is_continuation_byte(end); ++step)
+        --end;
+    return utf8.substr(0, end);
 }
 
 std::size_t count_code_points(std::string_view utf8) noexcept {
@@ -348,7 +376,8 @@ std::string format_duration(std::int64_t microseconds) {
     if (microseconds < 0) return {};
     // Below 9.995 s two decimals never round up to "10.00s"; from there on the m:ss form is used.
     if (microseconds < 9'995'000) return std::format("{:.2f}s", static_cast<double>(microseconds) / 1e6);
-    const auto seconds = microseconds / 1'000'000;
+    // Rounded like the two-decimal form above: 9.995 s is "0:10", never the smaller "0:09".
+    const auto seconds = (microseconds + 500'000) / 1'000'000;
     return std::format("{}:{:02}", seconds / 60, seconds % 60);
 }
 

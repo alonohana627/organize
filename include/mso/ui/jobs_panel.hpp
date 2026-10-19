@@ -49,6 +49,15 @@ public:
     int row_count() const;
     /// Reflects the global analysis pause state on the toggle button.
     void set_analysis_paused(bool paused);
+    /// Shows a library being opened with one-time work ("Upgrading library …", the step and its
+    /// progress); one row per library, not cancellable.
+    void update_library_open(const app::LibraryOpenProgressEvent& event);
+    /// Finishes the open rows of libraries in `open` whose last step has ended (the open is done).
+    void finish_completed_library_opens(const std::vector<uuids::uuid>& open);
+    /// Marks the open row of `library` failed with `reason`, if one is running.
+    void fail_library_open(const uuids::uuid& library, const QString& reason);
+    /// Marks every running open row of a library not in `open` failed (an open that failed).
+    void fail_unopened_library_opens(const std::vector<uuids::uuid>& open, const QString& reason);
     /// Forgets the analysis runs and worker status of libraries not in `open` (closed libraries):
     /// unfinished runs are marked "Library closed", so nothing offers Cancel for them any more.
     void retain_libraries(const std::vector<uuids::uuid>& open);
@@ -98,8 +107,9 @@ private:
     std::map<std::uint64_t, std::function<void()>> local_cancellers_;
     /// Number of the next UI task.
     std::uint64_t next_local_task_ = 1;
-    std::map<RunKey, QTreeWidgetItem*> analysis_runs_;  ///< rows of reported analysis runs
-    std::set<RunKey> dismissed_runs_;                   ///< runs the user cleared (still reported)
+    std::map<RunKey, QTreeWidgetItem*> analysis_runs_;       ///< rows of reported analysis runs
+    std::map<uuids::uuid, QTreeWidgetItem*> library_opens_;  ///< rows of libraries opened with one-time work
+    std::set<RunKey> dismissed_runs_;                        ///< runs the user cleared (still reported)
     /// Library → (display name, worker status line).
     std::map<uuids::uuid, std::pair<QString, QString>> worker_status_;
 };

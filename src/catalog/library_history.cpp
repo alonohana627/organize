@@ -761,21 +761,25 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
     ActionRecorder action(writer_);
     EditPlanner planner(writer_, command);
     std::size_t offset = 0;
-    bool resuming = false;
+    bool resuming = false;  // an earlier attempt committed chunks: continue after them
     if (*stored) {
         if ((*stored)->state == "completed") return (*stored)->receipt;
-        // An earlier attempt committed some chunks. Continue it only while it is still the newest
-        // history entry; otherwise report what was applied as partial.
+        // An earlier attempt committed some chunks. When one of them changed something it opened an
+        // action, and the edit continues only while that action is still the newest history entry;
+        // otherwise what was applied is reported as partial. When none of them changed anything
+        // there is no action and nothing that could conflict: the edit continues after them.
         const bool has_action = (*stored)->action_id.has_value() && (*stored)->receipt.history_action.has_value();
-        auto resumable = has_action ? is_resumable(writer_, *(*stored)->action_id) : Result<bool>(false);
-        if (!resumable) return std::unexpected(resumable.error());
-        if (!*resumable) return (*stored)->receipt;  // replayed = true, partial = true
+        if (has_action) {
+            auto resumable = is_resumable(writer_, *(*stored)->action_id);
+            if (!resumable) return std::unexpected(resumable.error());
+            if (!*resumable) return (*stored)->receipt;  // replayed = true, partial = true
+            action.adopt(*(*stored)->action_id, *(*stored)->receipt.history_action);
+        }
         receipt = (*stored)->receipt;
         receipt.replayed = false;
         receipt.partial = false;
         offset = (*stored)->next_offset;
         planner.continue_counts(receipt.applied, receipt.skipped);
-        action.adopt(*(*stored)->action_id, *receipt.history_action);
         resuming = true;
     }
 
@@ -790,7 +794,7 @@ Result<MutationReceipt> Library::apply_edit(const EditCommand& command) {
         if (auto began = transaction.begin(); !began) return began;
         if (!prepared) {
             if (auto ready = planner.prepare(); !ready) return ready;
-            if (resuming)
+            if (resuming && action.exists())
                 if (auto resumed = action.resume(); !resumed) return resumed;
         }
         if (auto applied = planner.apply(chunk); !applied) return applied;

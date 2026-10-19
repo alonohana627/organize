@@ -19,6 +19,7 @@
 #include "mso/analysis/analysis.hpp"
 #include "mso/analysis/byte_hash.hpp"
 #include "mso/analysis/decoded_stream_analysis.hpp"
+#include "mso/analysis/detail/unreadable_file.hpp"
 #include "mso/analysis/progress_reporter.hpp"
 #include "mso/media/media.hpp"
 
@@ -49,7 +50,9 @@ std::unexpected<Error> file_query_failure(const std::error_code& error, std::str
 Result<FileStamp> read_file_stamp(const std::filesystem::path& file) {
     std::error_code error;
     const auto status = std::filesystem::status(file, error);
-    if (status.type() == std::filesystem::file_type::not_found) return fail(ErrorCode::FileMissing, "file not found");
+    // libc++ reports an unreachable server as "not found" without an error: ask the OS what it is.
+    if (status.type() == std::filesystem::file_type::not_found)
+        return std::unexpected(detail::unreadable_file_error(file));
     if (error) return file_query_failure(error, "attributes");
     if (!std::filesystem::is_regular_file(status)) return fail(ErrorCode::InvalidArgument, "not a regular file");
 

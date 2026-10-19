@@ -19,11 +19,17 @@
 #include <QTimer>
 #include <QTreeWidget>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <variant>
 #include <vector>
 
 #include "mso/ui/analysis_controller.hpp"
@@ -34,11 +40,14 @@
 #include "mso/ui/inspector_panel.hpp"
 #include "mso/ui/jobs_panel.hpp"
 #include "mso/ui/library_controller.hpp"
+#include "mso/ui/main_window.hpp"
 #include "mso/ui/navigator_panel.hpp"
+#include "mso/ui/notification_bar.hpp"
 #include "mso/ui/preview_panel.hpp"
 #include "mso/ui/root_locations.hpp"
 #include "mso/ui/sample_context_menu.hpp"
 #include "mso/ui/sample_table_model.hpp"
+#include "mso/ui/sample_table_view.hpp"
 #include "mso/ui/ui_preferences.hpp"
 #include "mso/ui/waveform_view.hpp"
 #include "test_support.hpp"
@@ -143,6 +152,145 @@ std::unique_ptr<Workbench> start_workbench() {
 
 SampleKey key_of(const SampleRow& row) {
     return SampleKey{row.library, row.sample_id};
+}
+
+/// A one-shot signal between a worker thread and the test: open() once, wait (bounded) elsewhere.
+class Gate {
+public:
+    void open() {
+        {
+            const std::scoped_lock lock(mutex_);
+            open_ = true;
+        }
+        changed_.notify_all();
+    }
+    bool is_open() {
+        const std::scoped_lock lock(mutex_);
+        return open_;
+    }
+    /// Waits until open() (at most ten seconds, so a failing test never hangs).
+    void wait() {
+        std::unique_lock lock(mutex_);
+        changed_.wait_for(lock, std::chrono::seconds(10), [this] { return open_; });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool open_ = false;
+};
+
+/// What a FakePreviewEngine was asked and what its device does. Device calls arrive on the panel's
+/// engine pool, everything else on the UI thread, so the shared parts are atomics or locked.
+struct FakeDeviceControl {
+    std::atomic<bool> lost{false};                ///< the snapshot reports a lost device
+    std::atomic<bool> block_device_calls{false};  ///< device calls wait for release_device_call
+    Gate device_call_entered;                     ///< a held-back device call has started
+    Gate release_device_call;                     ///< lets held-back device calls finish
+    std::atomic<int> restarts{0};
+    std::atomic<int> listings{0};
+    std::atomic<int> selections{0};
+    std::mutex mutex;                                                  ///< guards the members below
+    std::vector<mso::audio::TransportCommand> posted;                  ///< UI thread
+    mso::audio::PreviewState state = mso::audio::PreviewState::Empty;  ///< from posted commands
+    std::uint64_t generation = 0;
+
+    /// A device call: waits (bounded) while the test holds device calls back.
+    void device_call() {
+        if (!block_device_calls) return;
+        device_call_entered.open();
+        release_device_call.wait();
+    }
+    /// Commands of type Command posted so far.
+    template <class Command>
+    int posted_count() {
+        const std::scoped_lock lock(mutex);
+        return static_cast<int>(std::ranges::count_if(posted, [](const mso::audio::TransportCommand& command) {
+            return std::holds_alternative<Command>(command);
+        }));
+    }
+};
+
+/// A preview engine whose output device the test controls (the null device is never lost and
+/// answers at once). It plays nothing.
+class FakePreviewEngine final : public mso::audio::PreviewEngine {
+public:
+    explicit FakePreviewEngine(std::shared_ptr<FakeDeviceControl> control) : control_(std::move(control)) {}
+
+    mso::Result<std::vector<mso::audio::OutputDeviceInfo>> list_output_devices() override {
+        ++control_->listings;
+        control_->device_call();
+        return std::vector<mso::audio::OutputDeviceInfo>{{mso::audio::OutputDeviceId{"fake:1"}, "Headphones", false},
+                                                         {mso::audio::OutputDeviceId{"fake:2"}, "Speakers", true}};
+    }
+    mso::Result<void> select_output_device(const mso::audio::OutputDeviceId&) override {
+        ++control_->selections;
+        control_->device_call();
+        return {};
+    }
+    mso::Result<void> restart_output_device() override {
+        ++control_->restarts;
+        control_->device_call();
+        control_->lost = false;  // plugged back in
+        return {};
+    }
+    // The asynchronous forms answer on a thread of their own, like the engine's output thread.
+    void list_output_devices_async(
+        mso::audio::DeviceRequestCompletion<std::vector<mso::audio::OutputDeviceInfo>> on_done) override {
+        answer_later([this, on_done] { on_done(list_output_devices()); });
+    }
+    void select_output_device_async(mso::audio::OutputDeviceId device,
+                                    mso::audio::DeviceRequestCompletion<void> on_done) override {
+        answer_later([this, device, on_done] { on_done(select_output_device(device)); });
+    }
+    void restart_output_device_async(mso::audio::DeviceRequestCompletion<void> on_done) override {
+        answer_later([this, on_done] { on_done(restart_output_device()); });
+    }
+    mso::Result<void> open(const std::filesystem::path&) override {
+        const std::scoped_lock lock(control_->mutex);
+        ++control_->generation;
+        control_->state = mso::audio::PreviewState::Paused;
+        return {};
+    }
+    mso::Result<void> open(std::unique_ptr<mso::media::Decoder>) override { return open(std::filesystem::path("x")); }
+    void post(mso::audio::TransportCommand command) noexcept override {
+        const std::scoped_lock lock(control_->mutex);
+        if (std::holds_alternative<mso::audio::transport::Play>(command))
+            control_->state = mso::audio::PreviewState::Playing;
+        else if (std::holds_alternative<mso::audio::transport::Pause>(command))
+            control_->state = mso::audio::PreviewState::Paused;
+        else if (std::holds_alternative<mso::audio::transport::TogglePlayPause>(command))
+            control_->state = control_->state == mso::audio::PreviewState::Playing ? mso::audio::PreviewState::Paused
+                                                                                   : mso::audio::PreviewState::Playing;
+        control_->posted.push_back(std::move(command));
+    }
+    mso::audio::PreviewSnapshot snapshot() const noexcept override {
+        mso::audio::PreviewSnapshot snapshot;
+        const std::scoped_lock lock(control_->mutex);
+        snapshot.state = control_->state;
+        snapshot.generation = control_->generation;
+        snapshot.output_device_lost = control_->lost;
+        snapshot.output_device_available = !control_->lost;
+        return snapshot;
+    }
+    mso::Result<void> render_offline(std::span<float>) override { return {}; }
+
+private:
+    /// Runs `answer` on a new thread (requests come from the UI thread only; joined on destruction).
+    void answer_later(std::function<void()> answer) { answer_threads_.emplace_back(std::move(answer)); }
+
+    std::shared_ptr<FakeDeviceControl> control_;
+    std::vector<std::jthread> answer_threads_;  ///< last: joined before anything else is destroyed
+};
+
+/// A preview engine factory over `control` that fails its first `failures` creations.
+mso::ui::PreviewPanel::EngineFactory fake_engine_factory(std::shared_ptr<FakeDeviceControl> control, int failures = 0) {
+    auto remaining = std::make_shared<std::atomic<int>>(failures);
+    return [control,
+            remaining](const mso::audio::PreviewOptions&) -> mso::Result<std::unique_ptr<mso::audio::PreviewEngine>> {
+        if (remaining->fetch_sub(1) > 0) return mso::fail(mso::ErrorCode::DeviceLost, "no audio subsystem");
+        return std::unique_ptr<mso::audio::PreviewEngine>(new FakePreviewEngine(control));
+    };
 }
 
 /// The first tree item whose text starts with `prefix`, or null.
@@ -321,8 +469,8 @@ TEST_SUITE("ui") {
                              [&](const QString& message) { messages.push_back(message); });
             const std::filesystem::path destination = bench->scratch / "export.csv";
             controller.start_export(bench->library, destination, mso::app::ExportOptions{});
-            CHECK(controller.running_exports() == 1);
-            REQUIRE(process_events_until([&] { return controller.running_exports() == 0; }, 30000));
+            CHECK(controller.running_tasks() == 1);
+            REQUIRE(process_events_until([&] { return controller.running_tasks() == 0; }, 30000));
             CHECK(std::filesystem::exists(destination));
             controller.backup(bench->library);
             REQUIRE(process_events_until([&] { return messages.size() == 2; }, 30000));
@@ -332,6 +480,27 @@ TEST_SUITE("ui") {
             REQUIRE(tree != nullptr);
             for (int row = 0; row < tree->topLevelItemCount(); ++row)
                 CHECK(tree->topLevelItem(row)->text(2).startsWith(QStringLiteral("Done.")));
+
+            // A backup offers Cancel, and a cancelled one keeps no file (window close: cancel_all()).
+            const auto backups = [&] {
+                std::size_t count = 0;
+                for (const auto& entry : std::filesystem::recursive_directory_iterator(bench->scratch / "library"))
+                    if (entry.path().extension() == ".sqlite" && entry.path().parent_path().filename() == "backups")
+                        ++count;
+                return count;
+            };
+            const std::size_t backups_before = backups();
+            controller.backup(bench->library);
+            tree->setCurrentItem(tree->topLevelItem(tree->topLevelItemCount() - 1));
+            QPushButton* cancel = nullptr;
+            for (auto* button : jobs.findChildren<QPushButton*>())
+                if (button->accessibleName() == QStringLiteral("Cancel selected job")) cancel = button;
+            REQUIRE(cancel != nullptr);
+            CHECK(cancel->isEnabled());
+            controller.cancel_all();  // before the long-task pool has even started it
+            REQUIRE(process_events_until([&] { return controller.running_tasks() == 0; }, 30000));
+            CHECK(tree->topLevelItem(tree->topLevelItemCount() - 1)->text(2).contains(QStringLiteral("cancelled")));
+            CHECK(backups() == backups_before);
         }
 
         // AnalysisController asks first; a "no" queues nothing.
@@ -417,5 +586,132 @@ TEST_SUITE("ui") {
             preview.retry_output_device();  // harmless while the device works
             CHECK_FALSE(preview.device_notice_visible());
         }
+    }
+
+    TEST_CASE("preview device calls run off the UI thread; Play and Retry join one restart, then play") {
+        auto bench = start_workbench();
+        auto control = std::make_shared<FakeDeviceControl>();
+        control->lost = true;  // headphones unplugged before the first preview
+        mso::ui::PreviewPanel preview(*bench->session, nullptr, fake_engine_factory(control));
+        REQUIRE(process_events_until([&] { return preview.engine() != nullptr; }));
+        CHECK(preview.device_notice_visible());
+
+        control->block_device_calls = true;
+        preview.select_sample(key_of(bench->rows.front()), QStringLiteral("kick"));
+        preview.play_selected();  // resolves the path, opens it, and finds the device lost
+        REQUIRE(process_events_until([&] { return control->device_call_entered.is_open(); }));
+        // The restart waits for the device on the engine pool; the UI thread keeps running.
+        CHECK(preview.device_request_running());
+        CHECK(preview.status_text().contains(QStringLiteral("Reconnecting")));
+        preview.retry_output_device();
+        preview.toggle_play_pause();  // Space while lost: Play (never a toggle), joining the restart
+        QCoreApplication::processEvents();
+        CHECK(control->restarts == 1);
+        CHECK(control->posted_count<mso::audio::transport::Play>() == 0);  // not before the device is back
+        control->release_device_call.open();
+        REQUIRE(process_events_until([&] { return !preview.device_request_running(); }));
+        CHECK(control->posted_count<mso::audio::transport::Play>() == 1);
+        CHECK(control->posted_count<mso::audio::transport::TogglePlayPause>() == 0);
+        CHECK_FALSE(preview.device_notice_visible());
+        CHECK(preview.engine()->snapshot().state == mso::audio::PreviewState::Playing);
+        preview.toggle_play_pause();  // playing: Space pauses
+        CHECK(control->posted_count<mso::audio::transport::Pause>() == 1);
+
+        // The Output menu lists devices off the UI thread: the last list shows at once.
+        auto* menu = preview.findChild<QMenu*>();
+        REQUIRE(menu != nullptr);
+        control->block_device_calls = false;
+        emit menu->aboutToShow();
+        REQUIRE(process_events_until([&] { return !preview.device_request_running(); }));
+        CHECK(control->listings == 1);
+        emit menu->aboutToShow();  // opened again: the list is there before the new one arrives
+        QAction* headphones = nullptr;
+        for (QAction* action : menu->actions())
+            if (action->text() == QStringLiteral("Headphones")) headphones = action;
+        REQUIRE(headphones != nullptr);
+        headphones->trigger();
+        REQUIRE(process_events_until([&] { return !preview.device_request_running() && control->selections == 1; }));
+        REQUIRE(process_events_until(
+            [&] { return bench->session->preference(mso::ui::UiPreferenceKeys::kPreviewOutputDevice) == "fake:1"; }));
+    }
+
+    TEST_CASE("preview survives a failed engine creation: Retry creates the engine again") {
+        auto bench = start_workbench();
+        auto control = std::make_shared<FakeDeviceControl>();
+        mso::ui::PreviewPanel preview(*bench->session, nullptr, fake_engine_factory(control, 1));
+        REQUIRE(process_events_until([&] { return preview.status_text().contains(QStringLiteral("unavailable")); }));
+        CHECK(preview.engine() == nullptr);
+        preview.retry_output_device();
+        REQUIRE(process_events_until([&] { return preview.engine() != nullptr; }));
+        CHECK(preview.status_text().isEmpty());
+    }
+
+    TEST_CASE("main window: changes to rows it holds never re-read the window; unknown samples do") {
+        auto bench = start_workbench();
+        mso::ui::MainWindow window(*bench->session);
+        window.show();
+        bench->session->refresh_libraries();
+        auto* model = qobject_cast<mso::ui::SampleTableModel*>(window.sample_table()->model());
+        REQUIRE(model != nullptr);
+        REQUIRE(process_events_until([&] { return model->rowCount() == 3 && !model->is_loading(); }));
+        int refreshed = 0;
+        QObject::connect(model, &mso::ui::SampleTableModel::refreshed, [&] { ++refreshed; });
+
+        mso::app::CatalogChangedEvent known;
+        known.library = bench->library;
+        known.sample_ids = {bench->rows[0].sample_id, bench->rows[2].sample_id};
+        emit bench->session->catalogChanged(known);  // analysis results for rows on screen
+        CHECK_FALSE(window.window_refresh_pending());
+
+        mso::app::CatalogChangedEvent unknown;
+        unknown.library = bench->library;
+        unknown.sample_ids = {999'999};  // a sample the table does not hold (an import)
+        emit bench->session->catalogChanged(unknown);
+        CHECK(window.window_refresh_pending());
+        REQUIRE(process_events_until([&] { return refreshed == 1; }));
+
+        // A whole-selection edit uses every selected key.
+        window.sample_table()->selectAll();
+        QCoreApplication::processEvents();
+        CHECK(window.sample_table()->selected_keys().size() == 3);
+        window.close();
+    }
+
+    TEST_CASE("main window: a library upgrade shows in the Jobs panel until the library is open") {
+        auto bench = start_workbench();
+        mso::ui::MainWindow window(*bench->session);
+        auto* jobs = window.findChild<mso::ui::JobsPanel*>();
+        REQUIRE(jobs != nullptr);
+        auto* tree = jobs->findChild<QTreeWidget*>();
+        REQUIRE(tree != nullptr);
+        mso::app::LibraryOpenProgressEvent event;  // synthetic: the bench library opened without work
+        event.library = bench->library;
+        event.directory = bench->scratch / "library";
+        event.step = mso::catalog::OpenStep::Migrating;
+        event.completed = 1;
+        event.total = 2;
+        emit bench->session->libraryOpenProgressed(event);
+        REQUIRE(jobs->row_count() == 1);
+        CHECK(tree->topLevelItem(0)->text(2).startsWith(QStringLiteral("Updating the catalog")));
+        event.completed = 2;
+        emit bench->session->libraryOpenProgressed(event);
+        bench->session->refresh_libraries();  // the open completed: the library is listed
+        REQUIRE(
+            process_events_until([&] { return tree->topLevelItem(0)->text(2).startsWith(QStringLiteral("Done")); }));
+        CHECK(window.notification_bar()->message().isEmpty());  // no collisions to report
+    }
+
+    TEST_CASE("inspector re-reads category and collection lists only for its library, coalesced") {
+        auto bench = start_workbench();
+        mso::ui::InspectorPanel inspector(*bench->session);
+        inspector.show_selection({bench->rows.front()}, 1);
+        CHECK(inspector.choice_reads_started() == 1);          // the selection's library: read at once
+        inspector.library_structure_changed(mso::new_uuid());  // another library's import
+        CHECK(inspector.choice_reads_started() == 1);
+        for (int change = 0; change < 5; ++change)
+            inspector.library_structure_changed(bench->library);  // this library, five times quickly
+        REQUIRE(process_events_until([&] { return inspector.choice_reads_started() == 2; }));
+        QCoreApplication::processEvents();
+        CHECK(inspector.choice_reads_started() == 2);  // the five became one read
     }
 }

@@ -13,8 +13,11 @@
 /// sorting, paging and row-evaluable filters are then answered from memory in milliseconds; only
 /// full-text terms and collection membership still ask SQLite for a set of ids.
 ///
-/// Memory is bounded: load() refuses a library with more than its row limit (RESOURCE_LIMIT), and
-/// the owner then answers that library from SQLite (app::Application does this automatically).
+/// Memory is bounded: load() refuses a library with more than its row limit (RESOURCE_LIMIT, checked
+/// with one count before anything is streamed), and the owner then answers that library from SQLite
+/// (app::Application does this automatically). The id-indexed tables are bounded by the same limit:
+/// a library whose sample ids reach past four times the row limit (at least 2^20) is refused too.
+/// Each row's three texts (display name, name key, file name) share one heap block.
 ///
 /// Ordering is identical to search::SearchService: per sort field, values ascending or descending,
 /// nulls always last, ties by sample id in the sort direction; across libraries ties are broken by
@@ -25,8 +28,12 @@
 /// membership changes across the cursor appears where its new value puts it (possibly again, or not
 /// at all in this pass), exactly like SearchService's keyset cursors, and the change event lists it
 /// so a view can refresh it in place. A cursor becomes STALE_CURSOR when a library's structure
-/// generation moves (rows added or removed, navigation changed, index reloaded), so a view
+/// generation moves (rows added or removed, navigation changed, index reloaded), or when a library
+/// that was missing from the earlier pages answers again (or the other way round), so a view
 /// re-queries at its anchor and picks up inserted rows.
+///
+/// Sort orders are built per field on first use and then patched in place: a changed row whose
+/// sort value did not move keeps its place, the others are erased and inserted by binary search.
 ///
 /// Root and folder scopes test the sample's primary location (its root and the path key of its
 /// folder, exact on case-sensitive roots), exactly like the SQL scope.
@@ -34,7 +41,8 @@
 /// Threading: every method is thread-safe. Readers share a std::shared_mutex. synchronize() and the
 /// final step of load() are serialized; neither holds the exclusive lock while running SQL, and a
 /// load streams the library without blocking synchronize(), so queries and edits keep being served
-/// from the previous state while a reload runs.
+/// from the previous state while a reload runs. The previous rows are freed after every lock is
+/// released.
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -91,8 +99,10 @@ public:
     static constexpr std::size_t kChangesPerSynchronization = 4096;
     /// Filtered result lists kept per index for paging (bounded, least recently used dropped).
     static constexpr std::size_t kCachedResults = 4;
-    /// Default row limit of load(): about 300 MiB of index at the measured row size (see
-    /// IMPLEMENTATION_STATUS.md), inside docs/06's browse budget with room for the UI and SQLite.
+    /// Default row limit of load(): about 300 MiB of index (`mso bench` with realistic 46-byte file
+    /// names measures about 320 bytes per row with every sort order built; see
+    /// IMPLEMENTATION_STATUS.md), so even a reload, which briefly holds two copies, stays inside
+    /// docs/06's 768 MiB browse budget with room for the UI and SQLite.
     static constexpr std::size_t kDefaultRowLimit = 1'000'000;
 
     /// An empty, not yet ready index of `library`.
@@ -122,8 +132,6 @@ public:
 
     /// True once a load() has completed (and clear() was not called since).
     bool ready() const noexcept { return ready_.load(std::memory_order_acquire); }
-    /// True while a load() is running.
-    bool loading() const noexcept;
     /// Catalog revision the index reflects.
     std::int64_t revision() const noexcept { return revision_.load(std::memory_order_acquire); }
     /// Current generation counters.

@@ -37,9 +37,10 @@ constexpr auto kProgressInterval = std::chrono::milliseconds(100);
 /// Directories nested deeper than this are recorded as gaps. Enumeration keeps one open listing
 /// per level, so the depth bounds its memory and handles.
 constexpr std::size_t kMaxDirectoryDepth = 256;
-/// Directories whose stored stats stay cached between batches. Depth-first enumeration interleaves
-/// a parent's files with its subdirectories', so a few directories cached at once avoid reloads.
-constexpr std::size_t kCachedStatDirectories = 8;
+/// Most directories whose stored stats are cached at once. A directory's map is dropped when the
+/// directory is finished, so the cache holds the directories still open on the enumeration stack
+/// (at most kMaxDirectoryDepth); this cap only guards against a broken stream of events.
+constexpr std::size_t kCachedStatDirectories = kMaxDirectoryDepth + 1;
 
 /// A candidate audio file found by enumeration.
 struct FileFound {
@@ -203,43 +204,54 @@ private:
         return DirectoryKey{*identity->volume_id, *identity->file_id};
     }
 
-    /// Reports an entry left out on purpose, with the path the catalog knows it by.
-    void skip(SkipReason reason, const std::optional<std::string>& stored_path, bool is_directory,
-              const std::stop_token& stop) {
-        push(EntrySkipped{reason, stored_path.value_or(std::string()), is_directory}, stop);
+    /// Reports an entry left out on purpose, with the path the catalog knows it by (empty when the
+    /// catalog could not store one). A directory is always reported: its subtree becomes a gap. A
+    /// file only matters where the catalog could hold a sample: a candidate audio file in a
+    /// directory this scan has not completed before. Any other file (the documents and projects of a
+    /// OneDrive root, or files an interrupted scan already recorded) is dropped here and costs the
+    /// catalog nothing.
+    void skip(SkipReason reason, const std::filesystem::path& relative, const std::filesystem::path& absolute,
+              bool is_directory, const std::stop_token& stop) {
+        if (!is_directory && (stack_.back().committed || !has_candidate_extension(absolute))) return;
+        push(EntrySkipped{reason, storable_relative_path(relative).value_or(std::string()), is_directory}, stop);
+    }
+
+    /// Why the link policy leaves out an entry of this kind, or nullopt when it is imported.
+    std::optional<SkipReason> skip_reason(files::detail::LinkKind kind) const noexcept {
+        switch (kind) {
+            case files::detail::LinkKind::CloudOnly:
+                return SkipReason::CloudOnly;  // never trigger a download
+            case files::detail::LinkKind::OtherReparsePoint:
+                return SkipReason::Unsupported;
+            case files::detail::LinkKind::SymbolicLink:
+            case files::detail::LinkKind::Junction:
+                if (!follow_links_) return SkipReason::Link;
+                return std::nullopt;
+            case files::detail::LinkKind::None:
+            case files::detail::LinkKind::CloudPlaceholder:  // available locally: an ordinary entry
+            case files::detail::LinkKind::Deduplicated:      // reads like an ordinary file
+            case files::detail::LinkKind::Compressed:        // WOF-compressed: reads like an ordinary file
+                return std::nullopt;
+        }
+        return SkipReason::Unsupported;  // not reached: every kind is listed above
     }
 
     /// Applies the link policy to one entry, then descends into directories and sends candidate files.
     void visit_entry(const std::filesystem::directory_entry& entry, const std::stop_token& stop) {
         const std::filesystem::path relative = stack_.back().relative / entry.path().filename();
-        const std::optional<std::string> stored_path = storable_relative_path(relative);
         // One attribute query per entry: std::filesystem::directory_entry does not expose the
         // Win32 attributes or reparse tag that the listing itself returned.
         const files::detail::EntryClassification classification = files::detail::classify_entry(entry.path());
-        switch (classification.kind) {
-            case files::detail::LinkKind::CloudOnly:
-                skip(SkipReason::CloudOnly, stored_path, classification.is_directory,
-                     stop);  // never trigger a download
-                return;
-            case files::detail::LinkKind::OtherReparsePoint:
-                skip(SkipReason::Unsupported, stored_path, classification.is_directory, stop);
-                return;
-            case files::detail::LinkKind::SymbolicLink:
-            case files::detail::LinkKind::Junction:
-                if (!follow_links_) {
-                    skip(SkipReason::Link, stored_path, classification.is_directory, stop);
-                    return;
-                }
-                break;
-            case files::detail::LinkKind::None:
-            case files::detail::LinkKind::CloudPlaceholder:  // available locally: an ordinary entry
-            case files::detail::LinkKind::Deduplicated:      // reads like an ordinary file
-                break;
+        if (const std::optional<SkipReason> reason = skip_reason(classification.kind)) {
+            skip(*reason, relative, entry.path(), classification.is_directory, stop);
+            return;
         }
         std::error_code status_error;
         if (entry.is_directory(status_error)) {
+            const std::optional<std::string> stored_path = storable_relative_path(relative);
             if (!stored_path) {
-                skip(SkipReason::UnsafePath, std::nullopt, true, stop);  // nothing below it could be stored
+                // Nothing below it could be stored either.
+                push(EntrySkipped{SkipReason::UnsafePath, std::string(), true}, stop);
                 return;
             }
             descend(relative, *stored_path, entry.path(), stop);
@@ -247,13 +259,17 @@ private:
         }
         if (!entry.is_regular_file(status_error)) {
             // FIFOs, sockets and devices are never opened; dangling links simply vanish.
-            if (!status_error && entry.exists(status_error)) skip(SkipReason::Unsupported, stored_path, false, stop);
+            if (!status_error && entry.exists(status_error)) {
+                skip(SkipReason::Unsupported, relative, entry.path(), false, stop);
+            }
             return;
         }
         const OpenDirectory& parent = stack_.back();
         if (parent.committed || !has_candidate_extension(entry.path())) return;
+        const std::optional<std::string> stored_path = storable_relative_path(relative);
         if (!stored_path) {
-            skip(SkipReason::UnsafePath, std::nullopt, false, stop);  // the catalog cannot store this path
+            // The catalog cannot store this path: counted, nothing to mark seen.
+            push(EntrySkipped{SkipReason::UnsafePath, std::string(), false}, stop);
             return;
         }
         push(FileFound{*stored_path, parent.text, entry.path()}, stop);
@@ -272,7 +288,7 @@ private:
         if (follow_links_) {
             auto key = directory_key(absolute);
             if (key && !visited_.insert(std::move(*key)).second) {
-                skip(SkipReason::LinkCycle, stored_path, true, stop);
+                push(EntrySkipped{SkipReason::LinkCycle, stored_path, true}, stop);
                 return;
             }
         }
@@ -369,6 +385,14 @@ public:
         return stat;
     }
 
+    /// Drops the map of a directory whose files have all been looked up (the directory is
+    /// finished). Every directory still open on the enumeration stack stays cached, so a parent's
+    /// map survives however many subdirectories are walked between two of its files.
+    void forget(const std::string& directory) {
+        const auto cached = std::ranges::find(entries_, directory, &Entry::directory);
+        if (cached != entries_.end()) entries_.erase(cached);
+    }
+
 private:
     /// One cached directory.
     struct Entry {
@@ -377,7 +401,8 @@ private:
     };
 
     /// The map of `directory`, moved to the front; the least recently used directory is dropped
-    /// when more than kCachedStatDirectories are cached.
+    /// when more than kCachedStatDirectories are cached (only if finished directories were never
+    /// forgotten).
     Result<std::map<std::string, catalog::Library::KnownStat>*> directory_stats(const std::string& directory) {
         const auto cached = std::ranges::find(entries_, directory, &Entry::directory);
         if (cached != entries_.end()) {
@@ -429,9 +454,11 @@ public:
             const std::size_t batch_size =
                 std::clamp<std::size_t>(options_.batch_size, 1, catalog::Library::kMaximumScanBatchFiles);
             const bool entries_pending = !pending_files_.empty() || !pending_skipped_files_.empty();
-            const bool batch_full = pending_files_.size() + pending_skipped_files_.size() >= batch_size;
+            const bool batch_full =
+                pending_files_.size() + pending_skipped_files_.size() + pending_gaps_.size() >= batch_size;
             const bool batch_due = entries_pending && Clock::now() - batch_started >= options_.batch_interval;
-            if (batch_full || batch_due || (!pending_directories_.empty() && !entries_pending)) {
+            const bool directories_pending = !pending_directories_.empty() || !pending_gaps_.empty();
+            if (batch_full || batch_due || (directories_pending && !entries_pending)) {
                 if (auto committed = commit_batch(stop); !committed) return committed;
                 batch_started = Clock::now();
             }
@@ -478,15 +505,20 @@ private:
         }
         if (auto* gap = std::get_if<DirectoryGap>(&item)) {
             ++progress_.inaccessible_directories;
-            return library_.record_scan_gap(session_, gap->directory, gap->denied);
+            finished_directories_.push_back(gap->directory);  // its files (if any) are all enumerated
+            pending_gaps_.push_back(std::move(*gap));
+            return {};
         }
         if (auto* skipped = std::get_if<EntrySkipped>(&item)) {
             count_skip(skipped->reason);
             if (skipped->relative_path.empty()) return {};  // nothing the catalog could hold there
             // It exists, so nothing catalogued there may become missing: a directory's subtree is
             // unknown (a gap), a file is seen with its stored stat.
-            if (skipped->is_directory) return library_.record_scan_gap(session_, skipped->relative_path, false);
-            pending_skipped_files_.push_back(std::move(skipped->relative_path));
+            if (skipped->is_directory) {
+                pending_gaps_.push_back(DirectoryGap{std::move(skipped->relative_path), false});
+            } else {
+                pending_skipped_files_.push_back(std::move(skipped->relative_path));
+            }
             return {};
         }
         if (auto* failed = std::get_if<EnumerationFailed>(&item)) {
@@ -514,6 +546,26 @@ private:
                 ++progress_.unsafe_paths_skipped;
                 break;
         }
+    }
+
+    /// Records the pending gaps. They are kept until the batch that marks their parents complete,
+    /// and recorded just before it, so a resumed scan never trusts a directory with an unrecorded
+    /// gap below it. A cancelled scan drops them: their parents were not completed either, so the
+    /// next scan walks there again and finds them.
+    Result<void> record_gaps() {
+        std::vector<catalog::ScanGap> gaps;
+        gaps.reserve(pending_gaps_.size());
+        for (const DirectoryGap& gap : pending_gaps_)
+            gaps.push_back(catalog::ScanGap{.relative_directory = gap.directory, .denied = gap.denied});
+        // One transaction per call, in calls of the size the catalog accepts.
+        const std::span<const catalog::ScanGap> all(gaps);
+        for (std::size_t start = 0; start < all.size(); start += catalog::Library::kMaximumScanBatchFiles) {
+            const std::size_t count = std::min(catalog::Library::kMaximumScanBatchFiles, all.size() - start);
+            if (auto recorded = library_.record_scan_gaps(session_, all.subspan(start, count)); !recorded)
+                return recorded;
+        }
+        pending_gaps_.clear();
+        return {};
     }
 
     /// Marks the pending skipped files seen, in calls of the size the catalog accepts.
@@ -553,7 +605,9 @@ private:
     /// with the finished directories in one catalog transaction (skipped files are marked seen
     /// just before).
     Result<void> commit_batch(const std::stop_token& stop) {
-        if (pending_files_.empty() && pending_directories_.empty() && pending_skipped_files_.empty()) return {};
+        if (pending_files_.empty() && pending_directories_.empty() && pending_skipped_files_.empty() &&
+            pending_gaps_.empty())
+            return {};
 
         // Phase 1: identities in parallel (every read is done when read_identities() returns),
         // then stored stats on this thread, so an error here can return without waiting.
@@ -607,7 +661,8 @@ private:
             if (file.probe_error) ++progress_.probe_failures;
         }
         // Before the batch marks its directories complete, so a resumed scan never trusts a
-        // directory whose skipped files were not recorded.
+        // directory whose skipped files or gaps were not recorded.
+        if (auto recorded = record_gaps(); !recorded) return recorded;
         if (auto marked = mark_skipped_files_seen(); !marked) return marked;
 
         const auto root = root_path_;
@@ -623,8 +678,14 @@ private:
         progress_.added += outcome->added;
         progress_.updated += outcome->updated;
         progress_.relinked += outcome->relinked;
+        // Finished directories send no more files: their cached stats can go.
+        for (const std::string& directory : pending_directories_)
+            stored_stats_.forget(directory);
+        for (const std::string& directory : finished_directories_)
+            stored_stats_.forget(directory);
         pending_files_.clear();
         pending_directories_.clear();
+        finished_directories_.clear();
         return {};
     }
 
@@ -638,6 +699,8 @@ private:
     std::vector<FileFound> pending_files_;
     std::vector<std::string> pending_directories_;
     std::vector<std::string> pending_skipped_files_;  ///< skipped files to mark seen with the next batch
+    std::vector<DirectoryGap> pending_gaps_;          ///< gaps to record with the next batch
+    std::vector<std::string> finished_directories_;   ///< unlistable directories, forgotten after the batch
     ImportProgress progress_;
     Clock::time_point last_report_{};
 };

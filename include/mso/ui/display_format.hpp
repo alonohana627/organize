@@ -73,6 +73,14 @@ public:
     static QString root_availability(catalog::Availability availability);
     /// Translated state of one file location.
     static QString location_state(catalog::LocationState state);
+    /// What a library is doing during a one-time open step ("Rebuilding name keys" …).
+    static QString open_step(catalog::OpenStep step);
+    /// Translated state of an analysis run ("running", "completed_with_errors" …); unknown states
+    /// are shown as they are.
+    static QString run_state(std::string_view state);
+    /// A tool tip that shows `text` literally: Qt renders tool tips that look like markup as rich
+    /// text, so names, paths and queries typed by the user ("<b>kick</b>") are escaped.
+    static QString plain_tooltip(const QString& text);
     /// Names of the analysis stages recorded in SampleRow::analysis_flags, or "None".
     static QString analysis_flags(std::int64_t flags);
     /// Local date and time of a UTC Unix-milliseconds timestamp.

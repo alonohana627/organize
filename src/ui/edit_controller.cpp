@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 
 #include "mso/ui/display_format.hpp"
 #include "mso/ui/edit_gateway.hpp"
@@ -20,6 +21,7 @@ struct MultiLibraryOutcome {
     std::int64_t applied = 0;
     std::int64_t conflicted = 0;
     QStringList failures;
+    std::set<uuids::uuid> failed_libraries;  ///< libraries whose write failed (their rows are reverted)
 };
 
 /// Groups keys by library, preserving each library's selection order.
@@ -39,12 +41,15 @@ void EditController::apply(const std::vector<SampleKey>& keys, catalog::EditComm
                            const QString& done_message) {
     if (keys.empty()) return;
     const bool removes = OptimisticEdit::removes_rows(command);
-    // 1. The user sees the result now.
+    // 1. The user sees the result now: loaded rows at once, evicted rows when they are read again.
+    //    The rows as they were are kept, so a failed write can be undone on screen.
+    auto previous = std::make_shared<std::vector<search::SampleRow>>();
     if (removes) {
         model_.remove_rows(keys);
     } else {
-        model_.patch_rows(keys, [&command](search::SampleRow& row) { OptimisticEdit::apply(command, row); });
-        model_.begin_pending_edit(keys);
+        const auto patch = [command](search::SampleRow& row) { OptimisticEdit::apply(command, row); };
+        *previous = model_.patch_rows(keys, patch);
+        model_.begin_pending_edit(keys, patch);
     }
 
     // 2. SQLite catches up in the background, one independent operation per library, each behind
@@ -57,13 +62,15 @@ void EditController::apply(const std::vector<SampleKey>& keys, catalog::EditComm
         per_library.operation = new_uuid();  // idempotency key of this library's write
         per_library.sample_ids = sample_ids;
         last_edited_library_ = library;
-        auto deliver = [this, outcome, library, keys, removes, done_message](Result<catalog::MutationReceipt> receipt) {
+        auto deliver = [this, outcome, library, keys, removes, previous,
+                        done_message](Result<catalog::MutationReceipt> receipt) {
             if (receipt) {
                 outcome->applied += receipt->applied;
                 outcome->conflicted += receipt->conflicted;
             } else {
                 outcome->failures << tr("%1: %2").arg(gateway_.library_name(library),
                                                       DisplayFormat::error(receipt.error()));
+                outcome->failed_libraries.insert(library);
             }
             emit historyChanged(library);
             if (--outcome->remaining > 0) return;
@@ -73,7 +80,15 @@ void EditController::apply(const std::vector<SampleKey>& keys, catalog::EditComm
                 if (!outcome->failures.isEmpty()) emit reloadRequested();
             } else {
                 model_.end_pending_edit(keys);
-                model_.refresh_rows(keys);
+                // A failure is undone on screen now, not only once the read below answers (it can
+                // fail too); a success shows the catalog's own values when the read answers.
+                if (!outcome->failed_libraries.empty()) {
+                    std::vector<SampleKey> failed_keys;
+                    for (const SampleKey& key : keys)
+                        if (outcome->failed_libraries.contains(key.library)) failed_keys.push_back(key);
+                    model_.revert_rows(failed_keys, *previous);
+                }
+                static_cast<void>(model_.refresh_rows(keys));  // reconciles; the count is for change events
             }
             if (!outcome->failures.isEmpty()) {
                 emit failed(tr("The change was not saved"),

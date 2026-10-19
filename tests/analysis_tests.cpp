@@ -6,6 +6,10 @@
 
 #include <picosha2.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -28,6 +32,7 @@
 #include "mso/analysis/byte_hash.hpp"
 #include "mso/analysis/chroma_accumulator.hpp"
 #include "mso/analysis/decoded_stream_analysis.hpp"
+#include "mso/analysis/detail/unreadable_file.hpp"
 #include "mso/analysis/key_estimator.hpp"
 #include "mso/analysis/limits.hpp"
 #include "mso/analysis/loudness_meter.hpp"
@@ -1215,6 +1220,41 @@ TEST_SUITE("analysis") {
         REQUIRE_FALSE(unreachable.has_value());
         CHECK(unreachable.error().code == ErrorCode::SourceOffline);
         CHECK(unreachable.error().retryable);
+
+        // analyze_file checks the file's attributes first and classifies a failure the same way.
+        AnalysisRequest request = request_for({Stage::ByteHash});
+        request.file = unreachable_file;
+        const auto analyzed = analyze_file(request, {});
+        REQUIRE_FALSE(analyzed.has_value());
+        CHECK(analyzed.error().code == ErrorCode::SourceOffline);
+        CHECK(analyzed.error().retryable);
+        request.file = directory.file("no-such-folder") / "missing.wav";
+        CHECK(error_code(analyze_file(request, {})) == ErrorCode::FileMissing);
     }
+
+#ifdef _WIN32
+    TEST_CASE("an unreachable server, share or drive is SOURCE_OFFLINE, never FILE_MISSING") {
+        // libc++ reports ERROR_BAD_NETPATH (server unreachable) as "not found" with no error code,
+        // so the verdict comes from the Win32 error itself.
+        const auto verdict = [](DWORD win32_error) {
+            return mso::analysis::detail::unreadable_file_error_from_win32(win32_error);
+        };
+        for (const DWORD offline : {ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME, ERROR_NETNAME_DELETED, ERROR_NOT_READY,
+                                    ERROR_INVALID_DRIVE, ERROR_UNEXP_NET_ERR, ERROR_SEM_TIMEOUT}) {
+            CAPTURE(offline);
+            CHECK(verdict(offline).code == ErrorCode::SourceOffline);
+            CHECK(verdict(offline).retryable);
+        }
+        for (const DWORD missing : {ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_INVALID_NAME}) {
+            CAPTURE(missing);
+            CHECK(verdict(missing).code == ErrorCode::FileMissing);
+            CHECK_FALSE(verdict(missing).retryable);
+        }
+        CHECK(verdict(ERROR_ACCESS_DENIED).code == ErrorCode::AccessDenied);
+        CHECK(verdict(ERROR_SHARING_VIOLATION).code == ErrorCode::AccessDenied);
+        CHECK(verdict(ERROR_SHARING_VIOLATION).retryable);
+        CHECK(verdict(ERROR_SUCCESS).code == ErrorCode::AccessDenied);  // it exists, yet cannot be opened
+    }
+#endif
 
 }  // TEST_SUITE

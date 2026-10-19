@@ -104,8 +104,19 @@ std::vector<search::SampleRow> SampleTableView::selected_samples() const {
 
 std::vector<SampleKey> SampleTableView::selected_keys() const {
     std::vector<SampleKey> keys;
-    for (const auto& sample : selected_samples())
-        keys.push_back({sample.library, sample.sample_id});
+    if (!sample_model_ || !selectionModel()) return keys;
+    // Every page keeps the keys of all its rows, so a selection far larger than the rows held in
+    // memory (Ctrl+A over 100,000 results) still yields every key, in row order.
+    std::vector<std::pair<int, int>> ranges;
+    for (const QItemSelectionRange& range : selectionModel()->selection())
+        ranges.emplace_back(range.top(), range.bottom());
+    std::sort(ranges.begin(), ranges.end());
+    int previous_bottom = -1;
+    for (auto [top, bottom] : ranges) {
+        for (int row = std::max(top, previous_bottom + 1); row <= bottom; ++row)
+            if (const auto key = sample_model_->key_at(row)) keys.push_back(*key);
+        previous_bottom = std::max(previous_bottom, bottom);
+    }
     return keys;
 }
 
@@ -127,9 +138,7 @@ std::size_t SampleTableView::selected_row_count() const {
 
 std::optional<SampleKey> SampleTableView::current_key() const {
     if (!sample_model_ || !currentIndex().isValid()) return std::nullopt;
-    if (const auto* sample = sample_model_->loaded_row(currentIndex().row()))
-        return SampleKey{sample->library, sample->sample_id};
-    return std::nullopt;
+    return sample_model_->key_at(currentIndex().row());  // known even while the row is evicted
 }
 
 std::size_t SampleTableView::select_keys(const std::vector<SampleKey>& keys, const std::optional<SampleKey>& current) {

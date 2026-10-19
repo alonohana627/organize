@@ -33,6 +33,17 @@ every existing library refuse to open (`DB_CORRUPT`). Always add a new one.
    and `scan_frontier_state` indexes, `scan_frontier.directory_key`) is
    `d626e8ddfd71f63dfdc0c742c4942cfdf2dd2f85fca222dc844667ec36817b5c`.
 8. Update `contracts/schema.sql` (the end-state reference) with the new tables, columns and indexes.
+9. Indexes, especially partial ones: a query uses a partial index only when its WHERE clause repeats
+   the index's own condition (SQLite does not infer `state<>'retired'` from `state='missing'`). The
+   test "every statement the catalog runs on locations and jobs is index-driven" explains every
+   statement the library compiled while exercising scans, edits and the analysis queue, and fails on a
+   full scan or a temporary B-tree sort of `locations` or `jobs`. When you add a statement on those
+   tables, make sure the scenario in that test runs it; accept a plan line there only with a written
+   reason it stays bounded.
+10. Changing `fold_key` or `path_key` output: bump `kFoldVersion` (`include/mso/domain/core.hpp`).
+    The next open takes a verified backup and rebuilds every stored key; a row whose new key another
+    row already has keeps a placeholder key and is listed in a `normalization_conflict` review item
+    (nothing is merged).
 
 ## Do not
 

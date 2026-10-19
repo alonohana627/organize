@@ -24,9 +24,10 @@ class JobsPanel;
 /// result summary, and cancels running exports when the window closes.
 ///
 /// Both run on the session's long-task pool (ApplicationSession::run_long_task), so a long export
-/// or backup never delays page loads and edits. Exports stop on Cancel, on cancel_all() and on
-/// session shutdown. A backup cannot be stopped half-way (the catalog writes and verifies it in
-/// one step), so it shows no Cancel button and the session waits for it at exit.
+/// or backup never delays page loads and edits. Both stop on their Cancel button, on cancel_all()
+/// (the window closes) and on session shutdown: a stopped export writes no file, and a stopped
+/// backup removes its partial copy (Library::create_backup's stop token), so exit never waits for
+/// a backup of a large library to finish.
 class ExportController final : public QObject {
     Q_OBJECT
 
@@ -40,12 +41,12 @@ public:
     /// Exports `library` to `destination` with `options` as a Jobs-panel task (no dialog).
     void start_export(const uuids::uuid& library, const std::filesystem::path& destination,
                       const app::ExportOptions& options);
-    /// Writes a verified backup of `library` into its backups folder.
+    /// Writes a verified backup of `library` into its backups folder as a cancellable Jobs task.
     void backup(const uuids::uuid& library);
-    /// Requests cancellation of every running export (application shutdown).
+    /// Requests cancellation of every running export and backup (the window closes).
     void cancel_all();
-    /// Exports still running.
-    std::size_t running_exports() const { return running_exports_.size(); }
+    /// Exports and backups still running.
+    std::size_t running_tasks() const { return running_tasks_.size(); }
 
 signals:
     /// One-line feedback for the status bar.
@@ -60,7 +61,10 @@ private:
     JobsPanel& jobs_;
     /// Parent of the file and choice dialogs.
     QWidget* dialog_parent_;
-    std::map<std::uint64_t, std::shared_ptr<std::stop_source>> running_exports_;  ///< jobs task → stop
+    /// Starts a Jobs-panel task whose Cancel button (and cancel_all()) requests `stop`.
+    std::uint64_t start_task(const QString& description, const std::shared_ptr<std::stop_source>& stop);
+
+    std::map<std::uint64_t, std::shared_ptr<std::stop_source>> running_tasks_;  ///< jobs task → stop
 };
 
 }  // namespace mso::ui

@@ -36,22 +36,44 @@ FileId file_id_from_index(std::uint64_t index) noexcept {
     return id;
 }
 
+// Windows reparse tags and attributes, spelled out because older MinGW headers lack some of them
+// and because classify_reparse_tag() is plain arithmetic on every platform.
+constexpr std::uint32_t kReparseTagSymbolicLink = 0xA000000C;       // IO_REPARSE_TAG_SYMLINK
+constexpr std::uint32_t kReparseTagMountPoint = 0xA0000003;         // IO_REPARSE_TAG_MOUNT_POINT
+constexpr std::uint32_t kReparseTagDeduplication = 0x80000013;      // IO_REPARSE_TAG_DEDUP
+constexpr std::uint32_t kReparseTagOverlayFilter = 0x80000017;      // IO_REPARSE_TAG_WOF (compact /EXE)
+constexpr std::uint32_t kReparseTagCloud = 0x9000001A;              // IO_REPARSE_TAG_CLOUD (OneDrive, Cloud Files API)
+constexpr std::uint32_t kReparseTagCloudMask = 0x0000F000;          // IO_REPARSE_TAG_CLOUD_1 .. _F
+constexpr std::uint32_t kReparseTagFilePlaceholder = 0x80000015;    // IO_REPARSE_TAG_FILE_PLACEHOLDER (Windows 8.1)
+constexpr std::uint32_t kAttributeOffline = 0x00001000;             // FILE_ATTRIBUTE_OFFLINE
+constexpr std::uint32_t kAttributeRecallOnOpen = 0x00040000;        // FILE_ATTRIBUTE_RECALL_ON_OPEN
+constexpr std::uint32_t kAttributeRecallOnDataAccess = 0x00400000;  // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+/// True for the attributes of an entry whose data is not on this device.
+bool data_not_local(std::uint32_t attributes, bool is_directory) noexcept {
+    if (is_directory) return (attributes & kAttributeRecallOnOpen) != 0;  // listing would be fetched
+    return (attributes & (kAttributeOffline | kAttributeRecallOnOpen | kAttributeRecallOnDataAccess)) != 0;
+}
+
 }  // namespace
+
+LinkKind classify_reparse_tag(std::uint32_t tag, std::uint32_t attributes, bool is_directory) noexcept {
+    if (tag == kReparseTagSymbolicLink) return LinkKind::SymbolicLink;
+    if (tag == kReparseTagMountPoint) return LinkKind::Junction;
+    if (tag == kReparseTagDeduplication) return LinkKind::Deduplicated;
+    // Usually invisible: the WOF driver hides its own tag while it is attached to the volume. Where
+    // it shows (the driver is not attached), the data is still on this volume, just compressed.
+    if (tag == kReparseTagOverlayFilter) return LinkKind::Compressed;
+    if ((tag & ~kReparseTagCloudMask) == kReparseTagCloud || tag == kReparseTagFilePlaceholder) {
+        return data_not_local(attributes, is_directory) ? LinkKind::CloudOnly : LinkKind::CloudPlaceholder;
+    }
+    return LinkKind::OtherReparsePoint;
+}
 
 #ifdef _WIN32
 
 namespace {
 
-// Spelled out because older MinGW headers lack some of them.
-constexpr DWORD kReparseTagSymbolicLink = 0xA000000C;       // IO_REPARSE_TAG_SYMLINK
-constexpr DWORD kReparseTagMountPoint = 0xA0000003;         // IO_REPARSE_TAG_MOUNT_POINT
-constexpr DWORD kReparseTagDeduplication = 0x80000013;      // IO_REPARSE_TAG_DEDUP
-constexpr DWORD kReparseTagCloud = 0x9000001A;              // IO_REPARSE_TAG_CLOUD (OneDrive, Cloud Files API)
-constexpr DWORD kReparseTagCloudMask = 0x0000F000;          // IO_REPARSE_TAG_CLOUD_1 .. _F
-constexpr DWORD kReparseTagFilePlaceholder = 0x80000015;    // IO_REPARSE_TAG_FILE_PLACEHOLDER (Windows 8.1 OneDrive)
-constexpr DWORD kAttributeOffline = 0x00001000;             // FILE_ATTRIBUTE_OFFLINE
-constexpr DWORD kAttributeRecallOnOpen = 0x00040000;        // FILE_ATTRIBUTE_RECALL_ON_OPEN
-constexpr DWORD kAttributeRecallOnDataAccess = 0x00400000;  // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
 constexpr std::int64_t kUnixEpochIn100ns = 116444736000000000LL;  // 1970-01-01 in FILETIME units
 
 /// FILETIME (100 ns since 1601) to nanoseconds since 1970, saturating instead of overflowing.
@@ -61,12 +83,6 @@ std::int64_t filetime_to_unix_ns(const FILETIME& time) noexcept {
         return std::numeric_limits<std::int64_t>::max();
     }
     return ticks_to_nanoseconds(static_cast<std::int64_t>(ticks) - kUnixEpochIn100ns, 100);
-}
-
-/// True for the attributes of an entry whose data is not on this device.
-bool data_not_local(DWORD attributes, bool is_directory) noexcept {
-    if (is_directory) return (attributes & kAttributeRecallOnOpen) != 0;  // listing would be fetched
-    return (attributes & (kAttributeOffline | kAttributeRecallOnOpen | kAttributeRecallOnDataAccess)) != 0;
 }
 
 }  // namespace
@@ -119,15 +135,7 @@ EntryClassification classify_entry(const std::filesystem::path& path) noexcept {
         HANDLE search = FindFirstFileExW(native.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
         if (search == INVALID_HANDLE_VALUE) return {LinkKind::OtherReparsePoint, is_directory};
         FindClose(search);
-        const DWORD tag = data.dwReserved0;
-        if (tag == kReparseTagSymbolicLink) return {LinkKind::SymbolicLink, is_directory};
-        if (tag == kReparseTagMountPoint) return {LinkKind::Junction, is_directory};
-        if (tag == kReparseTagDeduplication) return {LinkKind::Deduplicated, is_directory};
-        if ((tag & ~kReparseTagCloudMask) == kReparseTagCloud || tag == kReparseTagFilePlaceholder) {
-            return {data_not_local(attributes, is_directory) ? LinkKind::CloudOnly : LinkKind::CloudPlaceholder,
-                    is_directory};
-        }
-        return {LinkKind::OtherReparsePoint, is_directory};
+        return {classify_reparse_tag(data.dwReserved0, attributes, is_directory), is_directory};
     } catch (const std::exception&) {
         return {};  // path conversion ran out of memory: let the open report it
     }

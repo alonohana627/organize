@@ -2,6 +2,8 @@
 
 #include <format>
 #include <fstream>
+#include <optional>
+#include <ostream>
 
 #include <csv.hpp>
 #include <nlohmann/json.hpp>
@@ -99,6 +101,49 @@ nlohmann::json json_row(const search::SampleRow& row, const std::string& absolut
                           {"created_at", row.created_at}};
 }
 
+/// Writes one JSON object member by member, so an array of any length can be streamed between
+/// ordinary members without the whole document in memory. Every key and value is encoded by
+/// nlohmann::json; the writer only places the braces, colons and commas, and it tracks whether a
+/// separator is due, so no member or element can be spliced in malformed.
+class JsonObjectWriter {
+public:
+    /// Opens the object.
+    explicit JsonObjectWriter(std::ostream& out) : out_(out) { out_ << '{'; }
+
+    /// Writes `"key":value`.
+    void member(std::string_view key, const nlohmann::json& value) {
+        write_key(key);
+        out_ << json_fields::dump_json(value);
+    }
+    /// Writes `"key":[` and starts streaming elements into it.
+    void begin_array(std::string_view key) {
+        write_key(key);
+        out_ << '[';
+        first_element_ = true;
+    }
+    /// Writes one element of the open array.
+    void element(const nlohmann::json& value) {
+        if (!first_element_) out_ << ',';
+        first_element_ = false;
+        out_ << json_fields::dump_json(value);
+    }
+    /// Closes the open array.
+    void end_array() { out_ << ']'; }
+    /// Closes the object.
+    void finish() { out_ << '}'; }
+
+private:
+    void write_key(std::string_view key) {
+        if (!first_member_) out_ << ',';
+        first_member_ = false;
+        out_ << json_fields::dump_json(nlohmann::json(key)) << ':';
+    }
+
+    std::ostream& out_;
+    bool first_member_ = true;
+    bool first_element_ = true;
+};
+
 /// Sibling temporary name owned by this export (unique, so concurrent exports never collide).
 std::filesystem::path temporary_sibling(const std::filesystem::path& file) {
     auto temporary = file;
@@ -164,17 +209,20 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
         };
 
         auto csv_writer = csv::make_csv_writer(out);  // RFC 4180 quoting, CRLF records (patched)
+        std::optional<JsonObjectWriter> json_writer;
         if (csv) {
             if (options.utf8_bom) out << "\xEF\xBB\xBF";
             csv_writer << std::vector<std::string>(std::begin(kCsvColumns), std::end(kCsvColumns));
         } else {
-            // The envelope is written field by field around the streamed sample array.
-            const nlohmann::json library_json = {{"uuid", uuids::to_string(identity.uuid)},
-                                                 {"name", identity.name},
-                                                 {"catalog_revision", identity.catalog_revision}};
-            out << "{\"schema_version\":" << kExportSchemaVersion
-                << ",\"library\":" << json_fields::dump_json(library_json) << ",\"exported_at\":" << now_unix_ms()
-                << ",\"absolute_paths\":" << (options.include_absolute_paths ? "true" : "false") << ",\"samples\":[";
+            // The envelope is written member by member around the streamed sample array.
+            json_writer.emplace(out);
+            json_writer->member("schema_version", kExportSchemaVersion);
+            json_writer->member("library", {{"uuid", uuids::to_string(identity.uuid)},
+                                            {"name", identity.name},
+                                            {"catalog_revision", identity.catalog_revision}});
+            json_writer->member("exported_at", now_unix_ms());
+            json_writer->member("absolute_paths", options.include_absolute_paths);
+            json_writer->begin_array("samples");
         }
         if (!out) return write_failed();
 
@@ -182,7 +230,6 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
         search::SearchRequest request{
             .text = options.query, .sort = search::SortField::Added, .page_size = search::SearchService::kMaxPageSize};
         catalog::Library* scope[] = {&library};
-        bool first = true;
         while (true) {
             if (stop.stop_requested())
                 return cleanup_on_failure(Error{ErrorCode::Cancelled, false, "export cancelled", {}, {}});
@@ -200,9 +247,7 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
                             value = spreadsheet_safe(std::move(value));
                     csv_writer << values;
                 } else {
-                    out << (first ? "" : ",")
-                        << json_fields::dump_json(json_row(row, absolute, options.include_absolute_paths));
-                    first = false;
+                    json_writer->element(json_row(row, absolute, options.include_absolute_paths));
                 }
                 ++summary.rows;
             }
@@ -216,8 +261,10 @@ Result<ExportSummary> write_metadata_export(catalog::Library& library, const std
         if (csv) {
             csv_writer.flush();
         } else {
-            out << "],\"catalog_revision_at_end\":" << revision_at_end
-                << ",\"consistent\":" << (revision_at_end == identity.catalog_revision ? "true" : "false") << "}";
+            json_writer->end_array();
+            json_writer->member("catalog_revision_at_end", revision_at_end);
+            json_writer->member("consistent", revision_at_end == identity.catalog_revision);
+            json_writer->finish();
         }
         out.flush();
         if (!out) return write_failed();

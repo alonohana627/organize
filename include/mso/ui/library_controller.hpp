@@ -56,6 +56,8 @@ signals:
     void statusMessage(const QString& message);
     /// A command failed; shown prominently.
     void failed(const QString& title, const QString& details);
+    /// Opening a library failed (the Jobs panel ends its upgrade row, if one was shown).
+    void libraryOpenFailed(const QString& reason);
 
 private:
     /// Starts the scan of a root and announces it.

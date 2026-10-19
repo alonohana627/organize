@@ -1,8 +1,22 @@
 diff --git a/deps/miniaudio/extras/stb_vorbis.c b/deps/miniaudio/extras/stb_vorbis.c
-index 3e5c250..61db8f2 100644
+index 3e5c250..19cc9e1 100644
 --- a/deps/miniaudio/extras/stb_vorbis.c
 +++ b/deps/miniaudio/extras/stb_vorbis.c
-@@ -947,13 +947,26 @@ static void *make_block_array(void *mem, int count, int size)
+@@ -755,8 +755,11 @@ typedef struct
+    uint16 coupling_steps;
+    MappingChannel *chan;
+    uint8  submaps;
+-   uint8  submap_floor[15]; // varies
+-   uint8  submap_residue[15]; // varies
++   // Music Sample Organizer patch: a mapping has up to 16 submaps (get_bits(f,4)+1), as libvorbis
++   // allows; with 15 slots, submap 15's floor overwrote submap 0's residue (which could then name a
++   // residue that does not exist) and its residue was written past the array.
++   uint8  submap_floor[16]; // varies
++   uint8  submap_residue[16]; // varies
+ } Mapping;
+ 
+ typedef struct
+@@ -947,13 +950,28 @@ static void *make_block_array(void *mem, int count, int size)
     return p;
  }
  
@@ -10,9 +24,11 @@ index 3e5c250..61db8f2 100644
 +// Music Sample Organizer patch: setup_malloc and setup_temp_malloc take the size as size_t and
 +// refuse anything that does not fit an int, so a size computed from header counts (for example
 +// sizeof(char*) * comment_list_length) can no longer truncate to a small or negative allocation that
-+// the caller then overruns (GHSL-2023-165 to GHSL-2023-172). All setup allocations of one stream
-+// together are also limited to STB_VORBIS_MAX_SETUP_MEMORY, so a few hundred corrupt bytes cannot
-+// make the decoder allocate gigabytes (real streams need well under a megabyte).
++// the caller then overruns (the start_decoder writes GHSL-2023-165, 166, 167 and 171; the other
++// advisories of that report are patched where they occur: 168 at Mapping, 169 and 170 at the user
++// comments, 172 at DECODE). All setup allocations of one stream together are also limited to
++// STB_VORBIS_MAX_SETUP_MEMORY, so a few hundred corrupt bytes cannot make the decoder allocate
++// gigabytes (real streams need well under a megabyte).
 +#ifndef STB_VORBIS_MAX_SETUP_MEMORY
 +#define STB_VORBIS_MAX_SETUP_MEMORY (128u << 20)
 +#endif
@@ -31,7 +47,7 @@ index 3e5c250..61db8f2 100644
        f->setup_offset += sz;
        return p;
     }
-@@ -966,11 +979,14 @@ static void setup_free(vorb *f, void *p)
+@@ -966,11 +984,14 @@ static void setup_free(vorb *f, void *p)
     free(p);
  }
  
@@ -48,7 +64,7 @@ index 3e5c250..61db8f2 100644
        f->temp_offset -= sz;
        return (char *) f->alloc.alloc_buffer + f->temp_offset;
     }
-@@ -1238,16 +1254,21 @@ static int vorbis_validate(uint8 *data)
+@@ -1238,16 +1259,21 @@ static int vorbis_validate(uint8 *data)
  
  // called from setup only, once per code book
  // (formula implied by specification)
@@ -76,7 +92,7 @@ index 3e5c250..61db8f2 100644
  }
  
  // called twice per file
-@@ -1334,6 +1355,24 @@ static int STBV_CDECL point_compare(const void *p, const void *q)
+@@ -1334,6 +1360,37 @@ static int STBV_CDECL point_compare(const void *p, const void *q)
     #define USE_MEMORY(z)    ((z)->stream)
  #endif
  
@@ -98,10 +114,23 @@ index 3e5c250..61db8f2 100644
 +   #endif
 +}
 +
++// Music Sample Organizer patch: the error for a header length beyond stream_bytes_left(). In push
++// mode only the bytes pushed so far are visible, so a long string (cover art in a comment) means
++// "push more": setting eof makes stb_vorbis_open_pushdata report VORBIS_need_more_data, as it did
++// before lengths were checked. In pull mode the stream really is too short for the length.
++static int length_past_stream_error(vorb *z)
++{
++   if (IS_PUSH_MODE(z)) {
++      z->eof = TRUE;
++      return error(z, VORBIS_need_more_data);
++   }
++   return error(z, VORBIS_invalid_setup);
++}
++
  static uint8 get8(vorb *z)
  {
     if (USE_MEMORY(z)) {
-@@ -1582,9 +1621,11 @@ static int get8_packet(vorb *f)
+@@ -1582,9 +1639,11 @@ static int get8_packet(vorb *f)
  static int get32_packet(vorb *f)
  {
     uint32 x;
@@ -116,7 +145,20 @@ index 3e5c250..61db8f2 100644
     x += (uint32) get8_packet(f) << 24;
     return x;
  }
-@@ -3577,6 +3618,19 @@ static int is_whole_packet_present(stb_vorbis *f)
+@@ -1751,9 +1810,11 @@ static int codebook_decode_scalar(vorb *f, Codebook *c)
+ 
+ #endif
+ 
++// Music Sample Organizer patch: a failed decode (-1) is not looked up. A sparse codebook with no used
++// entry has no sorted_values at all, so sorted_values[-1] read through a null pointer (GHSL-2023-172).
+ #define DECODE(var,f,c)                                       \
+    DECODE_RAW(var,f,c)                                        \
+-   if (c->sparse) var = c->sorted_values[var];
++   if (c->sparse && var >= 0) var = c->sorted_values[var];
+ 
+ #ifndef STB_VORBIS_DIVIDES_IN_CODEBOOK
+   #define DECODE_VQ(var,f,c)   DECODE_RAW(var,f,c)
+@@ -3577,10 +3638,24 @@ static int is_whole_packet_present(stb_vorbis *f)
  }
  #endif // !STB_VORBIS_NO_PUSHDATA_API
  
@@ -136,7 +178,12 @@ index 3e5c250..61db8f2 100644
  static int start_decoder(vorb *f)
  {
     uint8 header[6], x,y;
-@@ -3649,29 +3703,48 @@ static int start_decoder(vorb *f)
+    int len,i,j,k, max_submaps = 0;
++   uint32 comment_bytes_left; // Music Sample Organizer patch: see the user comments below
+    int longest_floorlist=0;
+ 
+    // first page, first packet
+@@ -3649,29 +3724,58 @@ static int start_decoder(vorb *f)
     for (i=0; i < 6; ++i) header[i] = get8_packet(f);
     if (!vorbis_validate(header))                    return error(f, VORBIS_invalid_setup);
     //file vendor
@@ -147,7 +194,8 @@ index 3e5c250..61db8f2 100644
 +   // walks a NULL list or frees an uninitialized pointer.
     len = get32_packet(f);
 -   f->vendor = (char*)setup_malloc(f, sizeof(char) * (len+1));
-+   if (len < 0 || (uint32) len > stream_bytes_left(f)) return error(f, VORBIS_invalid_setup);
++   if (len < 0)                                     return error(f, VORBIS_invalid_setup);
++   if ((uint32) len > stream_bytes_left(f))         return length_past_stream_error(f);
 +   f->vendor = (char*)setup_malloc(f, sizeof(char) * ((size_t) len + 1));
     if (f->vendor == NULL)                           return error(f, VORBIS_outofmem);
     for(i=0; i < len; ++i) {
@@ -160,9 +208,15 @@ index 3e5c250..61db8f2 100644
     //user comments
     f->comment_list_length = get32_packet(f);
     f->comment_list = NULL;
-+   if (f->comment_list_length < 0 || (uint32) f->comment_list_length > stream_bytes_left(f) / 4) {
++   // The bytes left are asked for once and then counted down (each entry takes its 4-byte length and
++   // its text): in FILE mode stream_bytes_left() is an ftell(), and a header may hold millions of
++   // empty comments. The count stays an upper bound (page headers inside the packet are not
++   // subtracted), which is all the check needs.
++   comment_bytes_left = stream_bytes_left(f);
++   if (f->comment_list_length < 0) { f->comment_list_length = 0; return error(f, VORBIS_invalid_setup); }
++   if ((uint32) f->comment_list_length > comment_bytes_left / 4) {
 +      f->comment_list_length = 0;  // each entry needs at least its 4-byte length
-+      return error(f, VORBIS_invalid_setup);
++      return length_past_stream_error(f);
 +   }
     if (f->comment_list_length > 0)
     {
@@ -176,7 +230,10 @@ index 3e5c250..61db8f2 100644
        len = get32_packet(f);
 -      f->comment_list[i] = (char*)setup_malloc(f, sizeof(char) * (len+1));
 -      if (f->comment_list[i] == NULL)               return error(f, VORBIS_outofmem);
-+      if (len < 0 || (uint32) len > stream_bytes_left(f)) { f->comment_list_length = i; return error(f, VORBIS_invalid_setup); }
++      comment_bytes_left = comment_bytes_left > 4 ? comment_bytes_left - 4 : 0;
++      if (len < 0) { f->comment_list_length = i; return error(f, VORBIS_invalid_setup); }
++      if ((uint32) len > comment_bytes_left) { f->comment_list_length = i; return length_past_stream_error(f); }
++      comment_bytes_left -= (uint32) len;
 +      f->comment_list[i] = (char*)setup_malloc(f, sizeof(char) * ((size_t) len + 1));
 +      if (f->comment_list[i] == NULL) { f->comment_list_length = i; return error(f, VORBIS_outofmem); }
  
@@ -192,7 +249,7 @@ index 3e5c250..61db8f2 100644
        }
        f->comment_list[i][len] = (char)'\0';
     }
-@@ -3721,6 +3794,8 @@ static int start_decoder(vorb *f)
+@@ -3721,6 +3825,8 @@ static int start_decoder(vorb *f)
        int ordered, sorted_count;
        int total=0;
        uint8 *lengths;
@@ -201,7 +258,7 @@ index 3e5c250..61db8f2 100644
        Codebook *c = f->codebooks+i;
        CHECK(f);
        x = get_bits(f, 8); if (x != 0x42)            return error(f, VORBIS_invalid_setup);
-@@ -3735,6 +3810,9 @@ static int start_decoder(vorb *f)
+@@ -3735,6 +3841,9 @@ static int start_decoder(vorb *f)
        c->sparse = ordered ? 0 : get_bits(f,1);
  
        if (c->dimensions == 0 && c->entries != 0)    return error(f, VORBIS_invalid_setup);
@@ -211,7 +268,7 @@ index 3e5c250..61db8f2 100644
  
        if (c->sparse)
           lengths = (uint8 *) setup_temp_malloc(f, c->entries);
-@@ -3742,6 +3820,7 @@ static int start_decoder(vorb *f)
+@@ -3742,6 +3851,7 @@ static int start_decoder(vorb *f)
           lengths = c->codeword_lengths = (uint8 *) setup_malloc(f, c->entries);
  
        if (!lengths) return error(f, VORBIS_outofmem);
@@ -219,7 +276,7 @@ index 3e5c250..61db8f2 100644
  
        if (ordered) {
           int current_entry = 0;
-@@ -3749,8 +3828,8 @@ static int start_decoder(vorb *f)
+@@ -3749,8 +3859,8 @@ static int start_decoder(vorb *f)
           while (current_entry < c->entries) {
              int limit = c->entries - current_entry;
              int n = get_bits(f, ilog(limit));
@@ -230,7 +287,7 @@ index 3e5c250..61db8f2 100644
              memset(lengths + current_entry, current_length, n);
              current_entry += n;
              ++current_length;
-@@ -3762,7 +3841,7 @@ static int start_decoder(vorb *f)
+@@ -3762,7 +3872,7 @@ static int start_decoder(vorb *f)
                 lengths[j] = get_bits(f, 5) + 1;
                 ++total;
                 if (lengths[j] == 32)
@@ -239,7 +296,7 @@ index 3e5c250..61db8f2 100644
              } else {
                 lengths[j] = NO_CODE;
              }
-@@ -3775,9 +3854,10 @@ static int start_decoder(vorb *f)
+@@ -3775,9 +3885,10 @@ static int start_decoder(vorb *f)
              f->setup_temp_memory_required = c->entries;
  
           c->codeword_lengths = (uint8 *) setup_malloc(f, c->entries);
@@ -251,7 +308,7 @@ index 3e5c250..61db8f2 100644
           lengths = c->codeword_lengths;
           c->sparse = 0;
        }
-@@ -3800,16 +3880,17 @@ static int start_decoder(vorb *f)
+@@ -3800,16 +3911,17 @@ static int start_decoder(vorb *f)
        CHECK(f);
        if (!c->sparse) {
           c->codewords = (uint32 *) setup_malloc(f, sizeof(c->codewords[0]) * c->entries);
@@ -273,7 +330,7 @@ index 3e5c250..61db8f2 100644
           }
           size = c->entries + (sizeof(*c->codewords) + sizeof(*values)) * c->sorted_entries;
           if (size > f->setup_temp_memory_required)
-@@ -3817,18 +3898,17 @@ static int start_decoder(vorb *f)
+@@ -3817,18 +3929,17 @@ static int start_decoder(vorb *f)
        }
  
        if (!compute_codewords(c, lengths, c->entries, values)) {
@@ -295,7 +352,7 @@ index 3e5c250..61db8f2 100644
           ++c->sorted_values;
           c->sorted_values[-1] = -1;
           compute_sorted_huffman(c, lengths, values);
-@@ -3857,6 +3937,9 @@ static int start_decoder(vorb *f)
+@@ -3857,6 +3968,9 @@ static int start_decoder(vorb *f)
              if (values < 0) return error(f, VORBIS_invalid_setup);
              c->lookup_values = (uint32) values;
           } else {

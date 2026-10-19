@@ -25,7 +25,11 @@ void AnalysisController::set_confirmation(Confirmation confirmation) {
 
 void AnalysisController::start(const std::vector<SampleKey>& keys, const std::string& profile,
                                const QString& description) {
-    if (keys.empty() || !session_.is_ready()) {
+    if (!session_.is_ready()) {
+        emit statusMessage(tr("The workspace is still opening; try again in a moment."));
+        return;
+    }
+    if (keys.empty()) {
         emit statusMessage(tr("Select the samples to analyze first."));
         return;
     }

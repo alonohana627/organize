@@ -37,11 +37,12 @@ public:
 
     /// Copies of the selected rows whose data is loaded, in row order (at most 2,000 exist).
     std::vector<search::SampleRow> selected_samples() const;
-    /// Keys of the selected rows whose data is loaded, in row order.
+    /// Keys of every selected row, loaded or evicted, in row order (edits and analysis act on all
+    /// of them; drags and copies, which need file paths, use selected_samples()).
     std::vector<SampleKey> selected_keys() const;
     /// Number of selected rows, loaded or not.
     std::size_t selected_row_count() const;
-    /// Key of the current (focused) row, when loaded.
+    /// Key of the current (focused) row, loaded or evicted.
     std::optional<SampleKey> current_key() const;
     /// Selects exactly the given keys among the loaded rows; returns how many were found.
     std::size_t select_keys(const std::vector<SampleKey>& keys, const std::optional<SampleKey>& current);

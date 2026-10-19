@@ -44,25 +44,40 @@ void ExportController::export_metadata(const uuids::uuid& library, bool json, co
     start_export(library, DisplayFormat::to_path(destination), options);
 }
 
+namespace {
+
+/// Runs `work(token)` with a token stopped by either the task's own Cancel or session shutdown.
+template <class Work>
+auto with_cancel_or_shutdown(const std::stop_source& cancel, const std::stop_token& shutdown, Work&& work) {
+    std::stop_source combined;
+    const std::stop_callback on_cancel(cancel.get_token(), [&combined] { combined.request_stop(); });
+    const std::stop_callback on_shutdown(shutdown, [&combined] { combined.request_stop(); });
+    return std::forward<Work>(work)(combined.get_token());
+}
+
+}  // namespace
+
+std::uint64_t ExportController::start_task(const QString& description, const std::shared_ptr<std::stop_source>& stop) {
+    const std::uint64_t task = jobs_.start_local_task(description, [stop] { stop->request_stop(); });
+    running_tasks_[task] = stop;
+    return task;
+}
+
 void ExportController::start_export(const uuids::uuid& library, const std::filesystem::path& destination,
                                     const app::ExportOptions& options) {
     if (!session_.is_ready()) return;
     auto stop = std::make_shared<std::stop_source>();
-    const std::uint64_t task = jobs_.start_local_task(
-        tr("Export %1 to %2").arg(session_.library_name(library), DisplayFormat::from_path(destination)),
-        [stop] { stop->request_stop(); });
-    running_exports_[task] = stop;
+    const std::uint64_t task = start_task(
+        tr("Export %1 to %2").arg(session_.library_name(library), DisplayFormat::from_path(destination)), stop);
     session_.run_long_task(
         this,
         [library, destination, options, stop, shutdown = session_.shutdown_token()](app::Application& application) {
-            // Cancel (the task's own stop) and application shutdown both end the export.
-            std::stop_source combined;
-            std::stop_callback on_cancel(stop->get_token(), [&combined] { combined.request_stop(); });
-            std::stop_callback on_shutdown(shutdown, [&combined] { combined.request_stop(); });
-            return application.export_metadata(library, destination, options, combined.get_token());
+            return with_cancel_or_shutdown(*stop, shutdown, [&](std::stop_token token) {
+                return application.export_metadata(library, destination, options, std::move(token));
+            });
         },
         [this, task](Result<app::ExportSummary> summary) {
-            running_exports_.erase(task);
+            running_tasks_.erase(task);
             if (!summary) {
                 const bool cancelled = summary.error().code == ErrorCode::Cancelled;
                 const QString reason =
@@ -80,18 +95,25 @@ void ExportController::start_export(const uuids::uuid& library, const std::files
 
 void ExportController::backup(const uuids::uuid& library) {
     if (!session_.is_ready()) return;
-    const std::uint64_t task = jobs_.start_local_task(tr("Backup of %1").arg(session_.library_name(library)), {});
+    auto stop = std::make_shared<std::stop_source>();
+    const std::uint64_t task = start_task(tr("Backup of %1").arg(session_.library_name(library)), stop);
     session_.run_long_task(
         this,
-        [library](app::Application& application) {
-            return application.with_library(library,
-                                            [](catalog::Library& opened) { return opened.create_backup("manual"); });
+        [library, stop, shutdown = session_.shutdown_token()](app::Application& application) {
+            return with_cancel_or_shutdown(*stop, shutdown, [&](std::stop_token token) {
+                return application.with_library(library, [&token](catalog::Library& opened) {
+                    return opened.create_backup("manual", token);  // a stopped backup removes its partial file
+                });
+            });
         },
         [this, task](Result<std::filesystem::path> backup) {
+            running_tasks_.erase(task);
             if (!backup) {
-                const QString reason = DisplayFormat::error(backup.error());
+                const bool cancelled = backup.error().code == ErrorCode::Cancelled;
+                const QString reason =
+                    cancelled ? tr("cancelled; no backup was kept") : DisplayFormat::error(backup.error());
                 jobs_.finish_local_task(task, reason, false);
-                emit failed(tr("The backup failed"), reason);
+                if (!cancelled) emit failed(tr("The backup failed"), reason);
                 return;
             }
             const QString text = tr("verified backup at %1").arg(DisplayFormat::from_path(*backup));
@@ -101,7 +123,7 @@ void ExportController::backup(const uuids::uuid& library) {
 }
 
 void ExportController::cancel_all() {
-    for (const auto& [task, stop] : running_exports_)
+    for (const auto& [task, stop] : running_tasks_)
         stop->request_stop();
 }
 

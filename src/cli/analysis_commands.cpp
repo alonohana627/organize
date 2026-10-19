@@ -19,27 +19,31 @@ constexpr auto kPollInterval = std::chrono::milliseconds(250);
 /// supervisor's own wall-clock cap of one job plus its cancel grace, so a long file that is still
 /// legitimately analyzing is never mistaken for a stall.
 constexpr auto kStallTimeout = app::AnalysisSupervisor::Timing{}.maximum_job_deadline + std::chrono::minutes(5);
-/// Runs listed when looking a run up by id (the newest first; ours were just created).
+/// Runs listed when ours are not among the newest (another process created runs after them).
 constexpr std::size_t kRunLookupLimit = 1000;
 
 /// Profiles accepted by `analyze --profile`.
 const std::vector<std::string> kProfiles = {"Waveforms", "Musical", "Duplicates", "Full"};
 
-/// The current status of every run in `run_ids`; NOT_FOUND when one has disappeared.
+/// The current status of every run in `run_ids`; NOT_FOUND when one has disappeared. Polled four
+/// times a second, so it lists only as many of the newest runs as it waits for (ours were created
+/// last); only when another process has created runs since does it look further back.
 Result<std::vector<catalog::Library::AnalysisRunStatus>> current_runs(app::Application& application,
                                                                       const uuids::uuid& library,
                                                                       const std::vector<std::int64_t>& run_ids) {
-    auto listed = application.with_library(
-        library, [](catalog::Library& opened) { return opened.list_analysis_runs(kRunLookupLimit); });
-    if (!listed) return std::unexpected(listed.error());
-    std::vector<catalog::Library::AnalysisRunStatus> runs;
-    for (const auto run_id : run_ids) {
-        const auto found = std::ranges::find(*listed, run_id, &catalog::Library::AnalysisRunStatus::id);
-        if (found == listed->end())
-            return fail(ErrorCode::NotFound, std::format("analysis run {} is no longer listed", run_id));
-        runs.push_back(*found);
+    for (const std::size_t limit : {run_ids.size(), std::max(run_ids.size(), kRunLookupLimit)}) {
+        auto listed = application.with_library(
+            library, [limit](catalog::Library& opened) { return opened.list_analysis_runs(limit); });
+        if (!listed) return std::unexpected(listed.error());
+        std::vector<catalog::Library::AnalysisRunStatus> runs;
+        for (const auto run_id : run_ids) {
+            const auto found = std::ranges::find(*listed, run_id, &catalog::Library::AnalysisRunStatus::id);
+            if (found == listed->end()) break;
+            runs.push_back(*found);
+        }
+        if (runs.size() == run_ids.size()) return runs;
     }
-    return runs;
+    return fail(ErrorCode::NotFound, "an analysis run of this command is no longer listed");
 }
 
 /// Cancels every run (Ctrl+C or timeout); failures are reported but do not change the outcome.
@@ -160,7 +164,9 @@ void register_analysis_commands(CLI::App& root, CommandContext& context, int& ex
         };
         if (query.empty()) {
             // Everything: one set-based run per root, no id list in memory.
-            auto roots = app.with_library(library->uuid, [](catalog::Library& opened) { return opened.list_roots(); });
+            auto roots = app.with_library(library->uuid, [](catalog::Library& opened) {
+                return opened.list_roots(catalog::RootListing::WithoutSampleCounts);
+            });
             if (!roots) return void(exit_code = context.report(roots.error()));
             for (const auto& root_record : *roots) {
                 auto run = app.start_root_analysis(library->uuid, root_record.id, profile, force);

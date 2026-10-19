@@ -18,11 +18,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stop_token>
 #include <string>
@@ -30,6 +32,7 @@
 #include <vector>
 
 #include "mso/catalog/library.hpp"
+#include "mso/worker/worker_process.hpp"
 
 namespace mso::app {
 
@@ -73,6 +76,9 @@ public:
     AnalysisSupervisor(std::filesystem::path worker_executable, Hooks hooks);
     /// Starts the supervisor thread with explicit time limits.
     AnalysisSupervisor(std::filesystem::path worker_executable, Hooks hooks, Timing timing);
+    /// Starts the supervisor thread with explicit worker options (tests run a --self-test worker
+    /// that misbehaves on purpose) and time limits.
+    AnalysisSupervisor(worker::WorkerOptions worker_options, Hooks hooks, Timing timing);
     /// Stops the loop, releases the job in flight and shuts the worker down.
     ~AnalysisSupervisor();
     AnalysisSupervisor(const AnalysisSupervisor&) = delete;
@@ -93,6 +99,14 @@ public:
     /// Serves a library again (it was opened again after abandon_library()).
     void serve_library(const uuids::uuid& library);
 
+    /// Wall-clock budget of one job: Timing::minimum_job_deadline plus deadline_per_audio_second
+    /// for every second of audio (`duration_us`, unknown counts as none), capped at
+    /// maximum_job_deadline.
+    static std::chrono::milliseconds job_deadline(const Timing& timing, std::optional<std::int64_t> duration_us);
+    /// Wait before the next worker start after `failures` consecutive failed starts or submits:
+    /// first_retry_delay, doubled per further failure, capped at maximum_retry_delay.
+    static std::chrono::milliseconds retry_delay(const Timing& timing, int failures);
+
 private:
     void run(std::stop_token stop);
     /// One pass over the libraries; true when a job was processed.
@@ -110,7 +124,7 @@ private:
     bool abandoned(const catalog::Library& library) const;
     void set_detail(std::string detail);
 
-    std::filesystem::path worker_executable_;
+    worker::WorkerOptions worker_options_;
     Hooks hooks_;
     Timing timing_;
     std::atomic<bool> paused_{false};

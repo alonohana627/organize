@@ -1,6 +1,7 @@
 #include "mso/search/row_matcher.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <ranges>
 #include <string>
@@ -63,12 +64,21 @@ bool node_is_row_evaluable(const QueryNode& node) {
     return false;
 }
 
+/// Transparent hash so text-keyed memos are probed with a string_view without allocating.
+struct TextHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view text) const noexcept { return std::hash<std::string_view>{}(text); }
+};
+
 /// What one predicate node remembers about one library's rows: decisions that depend only on a
 /// taxonomy id or a root, never on the row itself.
 struct LibraryMemo {
     uuids::uuid library;  ///< the library these decisions belong to
     /// tag:/category: nodes: tag or category id → whether that node's path matches.
     std::unordered_map<std::int64_t, bool> taxonomy_decisions;
+    /// tag:/category: nodes: the same by display path, for tags and categories without an id yet
+    /// (added optimistically, not stored), so their paths are folded once rather than per row.
+    std::unordered_map<std::string, bool, TextHash, std::equal_to<>> path_decisions;
     /// folder: nodes: root id → the value resolved against that root.
     std::unordered_map<std::int64_t, detail::RootFolderMatch> folder_rules;
     /// tag: nodes: canonical paths the tag name redirects to in this library (merged tags), or null.
@@ -159,11 +169,17 @@ struct RowMatcher::Prepared {
         return is_in_subtree(segments, node.folded_segments);
     }
 
-    /// The decision of a tag/category node for one taxonomy id, computed once per library and id.
-    /// Id 0 (a tag added optimistically, not yet stored) is decided from the path every time.
+    /// The decision of a tag/category node for one taxonomy node, computed once per library and id;
+    /// a node without an id (0: added optimistically, not yet stored) is decided once per path.
     template <class Decide>
-    static bool decide_by_id(LibraryMemo& memo, std::int64_t id, Decide&& decide) {
-        if (id <= 0) return decide();
+    static bool decide_once(LibraryMemo& memo, std::int64_t id, std::string_view path, Decide&& decide) {
+        if (id <= 0) {
+            if (const auto known = memo.path_decisions.find(path); known != memo.path_decisions.end())
+                return known->second;
+            const bool decision = decide();
+            memo.path_decisions.emplace(std::string(path), decision);
+            return decision;
+        }
         const auto known = memo.taxonomy_decisions.find(id);
         if (known != memo.taxonomy_decisions.end()) return known->second;
         const bool decision = decide();
@@ -199,15 +215,15 @@ struct RowMatcher::Prepared {
                 for (std::size_t index = 0; index < row.tag_paths.size(); ++index) {
                     const std::int64_t id = index < row.tag_ids.size() ? row.tag_ids[index] : 0;
                     const std::string& path = row.tag_paths[index];
-                    if (decide_by_id(memo, id, [&] { return tag_path_matches(node, memo, path); })) return true;
+                    if (decide_once(memo, id, path, [&] { return tag_path_matches(node, memo, path); })) return true;
                 }
                 return false;
             }
             case Field::Category: {
                 if (row.category.empty()) return false;
                 LibraryMemo& memo = memo_for(node, row.library);
-                return decide_by_id(memo, row.category_id.value_or(0),
-                                    [&] { return category_path_matches(node, row.category); });
+                return decide_once(memo, row.category_id.value_or(0), row.category,
+                                   [&] { return category_path_matches(node, row.category); });
             }
             case Field::Folder: {  // primary location: path_key BETWEEN prefix AND upper bound
                 if (row.root_id == 0 || row.path_key.empty()) return false;

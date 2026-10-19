@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -50,10 +51,30 @@ private:
     std::unique_ptr<sqlite::Connection> connection_;
 };
 
+/// One-time work Library::open may do before it returns; each can take seconds on a large catalog.
+enum class OpenStep {
+    BackingUp,          ///< a verified backup before the catalog is changed
+    Migrating,          ///< applying pending schema migrations
+    RebuildingKeys,     ///< rebuilding name and path keys written with another normalization (kFoldVersion)
+    CheckingIntegrity,  ///< the integrity check after migrating
+};
+
+/// Progress of one OpenStep: `completed` of `total` parts are done (a part is one migration, one
+/// rebuilt table, or the whole backup or check).
+struct OpenProgress {
+    OpenStep step = OpenStep::BackingUp;
+    int completed = 0;
+    int total = 1;
+};
+
 /// Options for opening a library.
 struct OpenOptions {
     bool read_only = false;  ///< also forced when the catalog schema is newer than this build
     int max_readers = 4;     ///< bounded reader pool
+    /// Called on the opening thread before each part of the one-time work and once more when a step
+    /// is complete, so a caller can show that the library is being upgraded instead of looking hung.
+    /// Optional; it must not call into the library being opened.
+    std::function<void(const OpenProgress&)> on_progress;
 };
 
 /// Outcome of the startup recovery pass.
@@ -63,6 +84,12 @@ struct RecoveryReport {
     std::int64_t interrupted_jobs = 0;                          ///< running analysis jobs returned as `interrupted`
     bool migrated = false;                                      ///< pending migrations were applied
     std::optional<std::filesystem::path> pre_migration_backup;  ///< verified backup taken before migrating
+    /// Verified backup taken before rebuilding keys (absent when no rebuild was needed, or when this
+    /// open's pre-migration backup already covers it).
+    std::optional<std::filesystem::path> pre_rekey_backup;
+    /// Rows whose rebuilt key another row already has: they keep a placeholder key, and an open
+    /// `normalization_conflict` review item lists them.
+    std::int64_t key_conflicts = 0;
 };
 
 /// Fault-injection access for the catalog tests; defined only in tests/catalog_tests.cpp.
@@ -92,10 +119,11 @@ public:
     /// Opens an existing library: validates library.json against the database identity, verifies
     /// released migration checksums and their contiguity, takes a verified backup before applying
     /// pending migrations, then runs crash recovery and, when the catalog was written with another
-    /// key normalization (kFoldVersion), rebuilds its stored name and path keys. If rebuilt keys
-    /// would collide, the old keys stay and an open review item says so. A newer schema opens read-only (SCHEMA_TOO_NEW
-    /// for writes); an older schema cannot be opened read-only (INVALID_ARGUMENT: open it writable
-    /// once to upgrade).
+    /// key normalization (kFoldVersion), rebuilds its stored name and path keys after a verified
+    /// backup. Every row gets its new key except a row whose new key another row already has: it
+    /// keeps a placeholder key that no lookup produces (nothing is merged), and an open review item
+    /// lists it. A newer schema opens read-only (SCHEMA_TOO_NEW for writes); an older schema cannot
+    /// be opened read-only (INVALID_ARGUMENT: open it writable once to upgrade).
     [[nodiscard]] static Result<std::unique_ptr<Library>> open(const std::filesystem::path& directory,
                                                                const OpenOptions& options = {});
 
@@ -127,8 +155,9 @@ public:
     /// of every file under the root and never changes afterwards.
     [[nodiscard]] Result<RootRecord> add_root(std::string_view name, RootMode mode,
                                               std::optional<bool> case_sensitive = std::nullopt);
-    /// Live roots ordered by name.
-    [[nodiscard]] Result<std::vector<RootRecord>> list_roots();
+    /// Live roots ordered by name. Counting each root's samples reads all of its locations
+    /// (tens of milliseconds per 100k); callers that only need the roots skip it.
+    [[nodiscard]] Result<std::vector<RootRecord>> list_roots(RootListing listing = RootListing::WithSampleCounts);
     /// Records a root's reachability. A change marks the root's samples changed, blocks queued
     /// analysis jobs that became unreachable and unblocks jobs that became reachable again. A no-op
     /// change commits nothing. NOT_FOUND for an unknown root.
@@ -155,10 +184,12 @@ public:
                                                              std::span<const ScannedFile> files,
                                                              std::span<const std::string> completed_directories,
                                                              const PathExistsProbe& path_exists);
-    /// Stored stat of a live location, for probe skipping.
+    /// Stored stat and file identity of a live location, for probe skipping.
     struct KnownStat {
         std::optional<std::int64_t> byte_size;
         std::optional<std::int64_t> mtime_ns;
+        std::optional<std::string> volume_id;  ///< as ScannedFile::volume_id (hex volume serial)
+        std::optional<std::string> file_id;    ///< as ScannedFile::file_id (16 raw bytes)
     };
     /// Stored stat of the live locations directly inside one directory of a root, keyed by
     /// mso::path_key(relative_path, root.case_sensitive). The importer skips probing files whose
@@ -178,6 +209,9 @@ public:
     /// Records a directory that could not be enumerated; its subtree is unknown, not empty.
     [[nodiscard]] Result<void> record_scan_gap(const ScanSession& session, std::string_view relative_directory,
                                                bool denied);
+    /// record_scan_gap() for many directories in one transaction. At most kMaximumScanBatchFiles
+    /// gaps per call (INVALID_ARGUMENT otherwise); an empty span does nothing.
+    [[nodiscard]] Result<void> record_scan_gaps(const ScanSession& session, std::span<const ScanGap> gaps);
     /// Ends the scan. Unseen locations are marked missing everywhere except inside denied/failed
     /// subtrees (those stay as they were: unknown, not empty), whether or not coverage was complete;
     /// `complete_coverage` reports whether any gap was recorded. Also unblocks analysis jobs whose
@@ -257,8 +291,10 @@ public:
         std::optional<std::string> waveform_segment;  ///< safe relative path under derived/
         std::string tempo_algorithm, key_algorithm;
         /// Versions of the analyzers that produced the loudness values, the PCM hash and the waveform
-        /// (mso::analysis::AlgorithmVersions). Each is required when its fact is present: it is part
-        /// of the stored provenance and artifact identity, so a version bump invalidates old results.
+        /// (mso::analysis::AlgorithmVersions). Each is required when its fact is present: it is stored
+        /// with the value as provenance, and the waveform's is part of its artifact's identity (a new
+        /// version writes a new artifact row). A version bump does not mark older results stale:
+        /// analysis_flags stay set, so only a forced run analyzes them again.
         std::string loudness_algorithm, pcm_hash_algorithm, waveform_algorithm;
         bool tempo_requested = false, key_requested = false;
     };
@@ -339,23 +375,29 @@ public:
 
     // ------------------------------------------------------------ maintenance
     /// Verified backup: online backup API into backups/, then integrity + foreign-key + identity check
-    /// of the copy. `reason` is sanitized into the file name; at most kMaximumBackups are kept.
-    [[nodiscard]] Result<std::filesystem::path> create_backup(std::string_view reason);
+    /// of the copy. `reason` is sanitized into the file name; at most kMaximumBackups are kept. The
+    /// copy is read from one reader snapshot, so imports and edits keep writing meanwhile. A stop
+    /// request ends the copy or the check early: the partial file is removed and the result is
+    /// CANCELLED.
+    [[nodiscard]] Result<std::filesystem::path> create_backup(std::string_view reason, std::stop_token stop = {});
     /// Integrity, foreign-key and FTS checks in one line.
     [[nodiscard]] Result<std::string> integrity_report();
     /// Rebuilds the FTS index from sample_search in a maintenance transaction and verifies counts.
     [[nodiscard]] Result<void> rebuild_search_index();
 
 private:
-    friend  /// Fault-injection access for the catalog tests; defined only in tests/catalog_tests.cpp.
-        struct LibraryTestAccess;
+    /// Fault-injection access for the catalog tests; defined only in tests/catalog_tests.cpp.
+    friend struct LibraryTestAccess;
     Library() = default;
     [[nodiscard]] Result<void> initialize_new(std::string_view name);
     [[nodiscard]] Result<void> verify_and_migrate();
     [[nodiscard]] Result<void> recover_after_crash();
     /// Rebuilds every stored name and path key when the catalog was written with another key
-    /// normalization (library_state.normalization_version differs from kFoldVersion).
+    /// normalization (library_state.normalization_version differs from kFoldVersion). A row whose
+    /// new key another row already has keeps a placeholder key and is listed in a review item.
     [[nodiscard]] Result<void> refresh_normalized_keys();
+    /// Reports one part of open()'s one-time work to OpenOptions::on_progress, if any.
+    void report_open_progress(OpenStep step, int completed, int total) const;
     [[nodiscard]] Result<void> load_cached_identity();
     [[nodiscard]] Result<void> ensure_writable() const;
     /// Commits a transaction that advanced the revision to `revision` and publishes it to identity().
@@ -368,9 +410,10 @@ private:
     uuids::uuid uuid_;
     bool read_only_ = false;
     RecoveryReport recovery_;
-    std::string name_;                                 ///< cached at open (never changes while open)
-    int schema_version_ = 0;                           ///< cached at open
-    std::atomic<std::int64_t> published_revision_{0};  ///< latest revision committed or read
+    std::function<void(const OpenProgress&)> open_progress_;  ///< OpenOptions::on_progress, while opening
+    std::string name_;                                        ///< cached at open (never changes while open)
+    int schema_version_ = 0;                                  ///< cached at open
+    std::atomic<std::int64_t> published_revision_{0};         ///< latest revision committed or read
 
     std::mutex writer_mutex_;  ///< one serialized writer per library
     sqlite::Connection writer_;

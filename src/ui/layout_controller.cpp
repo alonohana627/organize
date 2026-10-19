@@ -43,9 +43,10 @@ bool LayoutController::restore(const nlohmann::json& layout) {
 }
 
 void LayoutController::reset() {
-    if (!window_.restoreState(default_state_, LayoutStore::kSchemaVersion) ||
-        !header_.restoreState(default_header_state_))
-        emit statusMessage(tr("The default layout could not be fully restored."));
+    // Both halves are restored even when the first fails (|| would skip the header).
+    const bool docks_restored = window_.restoreState(default_state_, LayoutStore::kSchemaVersion);
+    const bool header_restored = header_.restoreState(default_header_state_);
+    if (!docks_restored || !header_restored) emit statusMessage(tr("The default layout could not be fully restored."));
     emit headerRestored();
     for (QDockWidget* dock : window_.findChildren<QDockWidget*>(Qt::FindDirectChildrenOnly))
         dock->show();

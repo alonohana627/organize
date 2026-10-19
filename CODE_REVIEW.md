@@ -784,3 +784,4 @@ Out of scope by the owner's decision (Windows first):
   - `QFile::decodeName` round-trip;
   - the POSIX `durable_file` report after rename;
   - POSIX `classify_entry` following the link target.
+- **Fuzzing (§5.3 Medium and Lows):** deferred by the owner to P10 on 2026-10-19; targets kept, CI job off.

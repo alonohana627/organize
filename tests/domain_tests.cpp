@@ -2,8 +2,11 @@
 // taxonomy paths, analysis flags, musical keys, UUIDs and display formatting.
 #include <doctest.h>
 
+#include <array>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <set>
 #include <string>
 #include <variant>
@@ -15,6 +18,7 @@
 #include "mso/domain/json_fields.hpp"
 #include "mso/domain/overloaded.hpp"
 #include "mso/domain/taxonomy.hpp"
+#include "test_support.hpp"
 
 using namespace mso;
 
@@ -85,6 +89,69 @@ TEST_SUITE("domain") {
         CHECK(fold_path_key("a\\b.wav") != fold_path_key("a/b.wav"));
         CHECK(path_key("A\\B.wav", true) == "A\\B.wav");
 #endif
+    }
+
+    TEST_CASE("case-insensitive path keys follow NTFS for the pinned letter pairs, known exceptions included") {
+        struct LetterPair {
+            std::string_view first, second;
+            bool same_file;  ///< what NTFS does (checked below on Windows with real files)
+            bool same_key;   ///< what path_key does: equal to same_file except for the documented exceptions
+        };
+        constexpr std::array<LetterPair, 14> kPairs = {{
+            {"k", "K", true, true},
+            {"\u00e9", "\u00c9", true, true},            // e acute
+            {"\u03c3", "\u03a3", true, true},            // sigma
+            {"\u0434", "\u0414", true, true},            // Cyrillic de
+            {"\u017f", "S", false, false},               // long s
+            {"\u0131", "I", false, false},               // dotless i
+            {"\u00b5", "\u039c", false, false},          // micro sign vs capital mu
+            {"\u03c2", "\u03a3", false, false},          // final sigma
+            {"\u01c5", "\u01c4", false, false},          // title-case digraph vs uppercase
+            {"\u0130", "i", false, false},               // dotted capital I
+            {"\u212a", "k", false, false},               // Kelvin sign
+            {"\U00010428", "\U00010400", false, false},  // Deseret: outside the Basic Multilingual Plane
+            // Case pairs newer than the volume's $UpCase table: NTFS keeps them apart, path_key does not
+            // (utf8proc has no Unicode age to tell them apart; see path_key in core.hpp).
+            {"\u00df", "\u1e9e", false, true},  // sharp s vs capital sharp s (Unicode 5.1)
+            {"\u10d0", "\u1c90", false, true},  // Georgian Mkhedruli vs Mtavruli (Unicode 11)
+        }};
+        for (const auto& [first, second, same_file, same_key] : kPairs) {
+            CAPTURE(first);
+            CAPTURE(second);
+            CHECK((fold_path_key(std::format("x{}.wav", first)) == fold_path_key(std::format("x{}.wav", second))) ==
+                  same_key);
+        }
+#ifdef _WIN32
+        // The pins are what NTFS does: a file created under the first spelling is found, or not, under
+        // the second.
+        test::ScratchDirectory scratch;
+        for (const auto& [first, second, same_file, same_key] : kPairs) {
+            CAPTURE(first);
+            CAPTURE(second);
+            const auto created = scratch / std::format("x{}.wav", first);
+            REQUIRE(std::ofstream(created).good());
+            std::error_code error;
+            CHECK(std::filesystem::exists(scratch / std::format("x{}.wav", second), error) == same_file);
+            std::filesystem::remove(created, error);
+        }
+#endif
+    }
+
+    TEST_CASE("utf8_prefix shortens text without splitting a UTF-8 sequence") {
+        CHECK(utf8_prefix("Kick", 10) == "Kick");
+        CHECK(utf8_prefix("Kick", 2) == "Ki");
+        CHECK(utf8_prefix("Kick", 0).empty());
+        const std::string_view hebrew = "של";  // two 2-byte letters
+        CHECK(utf8_prefix(hebrew, 3) == "ש");
+        CHECK(utf8_prefix(hebrew, 4) == hebrew);
+        const std::string_view note = "a♯";  // '♯' is 3 bytes
+        CHECK(utf8_prefix(note, 1) == "a");
+        CHECK(utf8_prefix(note, 2) == "a");
+        CHECK(utf8_prefix(note, 3) == "a");
+        CHECK(utf8_prefix("\U0001F3B9x", 3).empty());         // inside a 4-byte sequence
+        CHECK(utf8_prefix("\xFF\xFF\xFF", 2) == "\xFF\xFF");  // malformed bytes are cut where asked
+        for (std::size_t length = 0; length <= 12; ++length)
+            CHECK(is_valid_utf8(utf8_prefix("ש♯\U0001F3B9ab", length)));
     }
 
     TEST_CASE("UTF-8 helpers validate, count and classify") {
@@ -275,7 +342,10 @@ TEST_SUITE("domain") {
     TEST_CASE("display formatting") {
         CHECK(format_duration(1'500'000) == "1.50s");
         CHECK(format_duration(9'994'999) == "9.99s");
-        CHECK(format_duration(9'999'999) == "0:09");  // never "10.00s"
+        CHECK(format_duration(9'995'000) == "0:10");  // never "10.00s", and never the smaller "0:09"
+        CHECK(format_duration(9'999'999) == "0:10");
+        CHECK(format_duration(74'499'999) == "1:14");
+        CHECK(format_duration(74'500'000) == "1:15");
         CHECK(format_duration(10'000'000) == "0:10");
         CHECK(format_duration(75'000'000) == "1:15");
         CHECK(format_duration(-1).empty());

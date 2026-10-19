@@ -173,6 +173,10 @@ signals:
     void backgroundError(const mso::app::BackgroundErrorEvent& event);
     /// A library became writable (or read-only); librariesChanged() follows with the new state.
     void libraryAccessChanged(const mso::app::LibraryAccessChangedEvent& event);
+    /// A library being opened does one-time work (backup, migration, key rebuild, check): the
+    /// latest progress per library is delivered. The open is complete when the library appears in
+    /// libraries() (librariesChanged()).
+    void libraryOpenProgressed(const mso::app::LibraryOpenProgressEvent& event);
 
 private:
     /// Merges `event` into the pending batch (any thread) and schedules one delivery.

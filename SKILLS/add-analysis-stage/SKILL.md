@@ -44,8 +44,7 @@ fencing (lease, cancel epoch, content revision).
    value rather than a guess; a catalog test that a re-analysis never overrides a user value; protocol
    round trips and worker process behaviour in `tests/worker_tests.cpp` (suite `worker`; the worker's
    `--self-test-fault` modes exist only for these tests). Run both suites under the `sanitize` preset
-   too (AddressSanitizer + UBSan; on Windows put `C:\msys64\clang64\bin` on `PATH` and set
-   `ASAN_SYMBOLIZER_PATH` to its `llvm-symbolizer.exe`): the worker's 2 GiB job-object memory cap
-   leaves ample room for ASan on Windows (peak commit measured at about 86 MiB).
+   too (AddressSanitizer + UBSan; CTest sets the symbolizer and `PATH` itself): the worker's 2 GiB
+   job-object memory cap leaves ample room for ASan on Windows (peak commit measured at about 86 MiB).
 
 Be honest in docs: synthetic tests prove mechanics, not real-world accuracy.

@@ -124,9 +124,10 @@ private:
 
     /// Coalescing state of one library's outline reads.
     struct LibraryReloadState {
-        bool in_flight = false;      ///< a read is running
-        bool dirty = false;          ///< the structure changed since the last read started
-        QElapsedTimer last_started;  ///< when the last read started (invalid before the first)
+        bool in_flight = false;           ///< a read is running
+        bool dirty = false;               ///< the structure changed since the last read started
+        QElapsedTimer last_started;       ///< when the last read started (invalid before the first)
+        std::uint64_t started_order = 0;  ///< read_order_ value when the last read started
     };
 
     /// Reads one library's outline (worker thread).
@@ -185,6 +186,9 @@ private:
     QTreeWidget* tree_ = nullptr;
     /// Drops outline deliveries a newer full reload superseded.
     std::uint64_t reload_generation_ = 0;
+    /// Counts read starts (full and per library), so a full read can tell which per-library reads
+    /// started after it: their newer outline must not be replaced by the full read's older one.
+    std::uint64_t read_order_ = 0;
     /// Coalescing state of reload_library() per library.
     std::map<uuids::uuid, LibraryReloadState> library_reloads_;
     /// Starts deferred library reads once their interval has passed.

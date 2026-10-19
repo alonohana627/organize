@@ -8,6 +8,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,12 @@ struct SampleRow {
 /// over samples, locations and tag links merged in memory, with the taxonomy and roots read once.
 /// Runs on one read snapshot. `visit` must not call back into this library's reader pool.
 [[nodiscard]] Result<void> for_each_row(catalog::Library& library, const std::function<void(SampleRow&&)>& visit);
+
+/// As for_each_row, but checks `stop` before every row: once it fires the stream stops, the read
+/// snapshot ends (the reader goes back to its pool) and the call fails with CANCELLED, so a library
+/// closed during a long stream (the desktop index's first load) is released promptly.
+[[nodiscard]] Result<void> for_each_row(catalog::Library& library, std::stop_token stop,
+                                        const std::function<void(SampleRow&&)>& visit);
 
 /// The merged-tag redirects of one library. Merging tag "Percusion" into "Drums" keeps the old tag
 /// as a tombstone with an alias, and `tag:Percusion` keeps matching the canonical tag's subtree

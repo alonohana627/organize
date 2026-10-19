@@ -48,12 +48,19 @@ Result<std::size_t> BoundedFileReader::fetch(std::uint64_t offset, std::span<std
     const bool in_window = offset >= window_offset_ && offset - window_offset_ <= window_.size() &&
                            window_.size() - (offset - window_offset_) >= destination.size();
     if (!in_window) {
-        if (destination.size() >= kReadAheadBytes) return file_->read_at(offset, destination);  // large: direct
-        // Refill with the request plus read-ahead, never past the end of the file and never more
-        // than the parser could still be given (the request itself is already charged).
-        const std::uint64_t still_affordable = remaining_budget() + destination.size();
+        if (destination.size() >= kReadAheadBytes) {  // large: read directly
+            const auto received = file_->read_at(offset, destination);
+            if (received) bytes_fetched_ += *received;
+            return received;
+        }
+        // Refill with the request plus read-ahead, never past the end of the file, never more than
+        // the parser could still be given (the request itself is already charged), and never more
+        // read-ahead in total than the byte budget.
+        const std::uint64_t read_ahead_left = byte_budget_ > read_ahead_bytes_ ? byte_budget_ - read_ahead_bytes_ : 0;
+        const std::uint64_t still_affordable = destination.size() + std::min(remaining_budget(), read_ahead_left);
         const auto window_length = static_cast<std::size_t>(
             std::min({static_cast<std::uint64_t>(kReadAheadBytes), file_size_ - offset, still_affordable}));
+        read_ahead_bytes_ += window_length - destination.size();
         window_.resize(window_length);
         const auto received = file_->read_at(offset, window_);
         if (!received) {
@@ -62,6 +69,7 @@ Result<std::size_t> BoundedFileReader::fetch(std::uint64_t offset, std::span<std
         }
         window_.resize(*received);
         window_offset_ = offset;
+        bytes_fetched_ += *received;
     }
     const auto start = static_cast<std::size_t>(offset - window_offset_);
     const std::size_t copied = std::min(destination.size(), window_.size() - start);

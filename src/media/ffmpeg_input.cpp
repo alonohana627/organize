@@ -130,10 +130,18 @@ Result<std::unique_ptr<FfmpegInput>> FfmpegInput::open(ReadAtFunction read_at, s
     return input;
 }
 
+void FfmpegInput::clear_read_error() noexcept {
+    read_error_.reset();
+    if (io_ != nullptr) io_->error = 0;
+}
+
 Result<void> FfmpegInput::find_stream_info() {
     const int status = avformat_find_stream_info(format_, nullptr);
     if (read_error_) return std::unexpected(*read_error_);
-    if (status == AVERROR_EXIT || past_deadline()) return fail(ErrorCode::ProbeLimit, "probe time limit reached");
+    // An analysis that finished, even just after the deadline, is complete; only an interrupted
+    // or failed one past the deadline is a limit.
+    if (status == AVERROR_EXIT || (status < 0 && past_deadline()))
+        return fail(ErrorCode::ProbeLimit, "probe time limit reached");
     if (status < 0) {
         return fail(ErrorCode::CorruptAudio,
                     std::format("FFmpeg could not analyse the streams: {}", ffmpeg_error_text(status)));

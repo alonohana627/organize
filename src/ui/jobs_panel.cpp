@@ -22,7 +22,7 @@ namespace {
 enum Column { TaskColumn = 0, ProgressColumn = 1, StatusColumn = 2 };
 
 /// What a row represents, stored in TaskColumn's item data.
-enum TaskKind { ImportTask = 1, AnalysisTask, LocalTask };
+enum TaskKind { ImportTask = 1, AnalysisTask, LocalTask, LibraryOpenTask };
 
 enum ItemRole {
     KindRole = Qt::UserRole + 1,
@@ -30,6 +30,7 @@ enum ItemRole {
     LibraryRole,    ///< analysis: library UUID text
     RunRole,        ///< analysis: run id
     StateRole,      ///< analysis: run state text; others: "running" / "finished"
+    StepEndedRole,  ///< library open: the last reported step has ended (bool)
 };
 
 bool is_finished_state(const QString& state) {
@@ -117,7 +118,7 @@ JobsPanel::JobsPanel(QWidget* parent) : QWidget(parent) {
 QTreeWidgetItem* JobsPanel::make_task_item(const QString& description) {
     auto* item = new QTreeWidgetItem(tree_, QStringList{description, QString(), tr("Starting…")});
     item->setData(TaskColumn, StateRole, QStringLiteral("running"));
-    item->setToolTip(TaskColumn, description);
+    item->setToolTip(TaskColumn, DisplayFormat::plain_tooltip(description));
     return item;
 }
 
@@ -158,7 +159,7 @@ void JobsPanel::update_import(const app::ImportProgressEvent& event) {
     if (progress.inaccessible_directories > 0)
         parts << tr("%1 inaccessible folders").arg(DisplayFormat::count(progress.inaccessible_directories));
     item->setText(StatusColumn, QLocale().createSeparatedList(parts));
-    item->setToolTip(StatusColumn, DisplayFormat::from_utf8(progress.current_directory));
+    item->setToolTip(StatusColumn, DisplayFormat::plain_tooltip(DisplayFormat::from_utf8(progress.current_directory)));
 }
 
 void JobsPanel::finish_operation(const app::OperationFinishedEvent& event) {
@@ -179,7 +180,7 @@ void JobsPanel::finish_operation(const app::OperationFinishedEvent& event) {
     else
         summary = tr("Failed: %1").arg(DisplayFormat::error(*event.error));
     item->setText(StatusColumn, summary);
-    item->setToolTip(StatusColumn, summary);
+    item->setToolTip(StatusColumn, DisplayFormat::plain_tooltip(summary));
     prune_finished_rows();
     update_buttons();
 }
@@ -211,7 +212,8 @@ void JobsPanel::update_analysis(const app::AnalysisProgressEvent& event, const Q
                            tr("%1 running").arg(DisplayFormat::count(run.running))};
         if (run.paused > 0) counts << tr("%1 paused").arg(DisplayFormat::count(run.paused));
         if (run.blocked > 0) counts << tr("%1 waiting for their files").arg(DisplayFormat::count(run.blocked));
-        item->setText(StatusColumn, tr("%1 — %2").arg(state, QLocale().createSeparatedList(counts)));
+        item->setText(StatusColumn,
+                      tr("%1 — %2").arg(DisplayFormat::run_state(run.state), QLocale().createSeparatedList(counts)));
     }
     // Runs the Application no longer reports have ended; dismissals of such runs can be forgotten.
     for (auto& [key, item] : analysis_runs_) {
@@ -270,6 +272,10 @@ void JobsPanel::forget(QTreeWidgetItem* item) {
             dismissed_runs_.insert(key);
         }
     }
+    if (kind == LibraryOpenTask) {
+        if (const auto library = DisplayFormat::to_uuid(item->data(TaskColumn, LibraryRole).toString()))
+            library_opens_.erase(*library);
+    }
 }
 
 std::uint64_t JobsPanel::start_local_task(const QString& description, std::function<void()> cancel) {
@@ -289,7 +295,7 @@ void JobsPanel::finish_local_task(std::uint64_t task, const QString& summary, bo
     if (found == local_tasks_.end()) return;
     found->second->setData(TaskColumn, StateRole, QStringLiteral("finished"));
     found->second->setText(StatusColumn, succeeded ? tr("Done. %1").arg(summary) : tr("Failed: %1").arg(summary));
-    found->second->setToolTip(StatusColumn, summary);
+    found->second->setToolTip(StatusColumn, DisplayFormat::plain_tooltip(summary));
     local_cancellers_.erase(task);
     prune_finished_rows();
     update_buttons();
@@ -309,6 +315,53 @@ void JobsPanel::retain_libraries(const std::vector<uuids::uuid>& open) {
     update_buttons();
 }
 
+void JobsPanel::update_library_open(const app::LibraryOpenProgressEvent& event) {
+    QTreeWidgetItem*& item = library_opens_[event.library];
+    if (!item) {
+        // The library is not in the open list yet: its folder names it.
+        item = make_task_item(tr("Upgrading library %1").arg(DisplayFormat::from_path(event.directory.filename())));
+        item->setData(TaskColumn, KindRole, LibraryOpenTask);
+        item->setData(TaskColumn, LibraryRole, DisplayFormat::from_uuid(event.library));
+        item->setToolTip(TaskColumn, DisplayFormat::plain_tooltip(DisplayFormat::from_path(event.directory)));
+    }
+    item->setData(TaskColumn, StateRole, QStringLiteral("running"));  // a later open of the same library
+    item->setData(TaskColumn, StepEndedRole, event.completed >= event.total);
+    set_progress(item, event.completed, event.total);
+    item->setText(StatusColumn, tr("%1…").arg(DisplayFormat::open_step(event.step)));
+    update_buttons();
+}
+
+void JobsPanel::finish_completed_library_opens(const std::vector<uuids::uuid>& open) {
+    for (const auto& [library, item] : library_opens_) {
+        if (is_finished_state(item->data(TaskColumn, StateRole).toString())) continue;
+        if (std::ranges::find(open, library) == open.end() || !item->data(TaskColumn, StepEndedRole).toBool())
+            continue;  // still opening, or between two steps
+        item->setData(TaskColumn, StateRole, QStringLiteral("finished"));
+        item->setText(StatusColumn, tr("Done. The library is ready."));
+    }
+    prune_finished_rows();
+    update_buttons();
+}
+
+void JobsPanel::fail_library_open(const uuids::uuid& library, const QString& reason) {
+    const auto found = library_opens_.find(library);
+    if (found == library_opens_.end() || is_finished_state(found->second->data(TaskColumn, StateRole).toString()))
+        return;
+    found->second->setData(TaskColumn, StateRole, QStringLiteral("failed"));
+    found->second->setText(StatusColumn, tr("Failed: %1").arg(reason));
+    found->second->setToolTip(StatusColumn, DisplayFormat::plain_tooltip(reason));
+    prune_finished_rows();
+    update_buttons();
+}
+
+void JobsPanel::fail_unopened_library_opens(const std::vector<uuids::uuid>& open, const QString& reason) {
+    std::vector<uuids::uuid> failed;
+    for (const auto& [library, item] : library_opens_)
+        if (std::ranges::find(open, library) == open.end()) failed.push_back(library);
+    for (const uuids::uuid& library : failed)
+        fail_library_open(library, reason);
+}
+
 int JobsPanel::row_count() const {
     return tree_->topLevelItemCount();
 }
@@ -324,7 +377,7 @@ void JobsPanel::update_buttons() {
     const int kind = item ? item->data(TaskColumn, KindRole).toInt() : 0;
     const QString state = item ? item->data(TaskColumn, StateRole).toString() : QString();
     const bool running = item && !is_finished_state(state);
-    bool cancellable = running && kind != LocalTask;
+    bool cancellable = running && (kind == ImportTask || kind == AnalysisTask);  // an open cannot stop
     if (running && kind == LocalTask) {
         const auto found = local_cancellers_.find(item->data(TaskColumn, OperationRole).toULongLong());
         cancellable = found != local_cancellers_.end() && static_cast<bool>(found->second);
