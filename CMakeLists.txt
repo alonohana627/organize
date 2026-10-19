@@ -84,6 +84,9 @@ if(TARGET mso::ffmpeg)
   list(APPEND _mso_system_versions FFmpeg "libavformat ${MSO_FFMPEG_libavformat_VERSION}")
 endif()
 
+# Declared even when the desktop app is not built, so the include-graph check still knows the ui/
+# directories (and checks their includes) in GUI-less builds.
+mso_declare_module(ui MODULES app audio)
 if(MSO_BUILD_GUI)
   if(MSO_REQUIRE_GUI)
     find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Concurrent)
@@ -100,7 +103,6 @@ if(MSO_BUILD_GUI)
     target_link_libraries(mso_ui PUBLIC mso_app mso_audio mso::generated Qt6::Widgets Qt6::Concurrent)
     set_target_properties(mso_ui PROPERTIES AUTOMOC ON)
     mso_apply_options(mso_ui)
-    mso_declare_module(ui MODULES app audio)
 
     qt_add_executable(MusicSampleOrganizer WIN32 src/ui/main.cpp)
     mso_add_executable_icon(MusicSampleOrganizer)

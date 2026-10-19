@@ -94,6 +94,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "mso.exe exited with $LASTEXITCODE" }
 
   linux:
+    # Parked by the owner (2026-10-19): most users are on Windows. The job builds and passes; delete
+    # the next line to run it again.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
