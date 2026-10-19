@@ -20,7 +20,6 @@ your DAW. It all runs on your computer: no account, no cloud, no subscription, n
 - **Rate, favorite, tag and sort.** Stars, favorites, tags like `Drums/Kick/Acoustic`, categories,
   notes and collections. Everything updates the moment you click, and Ctrl+Z undoes it, even after
   a restart.
-- **Spot duplicates.** Find the same sound hiding in three different packs.
 - **Survives a messy drive.** Rename or move a file and it keeps its tags and ratings. Unplug an
   external drive and its samples show as offline rather than disappearing.
 
@@ -28,8 +27,9 @@ your DAW. It all runs on your computer: no account, no cloud, no subscription, n
 
 ## Getting started
 
-1. **Install it.** There is no ready-made download yet, so for now the app is built from source on
-   Windows; see [Building](docs/BUILDING.md). Once installed, double-click `MusicSampleOrganizer.exe`.
+1. **Install it.** Run the Windows installer (`MusicSampleOrganizer-<version>-windows-x64.msi`). It adds
+   Music Sample Organizer to the Start menu and the desktop. There is no public download yet; the
+   installer is built from source, see [Building an installer](docs/BUILDING.md#windows-installer-msi).
 2. **Add your sample folders.** Click **Add sample folder…** (or File → Add Folder, Ctrl+Shift+O) and
    pick a folder. Add as many as you like: a whole drive of packs works fine.
 3. **Let it scan.** The Jobs panel at the bottom shows progress. You can browse and search while it
@@ -87,6 +87,8 @@ library, Ctrl+Shift+N new library. You can change any of them in Preferences.
 - **Analysis in the background:** it runs as a separate, throttled process so the app stays smooth.
   You can pause or cancel it from the Jobs panel at any time.
 - **Offline, always:** the app never connects to the internet.
+- **Coming next:** reviewing duplicates side by side (the app already fingerprints every sample to
+  find them), a waveform browser, and copying samples into a library.
 - **Command line:** there is also an `mso` tool for scripting and batch jobs; see
   [docs/COMMAND_LINE.md](docs/COMMAND_LINE.md).
 

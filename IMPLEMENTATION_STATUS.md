@@ -8,14 +8,16 @@ Updated 2026-10-19 · branch `phase/p1-browser` · the first implementation is c
 | --- | --- |
 | **P0** foundations | Done: CMake presets (clang + libc++, C++23), pinned vendored deps, SQLite wrapper with migrations/backup/FTS5, worker and audio spikes turned into real modules. USearch feasibility (P0.5) **not done**: vector search is not started. |
 | **P1** first useful browser | Done except DAW verification (below): create/open library, referenced-folder import with bounded probes, progress and cancel; paged sortable table; search; preview play/pause/stop/seek/volume with a lazy waveform; drag to DAW (file URLs); notes, ratings, favorites, tags, manual collections; durable undo/redo; missing-source display; verified backups and crash recovery. |
-| **P2** reliability and organization | Partly done: multiple libraries with federated search; rename/move tracking with review items and root rebinding; hierarchical tags/categories with rename/move/merge and undoable history; smart collections; CSV/JSON export; customizable shortcuts; dock/column/layout presets; migration with verified pre-migration backup. **Not done:** managed copy import (P2.1; the UI shows it disabled), the offline metadata mirror and safe eject (P2.3), a staged migration *restore* path, million-row selection snapshots. |
+| **P2** reliability and organization | Partly done: multiple libraries with federated search; rename/move tracking with review items and root rebinding; hierarchical tags/categories with rename/move/merge and undoable history; smart collections; CSV/JSON export; customizable shortcuts; dock/column/layout presets; migration with verified pre-migration backup. **Not done:** managed copy import (P2.1; the UI shows it disabled), a staged migration *restore* path, million-row selection snapshots. |
 | **P3** explicit analysis | Partly done: durable runs/jobs with leases, cancel epochs, pause/resume/cancel, worker process confined by a job object (Windows: CPU-rate and memory caps) or `RLIMIT_AS` + `nice` (POSIX: memory cap, lower priority, no CPU cap); waveform, loudness, tempo, key, byte and PCM hashes; provenance and manual overrides that analysis never overrides. **Not done:** waveform segment *cache browsing* view (R11 waveform browser), duplicate *review* UI (hashes are computed and stored, not yet grouped), held-out real-music accuracy evaluation. |
 | **P4** advanced preview | Mostly done: loops, varispeed 0.25–4×, independent tempo/pitch (±24 semitones) via signalsmith-stretch. **Not done:** 30-minute load test, quality/latency report. |
-| **P5** semantic search | Not started (model selection, embeddings, ANN). |
-| **P6** tempo-aware preview, 5M scale | Not started. |
+| **P5** semantic search | Not started, and deferred well past the current work (owner, 2026-10-19). |
+| **P6** 5M scale | Not started. Tempo-aware preview is scrapped (owner, 2026-10-19). |
 | **P7** VST3 | Not started. |
 
 Deliberate deviations from the specification, at the owner's request:
+- Scrapped (2026-10-19), not to be built: tempo-aware preview against a project tempo (P6), and the
+  offline metadata mirror with safe eject (P2.3). Semantic search (P5) is deferred far out.
 - Linux is a target in addition to Windows.
 - The desktop app analyzes automatically: after each import it queues the `Full` profile for the
   folder (only new or changed samples run), rescans folders at start-up and on reconnect, and creates
@@ -269,8 +271,9 @@ the Linux build is not yet verified on a Linux machine.
 
 - Real DAW drag-and-drop (Ableton and another DAW) has not been tried by a person.
 - Audible playback on a real device was not listened to; tests use the null/offline backends.
-- Linux build and CI have never run (no Linux machine here; no Git remote yet). The CI workflow, the
-  Linux Qt-with-libc++ build script and the pinned LLVM repository setup are therefore untested.
+- CI runs on GitHub (`alonohana627/organize`). The Linux job (core, CLI, worker; release and
+  ASan/UBSan) passed its tests once and is now parked; the desktop app has never been built on Linux,
+  and `.github/scripts/build-qt-libcxx.sh` has not completed a run.
 - The vendored git dependencies were originally fetched on Windows with `core.autocrlf=true`, so 46
   vendored files carry CRLF line endings where upstream has LF (content otherwise identical). The
   fixed `update_deps.py` fetches upstream bytes; running `python deps/update_deps.py` once rewrites
@@ -288,8 +291,6 @@ the Linux build is not yet verified on a Linux machine.
 
 ## Next actions
 
-1. Get the owner's OK to commit, push to GitHub, and let CI verify Linux.
-2. Managed copy import with the operation journal (P2.1), using the existing `file_operations` table.
-3. Duplicate review: group `byte_hash`/`pcm_sha256` matches into `duplicate_edges` and show them.
-4. Waveform browser view backed by the stored waveform segments (add `Library::waveform_overview`).
-5. Offline metadata mirror and safe eject (P2.3).
+1. Managed copy import with the operation journal (P2.1), using the existing `file_operations` table.
+2. Duplicate review: group `byte_hash`/`pcm_sha256` matches into `duplicate_edges` and show them.
+3. Waveform browser view backed by the stored waveform segments (add `Library::waveform_overview`).
